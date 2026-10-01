@@ -898,6 +898,7 @@ struct StreamerView: View {
 private struct NativeStreamStatsSnapshot: Equatable {
     var codec = "--"
     var effects = ""
+    var presentationRates: NativeStreamPresentationRates?
     var colorMode = "--"
     var resolution = "--"
     var fps: Int?
@@ -1156,6 +1157,11 @@ private struct NativeStreamStatsPill: View {
                 } else {
                     detailedPanel
                 }
+            }
+            if let rates = snapshot.presentationRates {
+                Text(rates.label).font(.caption2.monospacedDigit()).foregroundStyle(.white)
+                    .padding(.horizontal, 10).padding(.vertical, 4)
+                    .background(.black.opacity(0.50), in: Capsule())
             }
             if !snapshot.effects.isEmpty {
                 Text(snapshot.effects).font(.caption2.monospacedDigit()).foregroundStyle(.white)
@@ -1738,6 +1744,9 @@ private struct NativeStreamControlsPanel: View {
                         set: { value in coordinator.updateLiveSettings { $0.frameGenerationEnabled = value } }))
                 Text("Frame generation requires a 60 FPS stream and 120 Hz display. Adds delay; may show motion artifacts. Stream settings are unchanged.")
                     .font(.footnote).foregroundStyle(.secondary)
+                if let rates = coordinator.statsSnapshot.presentationRates {
+                    Text(rates.label).font(.footnote.monospacedDigit()).foregroundStyle(.secondary)
+                }
                 if !coordinator.statsSnapshot.effects.isEmpty {
                     Text(coordinator.statsSnapshot.effects).font(.footnote).foregroundStyle(.secondary)
                 }
@@ -2884,6 +2893,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             serverLabel: session.zone.isEmpty ? nil : session.zone, gpuLabel: session.gpuType,
             targetFps: streamProfile.fps, inputSummary: "r\(reliableInputPackets)/p\(partiallyReliableInputPackets)", detail: statsText)
         statsSnapshot.effects = renderer?.videoEffectsStatus ?? ""
+        statsSnapshot.presentationRates = renderer?.presentationRates
         if decoded > 0 { handleDecodedVideoProgress(framesDecoded: decoded); raiseModeChangeNoticeIfNeeded(deliveredResolution: resolution) }
         onRuntimeSample(StreamRuntimeSample(timestamp: now, pingMs: sample.pingMilliseconds.map { Int($0.rounded()) },
             bitrateKbps: bitrate, jitterMs: sample.jitterMilliseconds, fps: decodedFPS, receivedFps: receivedFPS,
@@ -4568,6 +4578,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         // before video arrives, and turning that provisional value into a user-facing notice is
         // how the Android build learned to gate this on real frames.
         statsSnapshot.effects = renderer?.videoEffectsStatus ?? ""
+        statsSnapshot.presentationRates = renderer?.presentationRates
         if (framesDecoded ?? 0) > 0 {
             raiseModeChangeNoticeIfNeeded(deliveredResolution: resolution)
         }
@@ -5909,6 +5920,9 @@ private final class NativeStreamRenderView: UIView {
     private var frameGenerationEnabled = false
     private var effectsSourceFPS = 60
     var videoEffectsStatus: String { filteredMetalView?.videoEffectsStatus ?? "" }
+    var presentationRates: NativeStreamPresentationRates? {
+        frameGenerationEnabled && filteredRendererActive ? filteredMetalView?.presentationRates : nil
+    }
 
     func setVideoEffects(upscaling: Bool, frameGeneration: Bool, sourceFPS: Int) {
         upscalingEnabled = upscaling; frameGenerationEnabled = frameGeneration; effectsSourceFPS = sourceFPS
@@ -6257,6 +6271,11 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     private var generationBudget = NativeStreamFrameGenerationBudget()
     private var effectsGeneration: UInt64 = 0
     private var generatedPresentations = 0
+    private var presentationRateMeter = NativeStreamPresentationRateMeter()
+    var presentationRates: NativeStreamPresentationRates? {
+        presentationLock.lock(); defer { presentationLock.unlock() }
+        return presentationRateMeter.snapshot(now: CACurrentMediaTime())
+    }
     private var lastEffectsStatus = ""
     private var generationStatus = "Off"
     private var generationPauseReason = "Paused: processing over budget"
@@ -6276,6 +6295,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         if self.frameGenerationEnabled != frameGeneration || self.sourceFPS != sourceFPS {
             frameGenerator.reset(); pendingRealFrame = nil; suspendGenerationUntil = 0
             generationBudget.reset(); effectsGeneration &+= 1
+            presentationLock.lock(); presentationRateMeter = NativeStreamPresentationRateMeter(); presentationLock.unlock()
         }
         upscalingEnabled = upscaling; frameGenerationEnabled = frameGeneration; self.sourceFPS = sourceFPS
     }
@@ -6580,6 +6600,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
 
     private func recordPresentation(at time: CFTimeInterval, receivedAt: CFTimeInterval, generated: Bool) {
         presentationLock.lock()
+        presentationRateMeter.observe(time: time, generatedFrame: generated)
         if presentationWindowStart == 0 { presentationWindowStart = time }
         presentedFrames += 1
         if generated { generatedPresentations += 1 }

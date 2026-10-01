@@ -1790,11 +1790,13 @@ enum StreamSettingsResolver {
     }
 
     static func metalFXResolution(preset: MetalFXQualityPreset, aspectRatio: String,
-                                  displaySize: CGSize, stretch: Bool, membershipTier: String?) -> StreamResolutionChoice? {
+                                  displaySize: CGSize, stretch: Bool, membershipTier: String?,
+                                  interpolationLimits: NativeStreamFrameGenerationLimits? = nil) -> StreamResolutionChoice? {
         guard let scale = preset.inputScale else { return nil }
         return choices(forAspectRatio: aspectRatio).filter { choice in
             guard isResolutionAvailable(choice, membershipTier: membershipTier) else { return false }
             let source = pixelSize(choice.value)
+            if let interpolationLimits, !interpolationLimits.contains(width: Int(source.width), height: Int(source.height)) { return false }
             let target = NativeStreamVideoEffectsPolicy.presentationSize(source: source, display: displaySize, stretch: stretch)
             return NativeStreamVideoEffectsPolicy.upscaleSize(source: source, destination: target) != nil
         }.min { left, right in

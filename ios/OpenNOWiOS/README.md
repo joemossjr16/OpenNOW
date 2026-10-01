@@ -1,8 +1,20 @@
-# Joe's OpenNOW iOS build 134
+# Joe's OpenNOW iOS build 135
 
-This branch contains the source for **OpenNOW 1.1.134**, based on the upstream iOS branch at `95c0f58d42eeed176edd677f604b193c85169d9e`. It includes the earlier local iOS changes needed by the current native receiver, hardware AV1/HDR rendering, catalog and launch features.
+This branch contains the source for **OpenNOW 1.1.135**, based on the upstream iOS branch at `95c0f58d42eeed176edd677f604b193c85169d9e`. It includes the earlier local iOS changes needed by the current native receiver, hardware AV1/HDR rendering, catalog and launch features.
 
-[Unsigned IPA and build notes](https://github.com/joemossjr16/ios-apps/releases/tag/opennow-134) · [KravaSigner feed](https://raw.githubusercontent.com/joemossjr16/ios-apps/main/repo.json)
+[Unsigned IPA and build notes](https://github.com/joemossjr16/ios-apps/releases/tag/opennow-135) · [KravaSigner feed](https://raw.githubusercontent.com/joemossjr16/ios-apps/main/repo.json)
+
+## Build 135: interpolation limits and generated/displayed FPS
+
+The HUD and Picture panel now show **Generated FPS** and **Displayed FPS** separately from decoded stream FPS. These count actual drawable presentation callbacks in one-second windows: generated only, and total real + generated, respectively. They do not infer rates from 120 Hz, requested FPS or submitted work. Duplicate/backwards callbacks are ignored; old measurements expire after a pause.
+
+An oversized-interpolation reproduction on this Mac accepted a 2560×1080 configuration/session and completed GPU commands but left the output Y/UV planes unwritten. The runtime API reports **1920 per axis / 2073600 total pixels** on this Mac. That failure can produce invalid/green output; it does not independently establish the iPhone's exact limit or every possible cause of flashing. Build 135 queries the device's maximum dimension **and** total pixel count on OS 27+, and rejects out-of-bounds input before allocating/presenting an interpolated frame. Older OS versions use an explicit conservative 1920-axis/1080p pixel ceiling. Unsupported input keeps ordinary decoded playback and reports its limit.
+
+With FG enabled, automatic MetalFX presets now filter sizes through these limits and show their exact choice. The Resolution picker marks **FG size eligible / unsupported**; other device/format/FPS restrictions still apply. Opening Settings recalculates an active automatic preset. Manual resolution stays selected; select an eligible size and start a **fresh session** to apply the host request. Codec, HDR, bit depth/chroma, FPS and bitrate are preserved. For an illustrative 2868×1320 fill target at 21:9, the Mac's 1920/1080p limit makes Quality select the catalog's 1680×720 rather than 2560×1080 when FG is enabled. Actual device limits determine your choice.
+
+The budget now also requires average completion cost above the display interval before suspending a sustained over-budget window, so the pause message cannot claim an average below budget exceeds it. Warm-up, bounded work, history-only cooldown and power/thermal/error guards remain.
+
+Validation: unsigned iOS build passed; **182 tests passed, zero failed, one MetalFX simulator skip** (183 total). Presentation-meter, size/overflow/preset and average-budget tests passed with existing regressions. Real Mac GPU tests reject oversized interpolation, compare MetalFX orientation with ordinary playback, preserve HDR highlights, generate motion midpoints, resume after history-only cooldown, and process **118 SDR + 118 PQ frames** with interpolation and MetalFX in the same command buffer without unwritten/green neutral samples. Physical iPhone/iPad retest is still needed; these checks do not establish every corruption case, sustainable throughput or 10-bit/4:4:4 interpolation support. Build with the iOS 27 SDK; the Mac GPU harness requires the macOS 27 SDK.
 
 ## Build 134: orientation and interpolation startup/cooldown fixes
 
@@ -80,7 +92,7 @@ Native decode timing measures submission-to-output completion latency. It includ
 
 ## Build on an Apple Silicon Mac
 
-Install full Xcode with its iOS platform. Run these commands from the repository root:
+Install full Xcode providing the iOS 27 SDK and its iOS platform. Run these commands from the repository root:
 
 ```sh
 python3 ios/OpenNOWiOS/BuildScripts/prepare-native-libraries.py

@@ -164,6 +164,7 @@ struct SettingsView: View {
                 enforceAvailableFPS()
                 enforceAvailableHDR()
                 enforceAvailableCodec()
+                applyMetalFXQualityPreset()
             }
             .onChangeCompat(of: store.settings.preferredAspectRatio) { _ in
                 enforceAvailableResolution()
@@ -171,6 +172,9 @@ struct SettingsView: View {
             }
             .onChangeCompat(of: store.settings.metalFXUpscalingEnabled) { enabled in
                 if enabled { applyMetalFXQualityPreset() }
+            }
+            .onChangeCompat(of: store.settings.frameGenerationEnabled) { _ in
+                applyMetalFXQualityPreset()
             }
             .onChangeCompat(of: store.settings.streamerPreferences.stretchStreamToFill) { _ in
                 applyMetalFXQualityPreset()
@@ -630,6 +634,10 @@ struct SettingsView: View {
             Text("Quality preserves more detail; Balanced and Performance request smaller streams to reduce decode work. Presets select the nearest eligible resolution available on your plan. Resolution changes apply to a fresh session. Manual keeps your selected resolution. HDR, codec and FPS stay unchanged.")
                 .font(.footnote).foregroundStyle(.secondary)
             Toggle("Frame Generation (Experimental)", isOn: $store.settings.frameGenerationEnabled)
+            if store.settings.frameGenerationEnabled {
+                Text("Frame generation: \(NativeStreamVideoEffectsPolicy.frameGenerationLimits().label). MetalFX presets select an eligible input size for both effects. Start a fresh session after changing resolution. The HUD reports generated and total displayed FPS separately.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
             Text("Generates an intermediate frame for a 60 FPS stream on a 120 Hz display. Requires iOS 26 or later and a supported device, resolution and color format. Adds display delay and may show motion artifacts. Pauses if the GPU falls behind, Low Power Mode is on or the device gets hot. Stream FPS stays unchanged; select 60 FPS to try it.")
                 .font(.footnote).foregroundStyle(.secondary)
 
@@ -1624,7 +1632,8 @@ struct SettingsView: View {
     private func metalFXChoice(_ preset: MetalFXQualityPreset) -> StreamSettingsResolver.StreamResolutionChoice? {
         StreamSettingsResolver.metalFXResolution(preset: preset, aspectRatio: store.settings.preferredAspectRatio,
             displaySize: metalFXDisplaySize, stretch: store.settings.streamerPreferences.stretchStreamToFill,
-            membershipTier: currentMembershipTier)
+            membershipTier: currentMembershipTier,
+            interpolationLimits: store.settings.frameGenerationEnabled ? NativeStreamVideoEffectsPolicy.frameGenerationLimits() : nil)
     }
 
     private func metalFXPresetLabel(_ preset: MetalFXQualityPreset) -> String {
@@ -1763,6 +1772,11 @@ struct SettingsView: View {
                 display: metalFXDisplaySize, stretch: store.settings.streamerPreferences.stretchStreamToFill)
             label += NativeStreamVideoEffectsPolicy.upscaleSize(source: source, destination: target) != nil
                 ? " · MetalFX eligible" : " · No upscale"
+        }
+        if store.settings.frameGenerationEnabled {
+            let source = StreamSettingsResolver.pixelSize(choice.value)
+            let limits = NativeStreamVideoEffectsPolicy.frameGenerationLimits()
+            label += limits.contains(width: Int(source.width), height: Int(source.height)) ? " · FG size eligible" : " · FG size unsupported"
         }
         return label
     }

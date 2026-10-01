@@ -4,7 +4,7 @@
 MetalFX is absent from the iOS simulator SDK. These synthetic checks exercise
 real MetalFX HDR upscaling/readback and native video interpolation separately.
 They do not establish iPhone/iPad capabilities or real-time performance.
-Run from the repository root on an Apple Silicon Mac with Xcode 26+.
+Run from the repository root on an Apple Silicon Mac with Xcode providing the macOS 27 SDK.
 """
 from pathlib import Path
 import platform
@@ -126,6 +126,17 @@ enum NativeStreamVideoPerformanceLog { static func record(_ text: String) { prin
   let device = MTLCreateSystemDefaultDevice()!, queue = device.makeCommandQueue()!
   let context = CIContext(mtlDevice: device, options: [.cacheIntermediates: false])
   let generator = NativeStreamFrameGenerator()
+  let limits = NativeStreamVideoEffectsPolicy.frameGenerationLimits()
+  print("Mac interpolation limits:", limits.label)
+  var oversized: CVPixelBuffer?
+  precondition(CVPixelBufferCreate(nil,limits.maximumDimension+2,1080,kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+   [kCVPixelBufferIOSurfacePropertiesKey: [:],kCVPixelBufferMetalCompatibilityKey:true] as CFDictionary,&oversized) == kCVReturnSuccess)
+  let rejectedCommand = queue.makeCommandBuffer()!
+  precondition(generator.encode(buffer:oversized!,timestamp:1,device:device,context:context,commandBuffer:rejectedCommand) == nil)
+  precondition(generator.status.hasPrefix("Resolution unsupported"))
+  rejectedCommand.commit(); await rejectedCommand.completed()
+  generator.reset()
+  print("PASS: oversized interpolation surface rejected before producing an unwritten frame")
   func source(offset: Int, hdr: Bool) -> CVPixelBuffer {
    var allocation: CVPixelBuffer?
    precondition(CVPixelBufferCreate(nil, 1920, 1080, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
@@ -188,6 +199,33 @@ enum NativeStreamVideoPerformanceLog { static func record(_ text: String) { prin
    precondition(outputHighlight > 1 && outputHighlight / inputHighlight > 0.8 && outputHighlight / inputHighlight < 1.2,
     "HDR highlight lost or incorrectly range-mapped during interpolation")
   }
+  let scaler = NativeStreamSpatialUpscaler(device:device)
+  let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.rgba32Float,width:2112,height:1188,mipmapped:false)
+  td.storageMode = .shared; td.usage = [.renderTarget,.shaderRead,.shaderWrite]
+  let target = device.makeTexture(descriptor:td)!
+  var combinedFrames = 0
+  for i in 0..<120 {
+   let command = queue.makeCommandBuffer()!
+   let image = generator.encode(buffer:i.isMultiple(of:2) ? first : second,
+    timestamp:10_000_000_000+Int64(i)*16_666_667,device:device,context:context,commandBuffer:command)
+   var combined = false
+   if let image,let scaled = scaler.encode(image:image,sourceSize:image.extent.size,destinationSize:CGSize(width:2112,height:1188),
+    hdr:hdr,context:context,commandBuffer:command) {
+    context.render(scaled,to:target,commandBuffer:command,bounds:CGRect(x:0,y:0,width:2112,height:1188),
+     colorSpace:NativeStreamVideoEffectsPolicy.workingColorSpace(hdr:hdr))
+    combined = true
+   }
+   command.commit(); await command.completed(); precondition(command.status == .completed)
+   if combined {
+    combinedFrames += 1
+    var sample = [Float](repeating:0,count:4)
+    sample.withUnsafeMutableBytes { target.getBytes($0.baseAddress!,bytesPerRow:16,from:MTLRegionMake2D(825,550,1,1),mipmapLevel:0) }
+    precondition(sample[0] > (hdr ? 1 : 0.5),"Combined generated/upscaled image was unwritten")
+    precondition(abs(sample[1]-sample[0]) < 0.1 && abs(sample[2]-sample[0]) < 0.1,"Green flash in neutral generated/upscaled frame")
+   } else { try await Task.sleep(nanoseconds:10_000_000) }
+  }
+  precondition(combinedFrames >= 60)
+  print("PASS: combined interpolation + MetalFX",hdr ? "PQ" : "SDR",combinedFrames,"frames without unwritten/green output")
   // A budget cooldown drops history but must retain the initialized processor.
   generator.clearHistory()
   let restartFirst = queue.makeCommandBuffer()!

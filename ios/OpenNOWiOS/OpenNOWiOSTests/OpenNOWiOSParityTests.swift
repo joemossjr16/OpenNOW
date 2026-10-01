@@ -13,6 +13,47 @@ import CoreImage
 @testable import OpenNOWiOS
 
 final class OpenNOWiOSParityTests: XCTestCase {
+    func testPresentationRatesCountPresentedGeneratedFramesAndExpire() throws {
+        var meter = NativeStreamPresentationRateMeter()
+        XCTAssertNil(meter.snapshot(now: 100))
+        for i in 0...240 { meter.observe(time: 100 + Double(i)/120, generatedFrame: i.isMultiple(of: 2)) }
+        let rates = try XCTUnwrap(meter.snapshot(now: 102))
+        XCTAssertEqual(rates.generatedFPS, 60, accuracy: 0.01)
+        XCTAssertEqual(rates.displayedFPS, 120, accuracy: 0.01)
+        meter.observe(time: 101, generatedFrame: true) // delayed/out-of-order callback
+        meter.observe(time: .nan, generatedFrame: true)
+        XCTAssertEqual(meter.snapshot(now: 102), rates)
+        XCTAssertNil(meter.snapshot(now: 99))
+        XCTAssertNil(meter.snapshot(now: 105))
+        meter.observe(time: 110, generatedFrame: false) // resume starts a fresh window
+        XCTAssertNil(meter.snapshot(now: 110))
+        for i in 1...60 { meter.observe(time: 110 + Double(i)/60, generatedFrame: false) }
+        let realOnly = try XCTUnwrap(meter.snapshot(now: 111))
+        XCTAssertEqual(realOnly.generatedFPS, 0)
+        XCTAssertEqual(realOnly.displayedFPS, 60, accuracy: 0.01)
+    }
+
+    func testFrameGenerationLimitsRejectOversizedBuffersAndGuideMetalFXPresets() throws {
+        let limits = NativeStreamFrameGenerationLimits(maximumDimension: 1920, maximumPixels: 2073600)
+        XCTAssertTrue(limits.contains(width: 1920, height: 1080))
+        XCTAssertTrue(limits.contains(width: 1080, height: 1920))
+        XCTAssertFalse(limits.contains(width: 2560, height: 1080))
+        XCTAssertFalse(limits.contains(width: 1920, height: 1200))
+        XCTAssertFalse(limits.contains(width: 1920, height: 1920))
+        XCTAssertFalse(limits.contains(width: 0, height: 1080))
+        let unsafe = NativeStreamFrameGenerationLimits(maximumDimension: .max, maximumPixels: .max)
+        XCTAssertFalse(unsafe.contains(width: .max, height: .max))
+        let display = CGSize(width: 2868, height: 1320)
+        let normal = try XCTUnwrap(StreamSettingsResolver.metalFXResolution(preset: .quality, aspectRatio: "21:9",
+            displaySize: display, stretch: true, membershipTier: "ULTIMATE"))
+        XCTAssertEqual(normal.value, "2560x1080")
+        let compatible = try XCTUnwrap(StreamSettingsResolver.metalFXResolution(preset: .quality, aspectRatio: "21:9",
+            displaySize: display, stretch: true, membershipTier: "ULTIMATE", interpolationLimits: limits))
+        XCTAssertEqual(compatible.value, "1680x720")
+        XCTAssertNil(StreamSettingsResolver.metalFXResolution(preset: .quality, aspectRatio: "32:9",
+            displaySize: display, stretch: true, membershipTier: "ULTIMATE", interpolationLimits: limits))
+    }
+
     func testFrameGenerationBudgetAllowsWarmupAndRejectsSustainedOverload() {
         var budget = NativeStreamFrameGenerationBudget()
         for _ in 0..<8 { XCTAssertFalse(budget.record(processingSeconds: 0.025, displayHz: 120)) }
@@ -25,6 +66,9 @@ final class OpenNOWiOSParityTests: XCTestCase {
         budget.reset(warmingUp: false)
         for _ in 0..<11 { XCTAssertFalse(budget.record(processingSeconds: 0.015, displayHz: 120)) }
         XCTAssertTrue(budget.record(processingSeconds: 0.015, displayHz: 120))
+        budget.reset(warmingUp: false)
+        for _ in 0..<9 { XCTAssertFalse(budget.record(processingSeconds: 0.0085, displayHz: 120)) }
+        for _ in 0..<3 { XCTAssertFalse(budget.record(processingSeconds: 0.005, displayHz: 120)) }
         budget.reset()
         XCTAssertFalse(budget.record(processingSeconds: .nan, displayHz: 120))
         XCTAssertFalse(budget.record(processingSeconds: 0.020, displayHz: 0))

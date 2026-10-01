@@ -9,6 +9,54 @@ import MetalFX
 #endif
 import VideoToolbox
 
+struct NativeStreamFrameGenerationLimits: Equatable {
+    let maximumDimension: Int
+    let maximumPixels: Int
+    func contains(width: Int, height: Int) -> Bool {
+        guard width > 0, height > 0, width <= maximumDimension, height <= maximumDimension else { return false }
+        let (pixels, overflow) = width.multipliedReportingOverflow(by: height)
+        return !overflow && pixels <= maximumPixels
+    }
+    var label: String { "≤\(maximumDimension) px per axis, ≤\(String(format: "%.2f", Double(maximumPixels)/1_000_000)) MP" }
+}
+
+struct NativeStreamPresentationRates: Equatable {
+    let generatedFPS: Double
+    let displayedFPS: Double
+    var label: String { String(format: "Generated %.0f FPS · Displayed %.0f FPS", generatedFPS, displayedFPS) }
+}
+
+/// Count actual drawable presentation callbacks, excluding the anchor frame from
+/// each time window so decoded and generated frames are never double-counted.
+struct NativeStreamPresentationRateMeter {
+    private var windowStart: Double?
+    private var lastTime: Double?
+    private var generated = 0
+    private var displayed = 0
+    private var measuredAt: Double?
+    private var rates: NativeStreamPresentationRates?
+    mutating func observe(time: Double, generatedFrame: Bool) {
+        guard time.isFinite, time > (lastTime ?? -.infinity) else { return }
+        if windowStart == nil || time - (lastTime ?? time) > 3 {
+            windowStart = time; lastTime = time
+            generated = 0; displayed = 0; rates = nil; measuredAt = nil
+            return
+        }
+        lastTime = time
+        displayed += 1
+        if generatedFrame { generated += 1 }
+        let elapsed = time - windowStart!
+        guard elapsed >= 1 else { return }
+        rates = .init(generatedFPS: Double(generated)/elapsed, displayedFPS: Double(displayed)/elapsed)
+        measuredAt = time
+        windowStart = time; generated = 0; displayed = 0
+    }
+    func snapshot(now: Double) -> NativeStreamPresentationRates? {
+        guard let measuredAt, now.isFinite, now >= measuredAt, now - measuredAt < 3 else { return nil }
+        return rates
+    }
+}
+
 /// Effects operate after decode. Neither feature changes the host's codec, color,
 /// resolution or FPS request. In particular, frame generation cannot repair a
 /// decoder that is already receiving more frames than it can process.
@@ -26,6 +74,19 @@ enum NativeStreamVideoEffectsPolicy {
               destination.width <= source.width * 4,
               destination.height <= source.height * 4 else { return nil }
         return CGSize(width: destination.width.rounded(), height: destination.height.rounded())
+    }
+
+    static func frameGenerationLimits() -> NativeStreamFrameGenerationLimits {
+        #if !targetEnvironment(simulator)
+        if #available(iOS 27.0, macOS 27.0, tvOS 27.0, *),
+           let dimension = VTLowLatencyFrameInterpolationConfiguration.maximumDimension(forSpatialScaleFactor: 1),
+           let pixels = VTLowLatencyFrameInterpolationConfiguration.maximumPixelCount(forSpatialScaleFactor: 1) {
+            return .init(maximumDimension: dimension, maximumPixels: pixels)
+        }
+        #endif
+        // Older OS versions cannot report these limits. Use the experimentally
+        // validated 1080p ceiling rather than presenting unwritten buffers.
+        return .init(maximumDimension: 1920, maximumPixels: 1920 * 1080)
     }
 
     static func frameGenerationAllowed(sourceFPS: Int, displayHz: Int,
@@ -71,7 +132,7 @@ struct NativeStreamFrameGenerationBudget {
         durations.append(processingSeconds)
         if recent.count > 12 { recent.removeFirst(); durations.removeFirst() }
         averageSeconds = durations.reduce(0, +) / Double(durations.count)
-        return recent.count == 12 && recent.filter { $0 }.count >= 9
+        return recent.count == 12 && recent.filter { $0 }.count >= 9 && averageSeconds > 1.0 / Double(displayHz)
     }
 
     mutating func reset(warmingUp: Bool = true) {
@@ -293,7 +354,13 @@ final class NativeStreamFrameGenerator {
                        format: CVPixelBufferGetPixelFormatType(buffer), hdr: hdr,
                        transfer: CVBufferCopyAttachment(buffer, kCVImageBufferTransferFunctionKey, nil) as? String ?? "")
         if next != key {
-            reset(); key = next; let token = generation
+            reset(); key = next
+            let limits = NativeStreamVideoEffectsPolicy.frameGenerationLimits()
+            NativeStreamVideoPerformanceLog.record("frame-generation limits=\(limits.label) source=\(next.width)x\(next.height)")
+            guard limits.contains(width: next.width, height: next.height) else {
+                status = "Resolution unsupported: \(limits.label)"; return nil
+            }
+            let token = generation
             status = "Preparing"
             setupQueue.async { [weak self] in
                 var result: Session?
