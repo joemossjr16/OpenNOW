@@ -253,6 +253,21 @@ extension NvstRtspSdp {
         if let chromaFormat = options.chromaFormat {
             attributes.set("x-nv-video[0].chromaFormat", String(chromaFormat))
         }
+        // Dynamic range is independent of bit depth. The captured baseline carries
+        // BT.709 CSC even when CloudMatch requested HDR; override it explicitly,
+        // as the WebRTC SDP path already does. Never advertise HDR with H.264.
+        if let requestedHDR = options.hdrEnabled {
+            let hdr = requestedHDR && options.codec != .h264
+            attributes.set("x-nv-video[0].dynamicRangeMode", hdr ? "1" : "0")
+            attributes.set("x-nv-video[0].encoderCscMode", hdr ? "5" : "3")
+            attributes.set("x-nv-video[0].encoderHdrCscMode", "4")
+            attributes.set("x-nv-video[0].dx9EnableHdr", hdr ? "1" : "0")
+            if hdr { attributes.set("x-nv-video[0].bitDepth", "10") }
+            if options.codec == .h264 {
+                attributes.set("x-nv-video[0].bitDepth", "8")
+                attributes.set("x-nv-video[0].chromaFormat", "1")
+            }
+        }
         // The seat's DESCRIBE is a 720p60 BASELINE (captured live: it offers clientViewport 1280x720
         // and video[0].maxFPS:60 even for a session we provisioned at 5120x2160@120). The client's
         // announce overrides that baseline — and we were overriding only the viewport (720->5K) while

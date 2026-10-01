@@ -671,4 +671,23 @@ extension NvstRtspSdpTests {
         #expect(adaptive.contains("a=x-nv-video[0].framePacing.mode:1"))
         #expect(adaptive.contains("a=x-nv-video[0].framePacing.feedbackMode:1"))
     }
+
+    @Test func explicitHDRRequestOverridesSDRDescribeAndPreserves444() {
+        let offered = [("x-nv-video[0].dynamicRangeMode", "0"),
+                       ("x-nv-video[0].encoderCscMode", "2"),
+                       ("x-nv-video[0].bitDepth", "8"), ("x-nv-video[0].chromaFormat", "1")]
+        let hdr = NvstRtspSdp.buildAnnounceSdp(.init(bitDepth: 10, chromaFormat: 3,
+            hdrEnabled: true, offeredAttributes: offered, codec: .hevc))
+        #expect(hdr.contains("a=x-nv-video[0].dynamicRangeMode:1"))
+        #expect(hdr.contains("a=x-nv-video[0].encoderCscMode:5"))
+        #expect(hdr.contains("a=x-nv-video[0].bitDepth:10"))
+        #expect(hdr.contains("a=x-nv-video[0].chromaFormat:3"))
+        let sdr = NvstRtspSdp.buildAnnounceSdp(.init(bitDepth: 10, hdrEnabled: false, codec: .av1))
+        #expect(sdr.contains("a=x-nv-video[0].dynamicRangeMode:0"))
+        #expect(sdr.contains("a=x-nv-video[0].bitDepth:10"))
+        let h264 = NvstRtspSdp.buildAnnounceSdp(.init(bitDepth: 10, chromaFormat: 3, hdrEnabled: true, codec: .h264))
+        #expect(h264.contains("a=x-nv-video[0].dynamicRangeMode:0"))
+        #expect(h264.contains("a=x-nv-video[0].bitDepth:8"))
+        #expect(h264.contains("a=x-nv-video[0].chromaFormat:1"))
+    }
 }

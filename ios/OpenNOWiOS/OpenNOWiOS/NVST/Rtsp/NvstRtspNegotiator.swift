@@ -520,6 +520,7 @@ extension NvstRtspNegotiator {
             prefilterModel: input.prefilterModel,
             bitDepth: input.colorQuality.map { NvstRtspSdp.colorFormat(forColorQuality: $0).bitDepth },
             chromaFormat: input.colorQuality.map { NvstRtspSdp.colorFormat(forColorQuality: $0).chromaFormat },
+            hdrEnabled: input.hdrEnabled,
             audioChannelCount: input.audioChannelCount,
             encryptionKey: described.encryptionKey,
             iceCredentials: resolved.localIce,

@@ -1,44 +1,38 @@
-# Metal 4 streaming renderer development
+# Metal 4 streaming renderer
 
-Build: **1.1.137 (137)**. [Unsigned experimental IPA](https://github.com/joemossjr16/ios-apps/releases/tag/opennow-metal4-137). Branch: `metal-4`. Baseline: build 136 at `ffc69ff0f13f69c60de8a22abcfe1b7a78b9ea29`. All existing changes are also pushed to [`ios/native-nvst-128`](https://github.com/joemossjr16/OpenNOW/tree/ios/native-nvst-128); subsequent Metal 4 development belongs here.
+Build **1.1.138 (138)** on `metal-4`. [Unsigned experimental IPA](https://github.com/joemossjr16/ios-apps/releases/tag/opennow-metal4-138). The original cumulative changes remain on [`ios/native-nvst-128`](https://github.com/joemossjr16/OpenNOW/tree/ios/native-nvst-128), build 136.
 
-## Implemented: direct 10-bit HDR rendering
+## Rendering and effects
 
-`NativeStreamMetal4HDRRenderer` submits real `MTL4CommandBuffer` work to an `MTL4CommandQueue`. It uses a Metal 4 compiler/pipeline descriptor, explicit command allocators, argument tables with GPU addresses/resource IDs, and residency sets. Two reusable slots bound in-flight work. Allocators, uniform memory and argument tables are reused only after commit feedback confirms completion. Source pixel buffers, IOSurface texture wrappers, output textures and drawables stay alive through completion.
+The direct 10-bit PQ renderer and the general SDR/HDR effects renderer submit real `MTL4CommandBuffer` work to `MTL4CommandQueue`. They use Metal 4 compiler/pipeline descriptors, allocators, argument tables, residency sets, commit feedback and drawable synchronization. Direct PQ preserves native 10-bit 4:2:0/4:2:2/4:4:4 planes. The effects renderer preserves color precision in linear RGBA16Float surfaces and uses **MTL4FXSpatialScaler**, including for generated images. Core Image supplies decoding-surface color conversion and existing sharpening; VTFrameProcessor supplies existing video interpolation. These APIs still take legacy Metal command buffers in the installed SDK, so producer and Metal 4 consumer are connected by GPU events, without blocking CPU waits. This is interoperable video interpolation, not the game-oriented MetalFX frame interpolator, which needs game motion vectors and depth absent from the received stream.
 
-The legacy and Metal 4 renderers share `NativeStreamHDRMetalProgram` for input validation, shader source, full/video-range math, BT.2020 coefficients and decoded-buffer orientation. Native 10-bit 4:2:0, 4:2:2 and 4:4:4 planes retain their original sizes; the renderer never reduces chroma detail or bit depth to match the API. PQ/HLG remain encoded, and the existing 10-bit EDR display layer owns color conversion.
+Two slots bound each configuration's work; the view admits at most two frames overall. Separate cached real/generated configurations avoid recompilation when performance interpolation produces smaller images. Setup happens off the display thread. GPU completion retains source IOSurfaces, intermediate textures, scalers, argument tables, uniform memory and drawables. A barrier covers compute/render/blit stages between spatial scaling and fragment reads. Shared events order live switches between legacy, direct and effects queues; completed GPU failures recover skipped signals and select the legacy path. Unsupported devices/inputs or setup failure also retain the existing renderer. CoreSimulator uses explicit fallback because its SDK omits Metal 4.
 
-On a physical iOS 26+ device that reports Metal 4 support, the stream view initializes this renderer asynchronously and selects it for eligible direct HDR playback when MetalFX, FG and sharpening are off. Unsupported input, unsupported hardware, setup failure or slot exhaustion uses the existing path. A GPU error disables Metal 4 for that view and selects legacy playback. The status identifies the active renderer; source codec and decode timing remain separate.
+PQ and HLG sources both use a PQ BT.2020 10-bit EDR display in the general path. Core Image performs source-to-linear conversion; the Metal 4 shader applies the PQ encoding corresponding to Core Image's 203-nit reference white. HLG source status remains HLG, describing decoded video, while presentation is normalized to PQ. SDR uses explicit sRGB output. Texture orientation is preserved. Spatial input is clamped to MetalFX's defined SDR [0,1] range after sharpening, while HDR retains half-float highlight range; this prevents NaN output from sharpen overshoot. Existing fit/fill, MetalFX resolution presets, FG quality/settings, generated/displayed FPS, heat/power/budget gates, PiP, pointer capture, touch input, catalog/imports and other UI features remain available. FG never silently truncates 10-bit or subsamples 4:4:4 to satisfy a processor that accepts only 8-bit NV12.
 
-Metal 4 drawable submission follows `waitForDrawable` → commit → `signalDrawable` → present. Actual presented callbacks feed the existing display statistics. Commit feedback supplies GPU timing. A lock-protected telemetry owner handles GPU/presentation callbacks independently of UIView actor isolation; concurrent rate/counter updates and reset are covered by regression tests. A shared event timeline orders submissions across the two queues when live settings switch render paths. Tickets advance only after submission succeeds; completed GPU failures recover skipped event signals. Display code never blocks on GPU completion or compilation. CoreSimulator has an explicit unavailable implementation because its SDK omits the Metal 4 command API.
+## HDR negotiation and status
+
+Native ANNOUNCE now explicitly carries HDR dynamic-range/BT.2020 CSC fields, independently of bit depth and chroma. HDR upgrades an old saved 8-bit color preference to the corresponding 10-bit request. H.264 does not advertise HDR. CloudMatch and RTSP retain their separate chroma/depth enums. Known downgraded host profiles are excluded from automatic compatible-session reuse; the request signature changes so a launch requests a fresh profile. Color status distinguishes received video from the requested format. Private bounded logs record requested format/build and finalized host HDR/depth/chroma without tokens, endpoints or full SDP.
+
+The phone's build-137 snapshot requested AV1 10-bit HDR but its host finalized 8-bit 4:2:0, HDR off, and the decoder produced 420f SDR. Rendering APIs cannot reconstruct host HDR or 4:4:4 from that stream. The request/reuse fixes need a live newly launched session to establish whether the service delivers the selected tier. A host refusal continues to show its actual output. Ten-bit 4:4:4 remains strict H.265 native decoding; incompatible hosts/hardware report failure rather than silently delivering 4:2:0.
 
 ## Validation
 
-The unsigned iOS build succeeds. 186 targeted protocol/rendering/input/PiP/HDR/FG simulator tests pass, zero fail, and one MetalFX test is explicitly skipped. This includes shared HDR input rejection and simulator fallback. Hardware-only MetalFX remains an explicit simulator skip.
-
-Run on an Apple Silicon Mac with macOS 26+ and current Xcode:
+Run on Apple Silicon macOS 26+ with Xcode's current SDK:
 
 ```sh
 python3 ios/OpenNOWiOS/BuildScripts/validate-metal4-hdr-macos.py
-python3 ios/OpenNOWiOS/BuildScripts/validate-video-effects-macos.py
+python3 ios/OpenNOWiOS/BuildScripts/validate-metal4-effects-macos.py
+python3 ios/OpenNOWiOS/BuildScripts/validate-metal4-interpolation-macos.py
 ```
 
-The new harness enables Metal API/GPU validation. It compares actual output pixels against the legacy renderer across all twelve combinations of 10-bit chroma layout, full/video range and PQ/HLG. It checks orientation, fit borders, adjacent 4:4:4 chroma detail, rejection of unsupported transfer functions, two-slot admission using a deliberately blocked GPU event, slot reuse and forty legacy/Metal 4 transitions. The existing harness checks HDR MetalFX, interpolation, limits, cooldown and alternating real/generated frames. These tests do not establish sustained iPhone/iPad performance, actual display EDR brightness or physical-device presentation timing.
+These enable Metal API and GPU validation. Direct rendering checks twelve chroma/range/transfer cases, fit/orientation, bounded slots and forty cross-queue switches. Effects checks twenty-four HDR cases (all six 10-bit chroma/range formats, PQ/HLG, upscale on/off), comparing GPU readback against Core Image/legacy MetalFX; SDR/sharpen checks include upscale on/off. Interpolation checks eight real size/quality/SDR/PQ combinations, generated motion midpoint/highlights and 944 generated/upscaled images alternating with full-size real frames, including no green/unwritten output and history-only cooldown recovery. Mac fixtures establish pixel correctness and resource ordering, not live iPhone/iPad HDR brightness or sustainable performance.
 
-## Next port stages
-
-1. Port spatial upscaling to `MTL4FXSpatialScaler`. Define explicit producer/consumer events and bounded intermediate surfaces for the existing Core Image input/final conversion. Measure the synchronization and submission cost before selecting the new scaler in live playback.
-2. Move eligible image conversion/sharpening into Metal 4 encoders so the display path can reduce queue handoffs. Compare HDR transfer/range and fit/fill output against existing playback before changing defaults.
-3. Integrate video interpolation through explicit interoperability. The current SDK's `VTFrameProcessor.process` accepts `MTLCommandBuffer`; its processing remains on the legacy queue until a tested cross-queue bridge exists. Keep original/generated timestamps, presentation counters, history and budget ownership in the current module.
-
-Metal 4 game-oriented temporal upscaling/frame interpolation requires inputs such as engine motion vectors and depth that the compressed GFN video stream does not currently supply. This branch does not fabricate these inputs or replace the working video interpolation with an unsupported game-renderer algorithm. Native MetalFX frame generation and denoising need a separately validated input strategy; changing command APIs alone does not supply it.
+The unsigned iOS device build and 188 targeted simulator protocol/render/input/PiP/HDR/FG checks passed (zero failures, one hardware MetalFX skip). Hardware-only MetalFX is an explicit simulator skip. Native libraries and licenses remain unchanged.
 
 ## Apple references
 
-- [Understanding the Metal 4 core API](https://developer.apple.com/documentation/metal/understanding-the-metal-4-core-api)
+- [Metal 4 core API](https://developer.apple.com/documentation/metal/understanding-the-metal-4-core-api)
 - [Metal 4 spatial scaler](https://developer.apple.com/documentation/metalfx/mtl4fxspatialscaler)
-- [Metal 4 command queue and drawable synchronization](https://developer.apple.com/documentation/metal/mtl4commandqueue)
-- [MetalFX frame interpolator inputs](https://developer.apple.com/documentation/metalfx/mtlfxframeinterpolatorbase)
-- [VideoToolbox frame processor](https://developer.apple.com/documentation/videotoolbox/vtframeprocessor)
-
-SDK signatures are checked against the installed iOS/macOS 27 headers. Runtime deployment remains compatible with older iOS through availability/capability fallback.
+- [VideoToolbox command-buffer processing](https://developer.apple.com/documentation/videotoolbox/vtframeprocessor/process(with:parameters:))
+- [MetalFX game frame interpolator inputs](https://developer.apple.com/documentation/metalfx/mtlfxframeinterpolatorbase)

@@ -126,6 +126,16 @@ enum NativeStreamVideoEffectsPolicy {
         return supported.contains(kCVPixelFormatType_64RGBAHalf) ? kCVPixelFormatType_64RGBAHalf : nil
     }
 
+    /// Sharpening can overshoot below zero or above SDR white. MetalFX linear
+    /// input is defined only in [0,1]; invalid values can produce NaN output.
+    /// HDR retains its half-float range and highlights rather than clipping to SDR.
+    static func spatialInput(image: CIImage, hdr: Bool) -> CIImage {
+        image.applyingFilter("CIColorClamp", parameters: [
+            "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
+            "inputMaxComponents": CIVector(x: hdr ? 65504 : 1, y: hdr ? 65504 : 1, z: hdr ? 65504 : 1, w: 1)
+        ]).cropped(to: image.extent)
+    }
+
     static func workingColorSpace(hdr: Bool) -> CGColorSpace {
         CGColorSpace(name: hdr ? CGColorSpace.extendedLinearITUR_2020 : CGColorSpace.extendedLinearSRGB)!
     }
@@ -296,7 +306,7 @@ final class NativeStreamSpatialUpscaler {
         let input = resources.inputs[slot], output = resources.outputs[slot]
         slot = (slot + 1) % resources.inputs.count
         let space = NativeStreamVideoEffectsPolicy.workingColorSpace(hdr: hdr)
-        context.render(image, to: input, commandBuffer: commandBuffer,
+        context.render(NativeStreamVideoEffectsPolicy.spatialInput(image: image, hdr: hdr), to: input, commandBuffer: commandBuffer,
                        bounds: CGRect(origin: .zero, size: sourceSize), colorSpace: space)
         resources.scaler.colorTexture = input; resources.scaler.outputTexture = output
         resources.scaler.inputContentWidth = next.width; resources.scaler.inputContentHeight = next.height

@@ -520,6 +520,8 @@ struct RemoteSessionCandidate: Identifiable, Codable, Equatable {
     let streamSettingsSignature: String?
     let resolution: String?
     let fps: Int?
+    var colorQuality: StreamColorQuality? = nil
+    var hdrEnabled: Bool? = nil
 }
 
 struct StorageAddon: Codable, Equatable {
@@ -1973,7 +1975,7 @@ enum StreamSettingsResolver {
     static func sessionSignature(for settings: AppSettings, profile: StreamVideoProfile) -> String {
         let color = colorQuality(for: settings).rawValue
         return [
-            "opennow-ios-stream-v1",
+            "opennow-ios-stream-v2",
             "res=\(profile.width)x\(profile.height)",
             "fps=\(profile.fps)",
             "bitrate=\(profile.maxBitrateKbps / 1000)",
@@ -2117,7 +2119,13 @@ enum StreamSettingsResolver {
     }
 
     static func colorQuality(for settings: AppSettings) -> StreamColorQuality {
-        StreamColorQuality(rawValue: settings.preferredColorQuality) ?? .eightBit420
+        let color = StreamColorQuality(rawValue: settings.preferredColorQuality) ?? .eightBit420
+        guard settings.hdrEnabled, color.bitDepth < 10 else { return color }
+        return color == .eightBit444 ? .tenBit444 : .tenBit420
+    }
+
+    static func remoteColorMatches(color: StreamColorQuality?, hdr: Bool?, settings: AppSettings) -> Bool {
+        (color == nil || color == colorQuality(for: settings)) && (hdr == nil || hdr == settings.hdrEnabled)
     }
 
     private static func profilePlanLimit(for membershipTier: String?) -> StreamResolutionPlan {
@@ -4134,6 +4142,11 @@ private actor GFNAPIClient {
         let hdrSummary = "\(activeSession.id):\(settings?.hdrEnabled == true):\(String(describing: finalizedHDR)):\(String(describing: request["sdrHdrMode"])):\(String(describing: monitor["sdrHdrMode"]))"
         if hdrSummary != lastHDRNegotiationSummary {
             lastHDRNegotiationSummary = hdrSummary
+            #if os(iOS) && canImport(WebRTC)
+            let depth = (final["bitDepth"] as? NSNumber)?.intValue ?? -1
+            let chroma = (final["chromaFormat"] as? NSNumber)?.intValue ?? -1
+            NativeStreamVideoPerformanceLog.record("host-profile requestedHDR=\(settings?.hdrEnabled == true) acceptedHDR=\(finalizedHDR.map(String.init) ?? "unknown") depthEnum=\(depth) chromaEnum=\(chroma)")
+            #endif
             NSLog("[OpenNOW] HDR negotiation requested=%@ accepted=%@ requestMode=%@ monitorMode=%@",
                   settings?.hdrEnabled == true ? "on" : "off",
                   finalizedHDR.map { $0 ? "on" : "off" } ?? "unknown",
@@ -4362,7 +4375,9 @@ private actor GFNAPIClient {
                 serverIp: serverIp,
                 streamSettingsSignature: streamSettingsSignature,
                 resolution: negotiatedProfile?.resolution,
-                fps: negotiatedProfile?.fps
+                fps: negotiatedProfile?.fps,
+                colorQuality: negotiatedProfile?.colorQuality,
+                hdrEnabled: Self.toBoolean((item["finalizedStreamingFeatures"] as? [String: Any])?["trueHdr"])
             )
         }
     }
@@ -8397,6 +8412,10 @@ final class OpenNOWStore: ObservableObject {
         guard candidate.resolution?.trimmingCharacters(in: .whitespacesAndNewlines) == expectedResolution else {
             return false
         }
+        // A signature describes the request; the finalized host format may have
+        // downgraded it. Reusing that seat perpetuates 8-bit SDR after requesting HDR.
+        guard StreamSettingsResolver.remoteColorMatches(color: candidate.colorQuality,
+            hdr: candidate.hdrEnabled, settings: settings) else { return false }
         return candidate.fps == profile.fps
     }
 

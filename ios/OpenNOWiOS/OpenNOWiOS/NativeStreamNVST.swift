@@ -108,10 +108,11 @@ actor NativeStreamNVST: NativeStreamNVSTTransport {
         })
         self.reserver = reserver
         let color = StreamSettingsResolver.colorQuality(for: settings).rawValue
+        Self.log("native-iOS requested build=\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown") codec=\(codec.rawValue) color=\(color) HDR=\(settings.hdrEnabled) FX=\(settings.metalFXUpscalingEnabled) FG=\(settings.frameGenerationEnabled)")
         let input = NvstRtspNegotiationInput(sessionID: allocation.id, rtspsEndpoints: endpoints,
             resolution: profile.resolutionString, fps: profile.fps, codec: codec == .h265 ? "HEVC" : codec.rawValue,
             bitrateKbps: profile.maxBitrateKbps, maximumBitrateKbps: profile.maxBitrateKbps,
-            colorQuality: color, audioChannelCount: 2, rtcpOnSctp: true,
+            colorQuality: color, hdrEnabled: settings.hdrEnabled, audioChannelCount: 2, rtcpOnSctp: true,
             disablesOwdCongestionControl: false, vsyncMode: .adaptive,
             announceOverrides: [("x-nv-vqos[0].dfc.enable", "0")])
         do {
@@ -375,7 +376,7 @@ actor NativeStreamNVST: NativeStreamNVSTTransport {
         if ping < 0, let rtsp { ping = await rtsp.controlRoundTripMilliseconds() }
         guard !stopped else { return }
         let state = pipeline.snapshot
-        let detail = "native NVST hardware=\(decoder.isHardwareAccelerated) thermal=\(ProcessInfo.processInfo.thermalState.rawValue) lowPower=\(ProcessInfo.processInfo.isLowPowerModeEnabled) resolution=\(decoder.decodedResolution ?? "pending") output=\(decoder.outputPixelFormatName) sessions=\(decoder.sessionCreationCount) failed=\(decoder.failedFrameCount) errors=\(decoder.failureStatusSummary) decoderStages=\(decoder.stageTimingSummary) recovery[requests=\(keyframeRequests) control=\(controlKeyframeRequests) udp=\(udpKeyframeRequests) keyframes=\(stats.keyframesEmitted) feedback=\(bundle?.isFeedbackChannelOpen == true)] buffer=\(receiver.receiveBufferBytes) ack=\(state.frameAcksSent) pacing=\(state.pacingReportsSent) fec=\(stats.recoveredPackets) auth=\(stats.authenticatedPackets) \(state.timingSummary)"
+        let detail = "native NVST hardware=\(decoder.isHardwareAccelerated) thermal=\(ProcessInfo.processInfo.thermalState.rawValue) lowPower=\(ProcessInfo.processInfo.isLowPowerModeEnabled) resolution=\(decoder.decodedResolution ?? "pending") output=\(decoder.outputPixelFormatName) bitstream=\(decoder.bitstreamFormat?.summary ?? "pending") requestedColor=\(StreamSettingsResolver.colorQuality(for: settings).rawValue) requestedHDR=\(settings.hdrEnabled) sessions=\(decoder.sessionCreationCount) failed=\(decoder.failedFrameCount) errors=\(decoder.failureStatusSummary) decoderStages=\(decoder.stageTimingSummary) recovery[requests=\(keyframeRequests) control=\(controlKeyframeRequests) udp=\(udpKeyframeRequests) keyframes=\(stats.keyframesEmitted) feedback=\(bundle?.isFeedbackChannelOpen == true)] buffer=\(receiver.receiveBufferBytes) ack=\(state.frameAcksSent) pacing=\(state.pacingReportsSent) fec=\(stats.recoveredPackets) auth=\(stats.authenticatedPackets) \(state.timingSummary)"
         onSample(NativeStreamNVSTSample(received: counters.framesEmitted, decoded: decoded, bytes: counters.bytesReceived,
             lost: stats.finalizedLossPackets, packets: stats.authenticatedPackets, resolution: decoder.decodedResolution,
             decodeMilliseconds: state.decodeP50Milliseconds, pingMilliseconds: ping >= 0 ? ping : nil,

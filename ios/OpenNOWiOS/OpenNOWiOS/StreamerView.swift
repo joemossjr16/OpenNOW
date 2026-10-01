@@ -900,6 +900,7 @@ private struct NativeStreamStatsSnapshot: Equatable {
     var effects = ""
     var presentationRates: NativeStreamPresentationRates?
     var colorMode = "--"
+    var requestedColor = ""
     var resolution = "--"
     var fps: Int?
     var bitrateKbps: Int?
@@ -1321,8 +1322,8 @@ private struct NativeStreamStatsPill: View {
             ))
         }
         if metrics.codec {
-            items.append(Readout(id: "color", label: "Color", compact: snapshot.colorMode,
-                                 detailed: snapshot.colorMode))
+            items.append(Readout(id: "color", label: "Color", compact: snapshot.colorMode + (snapshot.requestedColor.hasSuffix("HDR") && snapshot.colorMode.contains("SDR") ? " (HDR requested)" : ""),
+                                 detailed: snapshot.requestedColor.isEmpty ? snapshot.colorMode : "Received: " + snapshot.colorMode + " · Requested: " + snapshot.requestedColor))
         }
         if metrics.location, let server = snapshot.serverLabel, !server.isEmpty {
             items.append(Readout(
@@ -2903,6 +2904,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             jitterMs: Int(sample.jitterMilliseconds.rounded()), decodeMs: sample.decodeMilliseconds >= 0 ? sample.decodeMilliseconds : nil,
             serverLabel: session.zone.isEmpty ? nil : session.zone, gpuLabel: session.gpuType,
             targetFps: streamProfile.fps, inputSummary: "r\(reliableInputPackets)/p\(partiallyReliableInputPackets)", detail: statsText)
+        statsSnapshot.requestedColor = "\(StreamSettingsResolver.colorQuality(for: settings).label) \(settings.hdrEnabled ? "HDR" : "SDR")"
         statsSnapshot.effects = renderer?.videoEffectsStatus ?? ""
         statsSnapshot.presentationRates = renderer?.presentationRates
         if decoded > 0 { handleDecodedVideoProgress(framesDecoded: decoded); raiseModeChangeNoticeIfNeeded(deliveredResolution: resolution) }
@@ -4588,6 +4590,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         // A decoded frame is authoritative. CloudMatch can publish an intermediate monitor profile
         // before video arrives, and turning that provisional value into a user-facing notice is
         // how the Android build learned to gate this on real frames.
+        statsSnapshot.requestedColor = "\(StreamSettingsResolver.colorQuality(for: settings).label) \(settings.hdrEnabled ? "HDR" : "SDR")"
         statsSnapshot.effects = renderer?.videoEffectsStatus ?? ""
         statsSnapshot.presentationRates = renderer?.presentationRates
         if (framesDecoded ?? 0) > 0 {
@@ -6356,9 +6359,11 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     private let ciContext: CIContext
     private let directHDR: NativeStreamHDRMetalRenderer?
     private var metal4HDRStorage: AnyObject?
+    private var metal4EffectsStorage: AnyObject?
     private var metal4Disabled = false
     private let submissionTimeline: NativeStreamMetalFrameTimeline?
     private var rendererBackend = "Metal / Core Image"
+    private var metal4UpscalingStatus: String?
     private let spatialUpscaler: NativeStreamSpatialUpscaler
     // Real and generated inputs can have different sizes. Keep both pipelines warm.
     private let generatedSpatialUpscaler: NativeStreamSpatialUpscaler
@@ -6383,7 +6388,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         var parts: [String] = ["Renderer: " + rendererBackend]
         if upscalingEnabled {
             parts.append("MetalFX: " + (CACurrentMediaTime() < suspendUpscalingUntil
-                ? "Paused: processing error" : spatialUpscaler.status))
+                ? "Paused: processing error" : (metal4UpscalingStatus ?? spatialUpscaler.status)))
         }
         if frameGenerationEnabled { parts.append("FG: " + generationStatus) }
         return parts.joined(separator: " · ")
@@ -6401,7 +6406,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     }
     private var loggedDirectHDR = false
     private let sharpeningFilter = CIFilter(name: "CISharpenLuminance")
-    private var colorSpace = CGColorSpaceCreateDeviceRGB()
+    private var colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
     private var hdrTransfer = NativeStreamHDRTransfer.sdr
     private let mtkView: MTKView
     /// Exposed so the render view can reach the HUD switch on whichever layer is actually live.
@@ -6452,7 +6457,10 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         if #available(iOS 26.0, *), submissionTimeline != nil {
             DispatchQueue.global(qos:.userInitiated).async { [weak self] in
                 let renderer = NativeStreamMetal4HDRRenderer(device:device)
-                DispatchQueue.main.async { [weak self] in self?.metal4HDRStorage = renderer }
+                let effects = NativeStreamMetal4EffectsRenderer(device:device)
+                DispatchQueue.main.async { [weak self] in
+                    self?.metal4HDRStorage = renderer; self?.metal4EffectsStorage = effects
+                }
             }
         }
     }
@@ -6533,7 +6541,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         let rendererTelemetry = telemetry
         let mailbox = frames
         let receivedAt = entry.receivedAt
-        if #available(iOS 26.0, *), !metal4Disabled,
+        if #available(iOS 26.0, *), !metal4Disabled, hdrTransfer != .hlg,
            !upscalingEnabled, !frameGenerationEnabled, sharpeningAmount <= 0.001,
            let metal4 = metal4HDRStorage as? NativeStreamMetal4HDRRenderer {
             let admission = gpuAdmission
@@ -6584,7 +6592,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
             }
         }
         let shouldUpscale = upscalingEnabled && drawStarted >= suspendUpscalingUntil
-        let direct = effectImage == nil && !shouldUpscale && sharpeningAmount <= 0.001 && view.currentRenderPassDescriptor.map {
+        let direct = hdrTransfer != .hlg && effectImage == nil && !shouldUpscale && sharpeningAmount <= 0.001 && view.currentRenderPassDescriptor.map {
             directHDR?.encode(buffer: pixelBuffer, commandBuffer: commandBuffer,
                 descriptor: $0, destination: destination) == true
         } == true
@@ -6619,6 +6627,47 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                     source: frameSize == .zero ? sourceExtent.size : frameSize,
                     target: targetBounds.size
                 )
+            #if !targetEnvironment(simulator)
+            if #available(iOS 26.0, *), !metal4Disabled,
+               let effects = metal4EffectsStorage as? NativeStreamMetal4EffectsRenderer {
+                let admission = gpuAdmission
+                let encodeSeconds = CACurrentMediaTime() - effectsStarted
+                let generatedFrame = generated
+                if effects.submit(image: filteredImage, destination: destination,
+                    transfer: hdrTransfer == .pq ? 1 : hdrTransfer == .hlg ? 2 : 0,
+                    upscale: shouldUpscale, context: ciContext, producer: commandBuffer,
+                    target: drawable.texture, drawable: drawable, ticket: ticket,
+                    presented: { time in
+                        rendererTelemetry.recordPresentation(at: time, receivedAt: receivedAt, generated: generatedFrame)
+                    }, completion: { [weak self, pixelBuffer] duration, error in
+                        _ = pixelBuffer
+                        admission.signal()
+                        if ownsMailboxSlot { mailbox.complete() }
+                        rendererTelemetry.recordGPU(duration)
+                        let completionTime = max(CACurrentMediaTime() - effectsStarted, duration)
+                        DispatchQueue.main.async { [weak self] in
+                            guard let self, self.effectsGeneration == effectsToken else { return }
+                            if error != nil { self.metal4Disabled = true }
+                            if self.frameGenerationEnabled || self.upscalingEnabled {
+                                self.finishEffects(failed: error != nil, generated: generatedFrame,
+                                    completionTime: completionTime, encodeSeconds: encodeSeconds,
+                                    duration: duration, displayHz: displayHz)
+                            }
+                        }
+                    }) {
+                    if let ticket { submissionTimeline?.accept(ticket) }
+                    rendererBackend = generated ? "Metal 4 · interpolated presentation" : "Metal 4 · effects presentation"
+                    if shouldUpscale { metal4UpscalingStatus = effects.status } else { metal4UpscalingStatus = nil }
+                    if videoEffectsStatus != lastEffectsStatus {
+                        lastEffectsStatus = videoEffectsStatus
+                        NativeStreamVideoPerformanceLog.record("video-effects " + videoEffectsStatus)
+                    }
+                    submitted = true
+                    return
+                }
+            }
+            #endif
+            metal4UpscalingStatus = nil
             let scaledImage: CIImage
             let activeUpscaler = generated && sourceExtent.size != frameSize ? generatedSpatialUpscaler : spatialUpscaler
             if shouldUpscale, let scaled = activeUpscaler.encode(image: filteredImage,
@@ -6665,29 +6714,8 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
             let completionTime = max(CACurrentMediaTime() - effectsStarted, duration)
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.effectsGeneration == effectsToken else { return }
-                if command.status == .error {
-                    self.frameGenerator.reset(); self.pendingRealFrame = nil
-                    self.suspendGenerationUntil = CACurrentMediaTime() + 5
-                    self.suspendUpscalingUntil = CACurrentMediaTime() + 5
-                    self.spatialUpscaler.reset(); self.generatedSpatialUpscaler.reset()
-                    self.generationPauseReason = "Paused: processing error"
-                    self.generationStatus = self.generationPauseReason
-                    self.generationBudget.reset(); self.effectsGeneration &+= 1
-                } else if generated {
-                    if self.generationBudget.record(processingSeconds: completionTime, displayHz: displayHz) {
-                        NativeStreamVideoPerformanceLog.record(String(format:
-                            "frame-generation budget pause processing=%.2f ms avg=%.2f ms encode=%.2f ms gpu=%.2f ms display=%d Hz",
-                            completionTime * 1000, self.generationBudget.averageSeconds * 1000,
-                            encodeSeconds * 1000, duration * 1000, displayHz))
-                        self.generationPauseReason = String(format: "Paused: processing %.1f ms > %.1f ms",
-                            self.generationBudget.averageSeconds * 1000, 1000.0 / Double(displayHz))
-                        self.generationStatus = self.generationPauseReason
-                        self.suspendGenerationUntil = CACurrentMediaTime() + 2
-                        self.frameGenerator.clearHistory()
-                        self.generationBudget.reset(warmingUp: false)
-                        self.effectsGeneration &+= 1
-                    }
-                }
+                self.finishEffects(failed: command.status == .error, generated: generated,
+                    completionTime: completionTime, encodeSeconds: encodeSeconds, duration: duration, displayHz: displayHz)
             }
         }
         if videoEffectsStatus != lastEffectsStatus {
@@ -6701,23 +6729,51 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         if let ticket { submissionTimeline?.accept(ticket) }
     }
 
+
+    private func finishEffects(failed: Bool, generated: Bool, completionTime: Double,
+                       encodeSeconds: Double, duration: Double, displayHz: Int) {
+        if failed {
+            self.frameGenerator.reset(); self.pendingRealFrame = nil
+            self.suspendGenerationUntil = CACurrentMediaTime() + 5
+            self.suspendUpscalingUntil = CACurrentMediaTime() + 5
+            self.spatialUpscaler.reset(); self.generatedSpatialUpscaler.reset()
+            self.generationPauseReason = "Paused: processing error"
+            self.generationStatus = self.generationPauseReason
+            self.generationBudget.reset(); self.effectsGeneration &+= 1
+        } else if generated {
+            if self.generationBudget.record(processingSeconds: completionTime, displayHz: displayHz) {
+                NativeStreamVideoPerformanceLog.record(String(format:
+                    "frame-generation budget pause processing=%.2f ms avg=%.2f ms encode=%.2f ms gpu=%.2f ms display=%d Hz",
+                    completionTime * 1000, self.generationBudget.averageSeconds * 1000,
+                    encodeSeconds * 1000, duration * 1000, displayHz))
+                self.generationPauseReason = String(format: "Paused: processing %.1f ms > %.1f ms",
+                    self.generationBudget.averageSeconds * 1000, 1000.0 / Double(displayHz))
+                self.generationStatus = self.generationPauseReason
+                self.suspendGenerationUntil = CACurrentMediaTime() + 2
+                self.frameGenerator.clearHistory()
+                self.generationBudget.reset(warmingUp: false)
+                self.effectsGeneration &+= 1
+            }
+        }
+    }
+
     private func configureColorOutput(for buffer: CVPixelBuffer) {
         let transfer = NativeStreamHDRTransfer.detect(in: buffer)
         guard transfer != hdrTransfer else { return }
         hdrTransfer = transfer
         let hdr = transfer != .sdr
-        // Apple’s normalized HDR path: keep PQ/HLG encoding and BT.2020 primaries
+        // Normalize PQ/HLG sources into PQ display encoding with BT.2020 primaries
         // in a 10-bit drawable, with an EDR layer matching the rendered color space.
         colorSpace = hdr
-            ? CGColorSpace(name: transfer == .pq ? CGColorSpace.itur_2100_PQ : CGColorSpace.itur_2100_HLG)!
-            : CGColorSpaceCreateDeviceRGB()
+            ? CGColorSpace(name: CGColorSpace.itur_2100_PQ)!
+            : CGColorSpace(name: CGColorSpace.sRGB)!
         mtkView.colorPixelFormat = hdr ? .bgr10a2Unorm : .bgra8Unorm
         if let layer = mtkView.layer as? CAMetalLayer {
             layer.colorspace = colorSpace
             layer.wantsExtendedDynamicRangeContent = hdr
         }
         NSLog("[OpenNOW] display output=%@ pixelFormat=%lu EDR=%@",
-              transfer == .pq ? "BT2020-PQ" : transfer == .hlg ? "BT2020-HLG" : "SDR",
+              hdr ? "BT2020-PQ" : "SDR",
               mtkView.colorPixelFormat.rawValue, hdr ? "on" : "off")
     }
 

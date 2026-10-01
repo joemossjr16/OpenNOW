@@ -570,6 +570,19 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(NativeStreamTenBitSurface.chroma(kCVPixelFormatType_420YpCbCr10BiPlanarFullRange), "4:2:0")
     }
 
+    func testResumingHDRDoesNotReuseKnownSDRHostFormat() {
+        var settings = AppSettings.default
+        settings.hdrEnabled = true
+        settings.preferredColorQuality = "8bit_420"
+        XCTAssertEqual(StreamSettingsResolver.colorQuality(for: settings), .tenBit420)
+        XCTAssertFalse(StreamSettingsResolver.remoteColorMatches(color: .eightBit420, hdr: false, settings: settings))
+        XCTAssertFalse(StreamSettingsResolver.remoteColorMatches(color: .tenBit420, hdr: false, settings: settings))
+        XCTAssertTrue(StreamSettingsResolver.remoteColorMatches(color: .tenBit420, hdr: true, settings: settings))
+        settings.preferredColorQuality = "10bit_444"
+        XCTAssertFalse(StreamSettingsResolver.remoteColorMatches(color: .tenBit420, hdr: true, settings: settings))
+        XCTAssertTrue(StreamSettingsResolver.remoteColorMatches(color: .tenBit444, hdr: true, settings: settings))
+    }
+
     func test444ColorRequestUsesSeparateCloudMatchAndRTSPChromaEnums() throws {
         var settings = AppSettings.default
         settings.experimentalNativeNVSTEnabled = true

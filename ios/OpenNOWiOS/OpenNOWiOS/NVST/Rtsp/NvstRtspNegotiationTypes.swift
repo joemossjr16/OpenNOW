@@ -131,6 +131,7 @@ public struct NvstRtspNegotiationInput: Sendable {
     /// The session's colour tier string (`10bit_420`, `10bit_444`, `8bit_420`...). Announced as
     /// `video[0].bitDepth` and `video[0].chromaFormat`; nil leaves the captured values in place.
     public let colorQuality: String?
+    public let hdrEnabled: Bool?
     /// Playback channels the bundle's audio section was built for (2, 6 or 8); announced as the
     /// `x-nv-audio.surround` block when above 2.
     public let audioChannelCount: Int
@@ -171,6 +172,7 @@ public struct NvstRtspNegotiationInput: Sendable {
                 prefilterDenoise: Int? = nil,
                 prefilterModel: Int? = nil,
                 colorQuality: String? = nil,
+                hdrEnabled: Bool? = nil,
                 audioChannelCount: Int = 2,
                 timeout: Duration = .seconds(20),
                 rtcpOnSctp: Bool = true,
@@ -196,6 +198,7 @@ public struct NvstRtspNegotiationInput: Sendable {
         self.prefilterDenoise = prefilterDenoise
         self.prefilterModel = prefilterModel
         self.colorQuality = colorQuality
+        self.hdrEnabled = hdrEnabled
         self.fps = fps
         self.codec = codec
         self.timeout = timeout
