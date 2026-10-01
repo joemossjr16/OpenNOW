@@ -822,7 +822,7 @@ struct SettingsView: View {
             if StreamSettingsResolver.requiresDesktopColorProvisioning(for: store.settings) {
                 Toggle("Native Touch with 4:4:4 (Experimental)",
                        isOn: $store.settings.experimentalDesktop444TouchEnabled)
-                Text("Requests native touch while keeping 4:4:4. Choose Always to test it in any game, then start a new session. Host touch support is unverified.")
+                Text("Requests native touch with 4:4:4. Choose Always, then start a new session. Host support is unverified. If the host sends 4:2:0, turn this off and start a new session to restore 4:4:4.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

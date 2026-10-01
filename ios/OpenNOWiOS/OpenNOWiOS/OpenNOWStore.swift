@@ -1994,7 +1994,7 @@ enum StreamSettingsResolver {
         // Changing the allocation identity needs a new host session, even if
         // resolution, codec and the saved touch preference are unchanged.
         if requiresDesktopColorProvisioning(for: settings) {
-            signature.append("provisioning=desktop-444-v2")
+            signature.append("provisioning=desktop-444-v3")
             signature.append("desktopTouch=\(settings.experimentalDesktop444TouchEnabled ? settings.touch.nativeTouchMode.rawValue : "off")")
         }
         return signature.joined(separator: ";")
@@ -2918,13 +2918,14 @@ enum GFNAppLaunchMode: Int {
 /// desktop-native streamer and client type (`NVIDIA-CLASSIC` / `NATIVE`) with an Android OS and a
 /// `TABLET` device type. It requests the host-side digitizer and desktop resolutions, but live
 /// iOS tests found its finalized color profile downgraded to 4:2:0 with HDR off. Native 4:4:4
-/// therefore defaults to the desktop identity. Windows tablet touch is an opt-in experiment,
-/// not a validated host capability. An earlier iOS guess — `IOS` / `MOBILE` / `GFN-MOBILE` plus two
+/// therefore keeps the desktop identity. A Windows TABLET touch experiment also downgraded
+/// color in build 141. Desktop touch provisioning remains experimental, not a validated host
+/// capability. An earlier iOS guess — `IOS` / `MOBILE` / `GFN-MOBILE` plus two
 /// invented metadata keys — provisioned no digitizer at all.
 enum StreamDeviceProfile: Equatable {
     case desktop
     case touch
-    /// Experimental Windows tablet identity with a native digitizer request.
+    /// Experimental Windows desktop identity with a native digitizer request.
     /// Color delivery and actual host touch support require a live comparison.
     case desktopTouch
 
@@ -2976,8 +2977,8 @@ enum StreamDeviceProfile: Equatable {
 
     var nvDeviceType: String {
         switch self {
-        case .desktop: return "DESKTOP"
-        case .touch, .desktopTouch: return "TABLET"
+        case .desktop, .desktopTouch: return "DESKTOP"
+        case .touch: return "TABLET"
         }
     }
 

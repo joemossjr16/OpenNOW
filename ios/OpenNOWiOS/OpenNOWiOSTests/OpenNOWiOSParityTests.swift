@@ -2375,7 +2375,7 @@ final class OpenNOWiOSParityTests: XCTestCase {
         let device = StreamDeviceProfile.resolve(game: desktopGame, settings: settings, keyboardMouseConnected: false)
         XCTAssertEqual(device, .desktopTouch)
         XCTAssertEqual(device.nvDeviceOS, "WINDOWS")
-        XCTAssertEqual(device.nvDeviceType, "TABLET")
+        XCTAssertEqual(device.nvDeviceType, "DESKTOP")
         XCTAssertEqual(device.userAgent, StreamDeviceProfile.desktop.userAgent)
         XCTAssertEqual(device.clientPlatformName, "windows")
         XCTAssertEqual(device.clientIdentification, "GFN-PC")
@@ -2426,7 +2426,7 @@ final class OpenNOWiOSParityTests: XCTestCase {
         settings.preferredColorQuality = StreamColorQuality.tenBit444.rawValue
         settings.touch.nativeTouchMode = .always
         let desktop = StreamSettingsResolver.sessionSignature(for: settings)
-        XCTAssertTrue(desktop.contains("provisioning=desktop-444-v2"))
+        XCTAssertTrue(desktop.contains("provisioning=desktop-444-v3"))
         settings.experimentalDesktop444TouchEnabled = true
         let touch = StreamSettingsResolver.sessionSignature(for: settings)
         XCTAssertNotEqual(desktop, touch)
@@ -2490,6 +2490,23 @@ final class OpenNOWiOSParityTests: XCTestCase {
             XCTAssertEqual(command.payload, expected, "Input protocol \(version)")
             XCTAssertThrowsError(try NativeStreamNVSTInput.translate(Data(source.dropLast()), timestamp: stamp, sequence: 10))
         }
+    }
+
+    func testExperimental444TouchPreservesEveryDesktopIdentityField() {
+        let touch = StreamDeviceProfile.desktopTouch
+        let desktop = StreamDeviceProfile.desktop
+        XCTAssertEqual(touch.nvDeviceOS, desktop.nvDeviceOS)
+        XCTAssertEqual(touch.nvDeviceType, desktop.nvDeviceType)
+        XCTAssertEqual(touch.nvDeviceMake, desktop.nvDeviceMake)
+        XCTAssertEqual(touch.nvDeviceModel, desktop.nvDeviceModel)
+        XCTAssertEqual(touch.userAgent, desktop.userAgent)
+        XCTAssertEqual(touch.clientPlatformName, desktop.clientPlatformName)
+        XCTAssertEqual(touch.clientIdentification, desktop.clientIdentification)
+        XCTAssertEqual(touch.persistsInGameSettings, desktop.persistsInGameSettings)
+        XCTAssertEqual(touch.appLaunchMode, .touchFriendly)
+        XCTAssertEqual(desktop.appLaunchMode, .gamepadFriendly)
+        XCTAssertEqual(StreamDeviceProfile.touch.nvDeviceType, "TABLET")
+        XCTAssertEqual(StreamDeviceProfile.touch.nvDeviceOS, "ANDROID")
     }
 
     // MARK: - Failure classification
