@@ -18,7 +18,7 @@ Build 130's iPhone sample confirmed hardware-decoded 4K 10-bit 4:4:4 HDR PQ with
 
 The iOS wrapper sent only RTCP PLI, whose writer did not propagate an unavailable feedback channel, and never used the existing native IDR command. Build 131 requests a fresh keyframe using **0x0302 on reliable SCTP control**, falls back to the encrypted Mjolnir UDP PLI path if control cannot send, and sends feedback-channel PLI only when that channel is open. Request/retry throttling remains. Local counters distinguish requests, accepted control sends, UDP fallback attempts, received keyframes and feedback-channel state.
 
-The recovery command is tested through a real local encrypted DTLS/SCTP association. Actual NVIDIA host recovery still needs verification, and this fix does not promise 4K/120 iPhone throughput. Resolution, frame rate, HDR and color settings are preserved.
+The recovery command is tested through a real local encrypted DTLS/SCTP association. A build 131 live iPhone sample confirmed 31 accepted control sends, 32 received keyframes including the initial keyframe, and continued decoding across 30 queue recoveries. The host now supplies recovery keyframes, but 4K/120 remained around 88 decoded FPS and 44ms completion time, with queue recovery about once per second. Thermal state was normal, Low Power Mode was off and display GPU time was around 2ms. This verifies recovery in the sampled session and does not establish sustainable 4K/120 throughput. Resolution, frame rate, HDR and color settings are preserved.
 
 ## Build 130 iPhone decode test
 
@@ -28,7 +28,7 @@ Build 130 offers VideoToolbox both compatible full/video-range 10-bit 4:4:4 surf
 
 A single drain worker now consumes a compressed-frame inbox capped at 32 frames with a 250ms queued-age budget. Overflow/expiration discards stale queued work and waits for a fresh keyframe, retrying requests while waiting. It preserves healthy bursts and prevents indefinite queued-frame accumulation without decoding dependent frames from a deliberately broken chain. It cannot make overloaded hardware sustain 120 FPS or guarantee the host's keyframe response time.
 
-Local numeric logs now distinguish preparation/build/submission time, completion latency, actual output format/resolution, decoder rebuilds/failures, queue recovery/drop counts, thermal state and low-power status. Sustained iPhone throughput and build 131 host recovery still need live verification. Resolution, FPS, HDR and color settings are not automatically downgraded.
+Local numeric logs now distinguish preparation/build/submission time, completion latency, actual output format/resolution, decoder rebuilds/failures, queue recovery/drop counts, thermal state and low-power status. Build 131 host recovery is confirmed in the sampled iPhone session; sustained iPhone 4K/120 throughput remains unresolved. Resolution, FPS, HDR and color settings are not automatically downgraded.
 
 ## Retained fixes
 
