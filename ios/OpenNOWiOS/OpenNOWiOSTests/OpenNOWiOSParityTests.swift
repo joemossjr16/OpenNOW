@@ -2325,9 +2325,8 @@ final class OpenNOWiOSParityTests: XCTestCase {
             controls: ["TOUCHSCREEN"]
         )
 
-        // The touch identity keeps the desktop allocation matrix, so asking for 1440p, 120 fps or
-        // HDR no longer costs the digitizer. The old envelope check declined touch above 1080p60
-        // while the stream went on sending contacts regardless.
+        // This input preference helper does not decide the allocation identity. The production
+        // StreamDeviceProfile resolver separately protects native 4:4:4's desktop color profile.
         for mode in [NativeTouchMode.automatic, .always] {
             XCTAssertEqual(
                 NativeTouchSupport.appLaunchMode(mode: mode, game: touchGame),
@@ -2335,6 +2334,112 @@ final class OpenNOWiOSParityTests: XCTestCase {
                 "mode \(mode)"
             )
         }
+    }
+
+    func testNative444DefaultsToDesktopWithoutChangingColorOrTouchPreferences() throws {
+        let game = Self.makeGame(title: "Touch Game", controls: ["TOUCHSCREEN"])
+        var settings = AppSettings.default
+        settings.experimentalNativeNVSTEnabled = true
+        settings.preferredCodec = "H265"
+        settings.preferredColorQuality = StreamColorQuality.tenBit444.rawValue
+        settings.hdrEnabled = true
+        for mode in [NativeTouchMode.automatic, .always] {
+            settings.touch.nativeTouchMode = mode
+            let device = StreamDeviceProfile.resolve(game: game, settings: settings, keyboardMouseConnected: false)
+            XCTAssertEqual(device, .desktop)
+            XCTAssertEqual(device.nvDeviceOS, "WINDOWS")
+            XCTAssertEqual(device.nvDeviceType, "DESKTOP")
+            XCTAssertEqual(device.appLaunchMode, .gamepadFriendly)
+            XCTAssertEqual(settings.touch.nativeTouchMode, mode)
+            let color = StreamSettingsResolver.colorQuality(for: settings)
+            let features = CloudMatchStreamingFeatureRequest.build(settings: settings,
+                profile: StreamSettingsResolver.profile(for: settings), bitDepth: color.bitDepth, chromaFormat: color.chromaFormat)
+            XCTAssertEqual(features["bitDepth"] as? Int, 1)
+            XCTAssertEqual(features["chromaFormat"] as? Int, 1)
+            XCTAssertEqual(features["trueHdr"] as? Bool, true)
+        }
+        // An old digitizer marker cannot silently reintroduce the Android color downgrade.
+        XCTAssertEqual(StreamDeviceProfile.resolve(game: game, settings: settings,
+            keyboardMouseConnected: false, touchProvisionedOverride: true), .desktop)
+    }
+
+    func testExperimental444TouchKeepsWindowsColorIdentityAndRespectsInputChoice() {
+        let touchGame = Self.makeGame(title: "Touch Game", controls: ["TOUCHSCREEN"])
+        let desktopGame = Self.makeGame(title: "Desktop Game", controls: ["KEYBOARD_MOUSE"])
+        var settings = AppSettings.default
+        settings.experimentalNativeNVSTEnabled = true
+        settings.preferredColorQuality = StreamColorQuality.tenBit444.rawValue
+        settings.hdrEnabled = true
+        settings.experimentalDesktop444TouchEnabled = true
+        settings.touch.nativeTouchMode = .always
+        let device = StreamDeviceProfile.resolve(game: desktopGame, settings: settings, keyboardMouseConnected: false)
+        XCTAssertEqual(device, .desktopTouch)
+        XCTAssertEqual(device.nvDeviceOS, "WINDOWS")
+        XCTAssertEqual(device.nvDeviceType, "TABLET")
+        XCTAssertEqual(device.userAgent, StreamDeviceProfile.desktop.userAgent)
+        XCTAssertEqual(device.clientPlatformName, "windows")
+        XCTAssertEqual(device.clientIdentification, "GFN-PC")
+        XCTAssertEqual(device.appLaunchMode.rawValue, 3)
+        XCTAssertEqual(device.remoteControllersBitmap, 0)
+        XCTAssertEqual(device.availableSupportedControllers, [])
+        XCTAssertEqual(StreamSettingsResolver.colorQuality(for: settings), .tenBit444)
+        XCTAssertTrue(settings.hdrEnabled)
+        XCTAssertEqual(StreamDeviceProfile.resolve(game: desktopGame, settings: settings, keyboardMouseConnected: true), .desktop)
+        settings.touch.nativeTouchMode = .never
+        XCTAssertEqual(StreamDeviceProfile.resolve(game: touchGame, settings: settings, keyboardMouseConnected: false), .desktop)
+        settings.touch.nativeTouchMode = .automatic
+        XCTAssertEqual(StreamDeviceProfile.resolve(game: desktopGame, settings: settings, keyboardMouseConnected: false), .desktop)
+        XCTAssertEqual(StreamDeviceProfile.resolve(game: touchGame, settings: settings, keyboardMouseConnected: false), .desktopTouch)
+    }
+
+    func testNativeTouchClaimRetainsInputProfileAnd420Behavior() {
+        let game = Self.makeGame(title: "Desktop Game", controls: ["KEYBOARD_MOUSE"])
+        var settings = AppSettings.default
+        settings.experimentalNativeNVSTEnabled = true
+        settings.experimentalDesktop444TouchEnabled = true
+        settings.preferredColorQuality = StreamColorQuality.tenBit444.rawValue
+        settings.touch.nativeTouchMode = .always
+        // Claiming keeps the allocation's input envelope even after keyboard/mouse hot-plug.
+        XCTAssertEqual(StreamDeviceProfile.resolve(game: game, settings: settings,
+            keyboardMouseConnected: true, touchProvisionedOverride: true), .desktopTouch)
+        XCTAssertEqual(StreamDeviceProfile.resolve(game: game, settings: settings,
+            keyboardMouseConnected: false, touchProvisionedOverride: false), .desktop)
+        settings.preferredColorQuality = StreamColorQuality.tenBit420.rawValue
+        XCTAssertEqual(StreamDeviceProfile.resolve(game: game, settings: settings, keyboardMouseConnected: false), .touch)
+        settings.experimentalDesktop444TouchEnabled = false
+        let touch = StreamDeviceProfile.resolve(game: game, settings: settings, keyboardMouseConnected: false)
+        XCTAssertEqual(touch, .touch)
+        XCTAssertEqual(touch.nvDeviceOS, "ANDROID")
+        XCTAssertEqual(touch.appLaunchMode, .touchFriendly)
+        XCTAssertEqual(StreamDeviceProfile.resolve(game: game, settings: settings,
+            keyboardMouseConnected: true, touchProvisionedOverride: true), .touch)
+        XCTAssertEqual(StreamDeviceProfile.resolve(game: game, settings: settings,
+            keyboardMouseConnected: false, touchProvisionedOverride: false), .desktop)
+    }
+
+    func testDesktop444TouchMigrationAndSignatureRequireFreshAllocation() throws {
+        let legacy = try JSONDecoder().decode(AppSettings.self, from: Data("{}".utf8))
+        XCTAssertFalse(legacy.experimentalDesktop444TouchEnabled)
+        var settings = AppSettings.default
+        settings.experimentalNativeNVSTEnabled = true
+        settings.preferredColorQuality = StreamColorQuality.tenBit444.rawValue
+        settings.touch.nativeTouchMode = .always
+        let desktop = StreamSettingsResolver.sessionSignature(for: settings)
+        XCTAssertTrue(desktop.contains("provisioning=desktop-444-v1"))
+        settings.experimentalDesktop444TouchEnabled = true
+        let touch = StreamSettingsResolver.sessionSignature(for: settings)
+        XCTAssertNotEqual(desktop, touch)
+        let restored = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings))
+        XCTAssertTrue(restored.experimentalDesktop444TouchEnabled)
+        XCTAssertEqual(restored.touch.nativeTouchMode, settings.touch.nativeTouchMode)
+        XCTAssertEqual(restored.preferredColorQuality, settings.preferredColorQuality)
+        XCTAssertEqual(StreamSettingsResolver.sessionSignature(for: restored), touch)
+        settings.touch.nativeTouchMode = .never
+        XCTAssertNotEqual(StreamSettingsResolver.sessionSignature(for: settings), touch)
+        settings.preferredColorQuality = StreamColorQuality.tenBit420.rawValue
+        let old420 = StreamSettingsResolver.sessionSignature(for: settings)
+        settings.experimentalDesktop444TouchEnabled = false
+        XCTAssertEqual(StreamSettingsResolver.sessionSignature(for: settings), old420)
     }
 
     // MARK: - Failure classification

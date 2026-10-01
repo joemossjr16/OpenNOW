@@ -3117,6 +3117,10 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     /// produce it are not individually readable as an outcome, so the panel shows this instead.
     var resolvedTouchModeLabel: String {
         if nativeTouchActive {
+            if StreamSettingsResolver.requiresDesktopColorProvisioning(for: liveSettings),
+               liveSettings.experimentalDesktop444TouchEnabled {
+                return "Native Touch · experimental 4:4:4"
+            }
             return ResolvedTouchMode.nativeTouch.label
         }
         // Turning touch on inside a session the host provisioned without a digitizer cannot take

@@ -819,6 +819,14 @@ struct SettingsView: View {
                 }
             }
 
+            if StreamSettingsResolver.requiresDesktopColorProvisioning(for: store.settings) {
+                Toggle("Native Touch with 4:4:4 (Experimental)",
+                       isOn: $store.settings.experimentalDesktop444TouchEnabled)
+                Text("Requests native touch while keeping 4:4:4. Choose Always to test it in any game, then start a new session. Host touch support is unverified.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             if store.settings.touch.nativeTouchMode != .never {
                 settingsSlider(
                     "Touch Scroll Speed",
@@ -936,7 +944,9 @@ struct SettingsView: View {
     /// The end state the routing settings actually add up to. Showing this is the difference
     /// between three comprehensible pickers and three confusing ones.
     private var resolvedTouchMode: ResolvedTouchMode {
-        switch store.settings.touch.nativeTouchMode {
+        let desktopWithoutTouch = StreamSettingsResolver.requiresDesktopColorProvisioning(for: store.settings)
+            && !store.settings.experimentalDesktop444TouchEnabled
+        switch desktopWithoutTouch ? .never : store.settings.touch.nativeTouchMode {
         case .always:
             return .nativeTouch
         case .automatic, .never:

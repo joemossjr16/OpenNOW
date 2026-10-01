@@ -205,7 +205,13 @@ actor NativeStreamNVST: NativeStreamNVSTTransport {
             displayVsyncMicroseconds: UInt32(1_000_000 / max(1, displayFPS)),
             logger: Self.log, mediaSink: nil,
             onKeyframeNeeded: { [weak self] in Task { await self?.requestKeyframe() } },
-            onFatalDecodeError: { [weak self] reason in Task { await self?.fail(reason) } })
+            onFatalDecodeError: { [weak self] reason in
+                // Decoder-owned messages contain format/OSStatus, not protocol
+                // endpoints or credentials. Keep the actual rejection in the
+                // bounded log even when no decoded frame reaches the HUD.
+                Self.log("NVST decoder fatal: " + reason)
+                Task { await self?.fail(reason) }
+            })
         self.pipeline = pipeline
         pipeline.attach(bundle: bundle)
         let descriptor = reserver?.takeMjolnirDescriptor() ?? -1

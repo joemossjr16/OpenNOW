@@ -878,6 +878,7 @@ struct AppSettings: Codable, Equatable {
     var preferredCodec: String
     var nativeStreamerEnabled: Bool = false
     var experimentalNativeNVSTEnabled: Bool = false
+    var experimentalDesktop444TouchEnabled: Bool = false
     var preferredColorQuality: String = StreamColorQuality.eightBit420.rawValue
     var hdrEnabled: Bool = false
     var maxBitrateMbps: Int
@@ -991,6 +992,7 @@ struct AppSettings: Codable, Equatable {
         case preferredCodec
         case nativeStreamerEnabled
         case experimentalNativeNVSTEnabled
+        case experimentalDesktop444TouchEnabled
         case preferredColorQuality
         case hdrEnabled
         case maxBitrateMbps
@@ -1116,6 +1118,7 @@ struct AppSettings: Codable, Equatable {
         preferredCodec = try container.decodeIfPresent(String.self, forKey: .preferredCodec) ?? "Auto"
         nativeStreamerEnabled = try container.decodeIfPresent(Bool.self, forKey: .nativeStreamerEnabled) ?? false
         experimentalNativeNVSTEnabled = try container.decodeIfPresent(Bool.self, forKey: .experimentalNativeNVSTEnabled) ?? false
+        experimentalDesktop444TouchEnabled = try container.decodeIfPresent(Bool.self, forKey: .experimentalDesktop444TouchEnabled) ?? false
         preferredColorQuality = try container.decodeIfPresent(String.self, forKey: .preferredColorQuality) ?? StreamColorQuality.eightBit420.rawValue
         hdrEnabled = try container.decodeIfPresent(Bool.self, forKey: .hdrEnabled) ?? false
         maxBitrateMbps = try container.decodeIfPresent(Int.self, forKey: .maxBitrateMbps) ?? 0
@@ -1974,7 +1977,7 @@ enum StreamSettingsResolver {
 
     static func sessionSignature(for settings: AppSettings, profile: StreamVideoProfile) -> String {
         let color = colorQuality(for: settings).rawValue
-        return [
+        var signature = [
             "opennow-ios-stream-v2",
             "res=\(profile.width)x\(profile.height)",
             "fps=\(profile.fps)",
@@ -1987,7 +1990,14 @@ enum StreamSettingsResolver {
             "gsync=\(settings.enableCloudGsync ? 1 : 0)",
             "keyboard=\(settings.keyboardLayout.trimmingCharacters(in: .whitespacesAndNewlines))",
             "language=\(settings.gameLanguage.trimmingCharacters(in: .whitespacesAndNewlines))"
-        ].joined(separator: ";")
+        ]
+        // Changing the allocation identity needs a new host session, even if
+        // resolution, codec and the saved touch preference are unchanged.
+        if requiresDesktopColorProvisioning(for: settings) {
+            signature.append("provisioning=desktop-444-v1")
+            signature.append("desktopTouch=\(settings.experimentalDesktop444TouchEnabled ? settings.touch.nativeTouchMode.rawValue : "off")")
+        }
+        return signature.joined(separator: ";")
     }
 
     static func profile(
@@ -2126,6 +2136,10 @@ enum StreamSettingsResolver {
 
     static func remoteColorMatches(color: StreamColorQuality?, hdr: Bool?, settings: AppSettings) -> Bool {
         (color == nil || color == colorQuality(for: settings)) && (hdr == nil || hdr == settings.hdrEnabled)
+    }
+
+    static func requiresDesktopColorProvisioning(for settings: AppSettings) -> Bool {
+        settings.experimentalNativeNVSTEnabled && colorQuality(for: settings).chromaFormat == 2
     }
 
     private static func profilePlanLimit(for membershipTier: String?) -> StreamResolutionPlan {
@@ -2898,38 +2912,57 @@ enum GFNAppLaunchMode: Int {
     case touchFriendly = 3
 }
 
-/// The CloudMatch client identity a session is requested under, and the launch mode that goes with
-/// it. One value owns both because they are not independent: asking for `touchFriendly` under the
-/// desktop identity is a session that claims a digitizer and allocates as though it had none.
+/// Owns the allocation identity and requested input-device envelope together.
 ///
-/// The touch identity is not a guess. It is the combination the Android build validated: the
+/// The touch identity is the combination the Android build validated: the
 /// desktop-native streamer and client type (`NVIDIA-CLASSIC` / `NATIVE`) with an Android OS and a
-/// `TABLET` device type. That pairing tells the server to enable the host-side digitizer *and*
-/// keep the full desktop resolution matrix, so touch is no longer paid for with a downgraded
-/// allocation. An earlier iOS-flavoured guess at this — `IOS` / `MOBILE` / `GFN-MOBILE` plus two
+/// `TABLET` device type. It requests the host-side digitizer and desktop resolutions, but live
+/// iOS tests found its finalized color profile downgraded to 4:2:0 with HDR off. Native 4:4:4
+/// therefore defaults to the desktop identity. Windows tablet touch is an opt-in experiment,
+/// not a validated host capability. An earlier iOS guess — `IOS` / `MOBILE` / `GFN-MOBILE` plus two
 /// invented metadata keys — provisioned no digitizer at all.
-private enum StreamDeviceProfile: Equatable {
+enum StreamDeviceProfile: Equatable {
     case desktop
     case touch
+    /// Experimental Windows tablet identity with a native digitizer request.
+    /// Color delivery and actual host touch support require a live comparison.
+    case desktopTouch
+
+    static func resolve(game: CloudGame, settings: AppSettings,
+                        keyboardMouseConnected: Bool, touchProvisionedOverride: Bool? = nil) -> Self {
+        // A live 5080h/B40 comparison delivered 4:2:0 and HDR off under the
+        // Android touch profile, then 4:4:4 HDR under the desktop profile.
+        // Native Windows touch is an explicit experiment; the default keeps the
+        // verified desktop 4:4:4 path and finger mouse/controller input.
+        if StreamSettingsResolver.requiresDesktopColorProvisioning(for: settings) {
+            let touchRequested = touchProvisionedOverride
+                ?? (NativeTouchSupport.shouldUseNativeTouch(mode: settings.touch.nativeTouchMode, game: game)
+                    && !keyboardMouseConnected)
+            return settings.experimentalDesktop444TouchEnabled && touchRequested ? .desktopTouch : .desktop
+        }
+        if let touchProvisionedOverride { return touchProvisionedOverride ? .touch : .desktop }
+        return NativeTouchSupport.shouldUseNativeTouch(mode: settings.touch.nativeTouchMode, game: game)
+            && !keyboardMouseConnected ? .touch : .desktop
+    }
 
     var appLaunchMode: GFNAppLaunchMode {
         switch self {
         case .desktop: return .gamepadFriendly
-        case .touch: return .touchFriendly
+        case .touch, .desktopTouch: return .touchFriendly
         }
     }
 
     var remoteControllersBitmap: Int {
-        self == .touch ? 0 : 1
+        self == .desktop ? 1 : 0
     }
 
     var availableSupportedControllers: [Int] {
-        self == .touch ? [] : [2]
+        self == .desktop ? [2] : []
     }
 
     var nvDeviceOS: String {
         switch self {
-        case .desktop: return "WINDOWS"
+        case .desktop, .desktopTouch: return "WINDOWS"
         case .touch: return "ANDROID"
         }
     }
@@ -2937,7 +2970,7 @@ private enum StreamDeviceProfile: Equatable {
     var nvDeviceType: String {
         switch self {
         case .desktop: return "DESKTOP"
-        case .touch: return "TABLET"
+        case .touch, .desktopTouch: return "TABLET"
         }
     }
 
@@ -2945,28 +2978,28 @@ private enum StreamDeviceProfile: Equatable {
     /// model go back to that identity's own values rather than naming the iPhone.
     var nvDeviceMake: String {
         switch self {
-        case .desktop: return "APPLE"
+        case .desktop, .desktopTouch: return "APPLE"
         case .touch: return "UNKNOWN"
         }
     }
 
     var nvDeviceModel: String {
         switch self {
-        case .desktop: return OpenNOWPlatform.displayName
+        case .desktop, .desktopTouch: return OpenNOWPlatform.displayName
         case .touch: return "UNKNOWN"
         }
     }
 
     var userAgent: String {
         switch self {
-        case .desktop: return GFNConstants.userAgent
+        case .desktop, .desktopTouch: return GFNConstants.userAgent
         case .touch: return GFNConstants.touchUserAgent
         }
     }
 
     var clientPlatformName: String {
         switch self {
-        case .desktop: return "windows"
+        case .desktop, .desktopTouch: return "windows"
         case .touch: return "android"
         }
     }
@@ -2975,7 +3008,7 @@ private enum StreamDeviceProfile: Equatable {
     /// borrowed one and must not write a phone session's choices back over the desktop profile.
     var persistsInGameSettings: Bool {
         switch self {
-        case .desktop: return true
+        case .desktop, .desktopTouch: return true
         case .touch: return false
         }
     }
@@ -4399,8 +4432,9 @@ private actor GFNAPIClient {
         // Claiming repeats the session request body. During recovery, retain the input device
         // profile chosen when this allocation was created instead of letting a transient hot-plug
         // silently change a touch session into a controller session (or vice versa).
-        let deviceProfile = touchProvisionedOverride.map { $0 ? StreamDeviceProfile.touch : .desktop }
-            ?? Self.streamDeviceProfile(for: game, settings: settings)
+        let deviceProfile = StreamDeviceProfile.resolve(game: game, settings: settings,
+            keyboardMouseConnected: NativeStreamPhysicalInput.keyboardOrMouseConnected,
+            touchProvisionedOverride: touchProvisionedOverride)
         let zoneBase = Self.normalizedStreamingBase(streamingBaseUrl, vpcId: vpcId)
         var effectiveServerIp = Self.remoteSessionTargetHost(
             serverIp: candidate.serverIp,
@@ -5949,20 +5983,15 @@ private actor GFNAPIClient {
     /// Which CloudMatch identity — and therefore which `appLaunchMode` — this session is created
     /// under.
     ///
-    /// This deliberately reads `shouldUseNativeTouch`, the same predicate the live stream reads to
-    /// decide whether to send digitizer contacts. The two used to be different functions: the
-    /// session asked whether the *mobile allocation envelope* could take the requested profile and
-    /// declined the touch identity above 1080p60, while the stream went on sending touch packets
-    /// regardless. That envelope no longer exists — the touch identity keeps the desktop
-    /// allocation matrix — and one predicate means the session and the stream cannot disagree.
+    /// Native 4:4:4 needs the desktop color envelope. Other native-touch requests
+    /// keep the digitizer profile, including their resolution/FPS choices. The
+    /// resulting `touchProvisioned` flag also gates the live touch sender.
     private static func streamDeviceProfile(
         for game: CloudGame,
         settings: AppSettings
     ) -> StreamDeviceProfile {
-        NativeTouchSupport.shouldUseNativeTouch(
-            mode: settings.touch.nativeTouchMode,
-            game: game
-        ) && !NativeStreamPhysicalInput.keyboardOrMouseConnected ? .touch : .desktop
+        StreamDeviceProfile.resolve(game: game, settings: settings,
+            keyboardMouseConnected: NativeStreamPhysicalInput.keyboardOrMouseConnected)
     }
 
     private static func generatePKCE() -> (verifier: String, challenge: String) {
