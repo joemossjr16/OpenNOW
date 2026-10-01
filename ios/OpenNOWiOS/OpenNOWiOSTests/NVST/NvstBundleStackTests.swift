@@ -67,6 +67,20 @@ import Testing
         #expect(deliveredReply.payload == reply)
     }
 
+    @Test func explicitKeyframeRequestReachesSeatOverReliableDtlsSctpControl() async throws {
+        let seat = try await startBundleWithLocalSeat(microphone: nil)
+        defer { seat.bundle.close(); seat.transport.close(); seat.peer.close() }
+        try await waitUntil(timeout: 15) { seat.bundle.isControlChannelOpen }
+        #expect(NativeStreamKeyframeRecovery.request(sendControl: { seat.bundle.sendControl($0) },
+            sendUDP: { Issue.record("An established control channel should carry the IDR request") }))
+        let expected = Data([0x02, 0x03, 0x02, 0x00, 0x00, 0x00])
+        try await waitUntil(timeout: 5) {
+            seat.peer.messages.contains { $0.streamID == 0
+                && $0.ppid == NvstSctpAssociation.PPID.binary && $0.payload == expected }
+        }
+        #expect(seat.peer.messages.contains { $0.streamID == 0 && $0.payload == expected })
+    }
+
     @Test func theBundleDecodesSeatAudioOverItsEstablishedChannels() async throws {
         let bundleSeat = try await startBundleWithLocalSeat(microphone: nil)
         defer { bundleSeat.bundle.close(); bundleSeat.transport.close(); bundleSeat.peer.close() }

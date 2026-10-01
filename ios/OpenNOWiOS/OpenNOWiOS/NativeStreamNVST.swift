@@ -3,6 +3,17 @@ import CoreVideo
 import Foundation
 import WebRTC
 
+/// A PLI on an unopened feedback channel can be discarded without an error. The
+/// host also accepts an explicit IDR command on its reliable control channel.
+enum NativeStreamKeyframeRecovery {
+    @discardableResult
+    static func request(sendControl: (NvstControlCommand) -> Bool, sendUDP: () -> Void) -> Bool {
+        let sent = sendControl(.idrRequest())
+        if !sent { sendUDP() }
+        return sent
+    }
+}
+
 struct NativeStreamNVSTSample: Sendable {
     let received: UInt64
     let decoded: UInt64
@@ -62,6 +73,9 @@ actor NativeStreamNVST: NativeStreamNVSTTransport {
     private var lastRtpStatsFrame: UInt64 = 0
     private var lastControlStatsAt: Date?
     private var lastKeyframeRequestAt: Date?
+    private var keyframeRequests = 0
+    private var controlKeyframeRequests = 0
+    private var udpKeyframeRequests = 0
     private var lastProgressAt = Date()
     private var lastDecoded: UInt64 = 0
     private var didFail = false
@@ -168,6 +182,8 @@ actor NativeStreamNVST: NativeStreamNVSTTransport {
         keepalive?.cancel(); keepalive = nil; qos?.cancel(); qos = nil
         feedback.stop(); activatedInput = false
         preparationError = nil; lastQosBytes = 0; lastDelay = 0; qosSequence = 0
+        lastKeyframeRequestAt = nil
+        keyframeRequests = 0; controlKeyframeRequests = 0; udpKeyframeRequests = 0
         lastRtpStatsFrame = 0; lastControlStatsAt = nil; gamepadSequences.removeAll()
 
 
@@ -329,9 +345,17 @@ actor NativeStreamNVST: NativeStreamNVSTTransport {
     private func requestKeyframe() {
         guard !stopped, lastKeyframeRequestAt.map({ Date().timeIntervalSince($0) >= 0.25 }) ?? true else { return }
         lastKeyframeRequestAt = Date()
-        if let ssrc = receiver?.stats.boundSSRC { feedback.updateMediaSSRC(ssrc) }
-        try? feedback.sendKeyframeRequestNow()
-        feedback.requestKeyframe()
+        keyframeRequests += 1
+        let controlSent = NativeStreamKeyframeRecovery.request(
+            sendControl: { bundle?.sendControl($0) ?? false },
+            sendUDP: { receiver?.requestKeyframe() })
+        if controlSent { controlKeyframeRequests += 1 }
+        else { udpKeyframeRequests += 1 }
+        if bundle?.isFeedbackChannelOpen == true {
+            if let ssrc = receiver?.stats.boundSSRC { feedback.updateMediaSSRC(ssrc) }
+            try? feedback.sendKeyframeRequestNow()
+            feedback.requestKeyframe()
+        }
     }
 
     private func sample() async {
@@ -351,7 +375,7 @@ actor NativeStreamNVST: NativeStreamNVSTTransport {
         if ping < 0, let rtsp { ping = await rtsp.controlRoundTripMilliseconds() }
         guard !stopped else { return }
         let state = pipeline.snapshot
-        let detail = "native NVST hardware=\(decoder.isHardwareAccelerated) thermal=\(ProcessInfo.processInfo.thermalState.rawValue) lowPower=\(ProcessInfo.processInfo.isLowPowerModeEnabled) resolution=\(decoder.decodedResolution ?? "pending") output=\(decoder.outputPixelFormatName) sessions=\(decoder.sessionCreationCount) failed=\(decoder.failedFrameCount) errors=\(decoder.failureStatusSummary) decoderStages=\(decoder.stageTimingSummary) buffer=\(receiver.receiveBufferBytes) ack=\(state.frameAcksSent) pacing=\(state.pacingReportsSent) fec=\(stats.recoveredPackets) auth=\(stats.authenticatedPackets) \(state.timingSummary)"
+        let detail = "native NVST hardware=\(decoder.isHardwareAccelerated) thermal=\(ProcessInfo.processInfo.thermalState.rawValue) lowPower=\(ProcessInfo.processInfo.isLowPowerModeEnabled) resolution=\(decoder.decodedResolution ?? "pending") output=\(decoder.outputPixelFormatName) sessions=\(decoder.sessionCreationCount) failed=\(decoder.failedFrameCount) errors=\(decoder.failureStatusSummary) decoderStages=\(decoder.stageTimingSummary) recovery[requests=\(keyframeRequests) control=\(controlKeyframeRequests) udp=\(udpKeyframeRequests) keyframes=\(stats.keyframesEmitted) feedback=\(bundle?.isFeedbackChannelOpen == true)] buffer=\(receiver.receiveBufferBytes) ack=\(state.frameAcksSent) pacing=\(state.pacingReportsSent) fec=\(stats.recoveredPackets) auth=\(stats.authenticatedPackets) \(state.timingSummary)"
         onSample(NativeStreamNVSTSample(received: counters.framesEmitted, decoded: decoded, bytes: counters.bytesReceived,
             lost: stats.finalizedLossPackets, packets: stats.authenticatedPackets, resolution: decoder.decodedResolution,
             decodeMilliseconds: state.decodeP50Milliseconds, pingMilliseconds: ping >= 0 ? ping : nil,

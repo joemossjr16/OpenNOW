@@ -8,6 +8,24 @@ import Metal
 @testable import OpenNOWiOS
 
 final class OpenNOWiOSParityTests: XCTestCase {
+    func testNativeKeyframeRecoverySendsExplicitControlCommandWithoutFeedbackChannel() throws {
+        var sent: NvstControlCommand?
+        var udpRequests = 0
+        XCTAssertTrue(NativeStreamKeyframeRecovery.request(sendControl: { sent = $0; return true },
+            sendUDP: { udpRequests += 1 }))
+        XCTAssertEqual(try XCTUnwrap(sent).encoded, Data([0x02, 0x03, 0x02, 0x00, 0x00, 0x00]))
+        XCTAssertEqual(udpRequests, 0)
+    }
+
+    func testNativeKeyframeRecoveryFallsBackWhenControlCannotSend() {
+        var attempts = 0
+        var udpRequests = 0
+        XCTAssertFalse(NativeStreamKeyframeRecovery.request(sendControl: { _ in attempts += 1; return false },
+            sendUDP: { udpRequests += 1 }))
+        XCTAssertEqual(attempts, 1)
+        XCTAssertEqual(udpRequests, 1)
+    }
+
     func testDecodeInboxPreservesHealthyBurstsAndFIFO() {
         var inbox = NvstDecodeFrameInbox<Int>()
         for frame in 0..<12 {

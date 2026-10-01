@@ -1,8 +1,8 @@
-# Joe's OpenNOW iOS build 130
+# Joe's OpenNOW iOS build 131
 
-This branch contains the source for **OpenNOW 1.1.130**, based on the upstream iOS branch at `95c0f58d42eeed176edd677f604b193c85169d9e`. It includes the earlier local iOS changes needed by the current native receiver, hardware AV1/HDR rendering, catalog and launch features.
+This branch contains the source for **OpenNOW 1.1.131**, based on the upstream iOS branch at `95c0f58d42eeed176edd677f604b193c85169d9e`. It includes the earlier local iOS changes needed by the current native receiver, hardware AV1/HDR rendering, catalog and launch features.
 
-[Unsigned IPA and build notes](https://github.com/joemossjr16/ios-apps/releases/tag/opennow-130) · [KravaSigner feed](https://raw.githubusercontent.com/joemossjr16/ios-apps/main/repo.json)
+[Unsigned IPA and build notes](https://github.com/joemossjr16/ios-apps/releases/tag/opennow-131) · [KravaSigner feed](https://raw.githubusercontent.com/joemossjr16/ios-apps/main/repo.json)
 
 ## Experimental 10-bit 4:4:4 HDR
 
@@ -12,6 +12,14 @@ The receiver checks the incoming HEVC bitstream for exactly 10-bit 4:4:4, requir
 
 The **Color** status reports actual decoded output and transfer metadata. Look for **10-bit 4:4:4 HDR PQ** for a PQ HDR stream. Host SDR output remains labeled SDR. Build 129 live logs confirmed hardware-decoded 10-bit 4:4:4 HDR PQ on both an iPhone 18 Pro Max and M5 iPad Pro. The iPhone could not sustain the tested 4K/120 workload; successful format support does not establish real-time throughput. Choose **10-bit 4:2:0** if the host or device cannot support it. AV1 remains available for 4:2:0.
 
+## Build 131 recovery fix
+
+Build 130's iPhone sample confirmed hardware-decoded 4K 10-bit 4:4:4 HDR PQ with normal thermal state and Low Power Mode off. Moving segments showed roughly 19–31ms median completion time and about 78–88 decoded FPS as arrival rate varied. The queue-age peak stayed around 249ms, but recovery could then wait for a fresh keyframe until decoding stopped. Those changing conditions do not prove the range-selection change made the hardware faster.
+
+The iOS wrapper sent only RTCP PLI, whose writer did not propagate an unavailable feedback channel, and never used the existing native IDR command. Build 131 requests a fresh keyframe using **0x0302 on reliable SCTP control**, falls back to the encrypted Mjolnir UDP PLI path if control cannot send, and sends feedback-channel PLI only when that channel is open. Request/retry throttling remains. Local counters distinguish requests, accepted control sends, UDP fallback attempts, received keyframes and feedback-channel state.
+
+The recovery command is tested through a real local encrypted DTLS/SCTP association. Actual NVIDIA host recovery still needs verification, and this fix does not promise 4K/120 iPhone throughput. Resolution, frame rate, HDR and color settings are preserved.
+
 ## Build 130 iPhone decode test
 
 With the same requested 4K/120 H265 10-bit 4:4:4 HDR settings, build 129 samples showed roughly 120 received FPS but only 88–90 decoded FPS and about 50ms completion latency on iPhone. Queued work grew past 20 seconds of delay. An iPad working segment showed roughly 120 decoded FPS and 7.7ms completion latency. iPhone display GPU time was about 2.5ms.
@@ -20,7 +28,7 @@ Build 130 offers VideoToolbox both compatible full/video-range 10-bit 4:4:4 surf
 
 A single drain worker now consumes a compressed-frame inbox capped at 32 frames with a 250ms queued-age budget. Overflow/expiration discards stale queued work and waits for a fresh keyframe, retrying requests while waiting. It preserves healthy bursts and prevents indefinite queued-frame accumulation without decoding dependent frames from a deliberately broken chain. It cannot make overloaded hardware sustain 120 FPS or guarantee the host's keyframe response time.
 
-Local numeric logs now distinguish preparation/build/submission time, completion latency, actual output format/resolution, decoder rebuilds/failures, queue recovery/drop counts, thermal state and low-power status. Build 130 hardware speed still needs comparison after installation. Resolution, FPS, HDR and color settings are not automatically downgraded.
+Local numeric logs now distinguish preparation/build/submission time, completion latency, actual output format/resolution, decoder rebuilds/failures, queue recovery/drop counts, thermal state and low-power status. Sustained iPhone throughput and build 131 host recovery still need live verification. Resolution, FPS, HDR and color settings are not automatically downgraded.
 
 ## Retained fixes
 
@@ -57,7 +65,7 @@ The unsigned device app is in `DerivedData/Build/Products/Debug-iphoneos/OpenNOW
 
 Enable **Settings → Stream → Connection → Native NVST Receiver (Experimental)** and start or resume a session. The standard WebRTC receiver remains the default. Native NVST requires iOS 17 or later, an advertised RTSPS endpoint, and hardware decoding. A 10-bit stream cannot silently use an 8-bit output surface. Existing quality settings and device identity are preserved.
 
-Build 130 passed an unsigned arm64 device build and **170 targeted simulator tests**. Tests additionally verify healthy queue bursts/FIFO order, bounded overflow and keyframe retry over thousands of arrivals, stale-work expiration, and that compatible range requests never allow chroma/depth downgrade. Existing tests verify strict 10-bit/4:4:4 bitstream validation, full/video-range surfaces, actual-output HDR labels, settings persistence, separate CloudMatch and RTSP chroma enums, and GPU readback of alternating one-pixel chroma detail through the HDR Metal renderer. Existing tests cover pointer preference and teardown, capture release policy, independent PiP conversion from 10-bit HDR, PiP clock/size bounds, early/reordered/rejected completion bookkeeping, encrypted DTLS/SCTP control and input, SRTP/FEC, RTSP, AV1/HDR metadata and settings migration. Simulator rendering tests do not establish physical hardware support for HEVC 10-bit 4:4:4.
+Build 131 passed an unsigned arm64 device build and **173 targeted simulator tests**. New checks cover exact IDR control-command framing, UDP fallback, and command delivery through a local encrypted DTLS/SCTP association. Tests additionally verify healthy queue bursts/FIFO order, bounded overflow and keyframe retry over thousands of arrivals, stale-work expiration, and that compatible range requests never allow chroma/depth downgrade. Existing tests verify strict 10-bit/4:4:4 bitstream validation, full/video-range surfaces, actual-output HDR labels, settings persistence, separate CloudMatch and RTSP chroma enums, and GPU readback of alternating one-pixel chroma detail through the HDR Metal renderer. Existing tests cover pointer preference and teardown, capture release policy, independent PiP conversion from 10-bit HDR, PiP clock/size bounds, early/reordered/rejected completion bookkeeping, encrypted DTLS/SCTP control and input, SRTP/FEC, RTSP, AV1/HDR metadata and settings migration. Simulator rendering tests do not establish physical hardware support for HEVC 10-bit 4:4:4.
 
 Physical iPad mouse capture, PiP/background behavior and the updated decode timing still need testing after installation. Simulator results do not establish physical-device performance. Build 127 live samples showed roughly 120 received/decoded FPS on iPhone and on iPad after a restart; the earlier recurring iPad arrival gaps were absent in the post-restart sample, with their cause still unconfirmed.
 
