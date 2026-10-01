@@ -288,7 +288,8 @@
     "Receiver RTP jitter uses the protocol clock constant without depending on decoder availability.",
     "Local-peer tests supply their audio clock and disable physical RemoteIO startup; device production starts RemoteIO and reports startup failure.",
     "Native decode bookkeeping registers before VideoToolbox submission and matches completion by frame index; synchronous rejection and empty samples clear their own entry.",
-    "Native playback audio uses moviePlayback mode when microphone capture is disabled."
+    "Native playback audio uses moviePlayback mode when microphone capture is disabled.",
+    "Experimental HEVC 10-bit 4:4:4 validates bitstream depth/chroma, requests only matching full/video-range surfaces, requires hardware decode and validates actual output plane geometry; no 4:2:0/8-bit fallback."
   ],
   "tests": [
     {

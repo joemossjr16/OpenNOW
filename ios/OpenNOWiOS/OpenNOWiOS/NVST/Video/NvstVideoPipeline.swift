@@ -287,6 +287,7 @@ public final class NvstVideoPipeline: @unchecked Sendable {
         decoder.onDecodeCompleted = { [weak self] frameIndex, success in
             self?.handleDecodeCompleted(frameIndex: frameIndex, success: success)
         }
+        decoder.onFatalFormatFailure = onFatalDecodeError
     }
 
     /// Hands over the channel the frame acks go out on, once the bundle is up.
@@ -387,6 +388,15 @@ public final class NvstVideoPipeline: @unchecked Sendable {
             return
         } catch {
             discardDecodeCompletion(frameIndex: unit.frameIndex)
+            if decoder.requiresTenBit444, let error = error as? NvstVideoToolboxDecoder.DecoderError {
+                switch error {
+                case .requested444NotDelivered, .unsupported444Hardware, .output444NotPreserved,
+                     .hardwareRequired, .formatDescriptionFailed:
+                    onFatalDecodeError(error.localizedDescription)
+                    return
+                default: break
+                }
+            }
             consecutiveDecodeFailures += 1
             logger?("NVST decode error: \(error.localizedDescription)")
             // A bad-data rejection means the reference chain is broken, and every following frame

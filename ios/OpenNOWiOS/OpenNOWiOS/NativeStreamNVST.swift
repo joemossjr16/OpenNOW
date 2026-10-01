@@ -171,7 +171,8 @@ actor NativeStreamNVST: NativeStreamNVSTTransport {
         lastRtpStatsFrame = 0; lastControlStatsAt = nil; gamepadSequences.removeAll()
 
 
-        let decoder = NvstVideoToolboxDecoder(codec: handoff.codec)
+        let decoder = NvstVideoToolboxDecoder(codec: handoff.codec,
+            requiresTenBit444: StreamSettingsResolver.colorQuality(for: settings) == .tenBit444)
         self.decoder = decoder
         let callback = onFrame
         decoder.onPixelBuffer = { pixelBuffer, time, _ in

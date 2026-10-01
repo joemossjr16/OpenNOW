@@ -1,6 +1,6 @@
 <h1 align="center">OpenNOW</h1>
 
-**Joe's iOS build 128:** [source changes, build instructions and validation](ios/OpenNOWiOS/README.md) · [unsigned IPA](https://github.com/joemossjr16/ios-apps/releases/tag/opennow-128)
+**Joe's iOS build 129:** [source changes, build instructions and validation](ios/OpenNOWiOS/README.md) · [unsigned IPA](https://github.com/joemossjr16/ios-apps/releases/tag/opennow-129)
 
 <p align="center">
   <img src="logo.png" alt="OpenNOW logo" width="180" />

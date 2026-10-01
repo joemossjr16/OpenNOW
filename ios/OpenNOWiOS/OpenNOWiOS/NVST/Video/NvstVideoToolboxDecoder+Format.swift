@@ -90,13 +90,21 @@ extension NvstVideoToolboxDecoder {
     /// same normalised coordinates, so 4:2:2 and 4:4:4 chroma planes of any size bind unchanged,
     /// and full range is what the YCbCr shaders assume. A 10-bit stream asks for the matching
     /// 10-bit surface so the decoder no longer truncates every frame to 8 bits before the renderer
-    /// sees it. The 8-bit 4:2:0 surface is always the last resort, because VideoToolbox will
-    /// convert down to it from anything.
-    static func preferredOutputPixelFormats(for format: BitstreamFormat) -> [OSType] {
+    /// sees it. Strict 4:4:4 offers only full/video-range 10-bit 4:4:4 surfaces.
+    static func validate444Bitstream(_ format: BitstreamFormat) throws {
+        guard format.bitDepth == 10, format.chroma == .yuv444 else {
+            throw DecoderError.requested444NotDelivered(format.summary)
+        }
+    }
+
+    static func preferredOutputPixelFormats(for format: BitstreamFormat, requiresTenBit444: Bool = false) -> [OSType] {
+        if requiresTenBit444 {
+            return [kCVPixelFormatType_444YpCbCr10BiPlanarFullRange, kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange]
+        }
         let fallback = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
         var preferred: [OSType] = []
         switch (format.chroma, format.isTenBit) {
-        case (.yuv444, true): preferred = [kCVPixelFormatType_444YpCbCr10BiPlanarFullRange, kCVPixelFormatType_420YpCbCr10BiPlanarFullRange]
+        case (.yuv444, true): preferred = [kCVPixelFormatType_444YpCbCr10BiPlanarFullRange, kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr10BiPlanarFullRange]
         case (.yuv444, false): preferred = [kCVPixelFormatType_444YpCbCr8BiPlanarFullRange]
         case (.yuv422, true): preferred = [kCVPixelFormatType_422YpCbCr10BiPlanarFullRange, kCVPixelFormatType_420YpCbCr10BiPlanarFullRange]
         case (.yuv422, false): preferred = [kCVPixelFormatType_422YpCbCr8BiPlanarFullRange]

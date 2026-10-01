@@ -4,9 +4,109 @@ import WebRTC
 import CoreVideo
 import CoreMedia
 import SwiftUI
+import Metal
 @testable import OpenNOWiOS
 
 final class OpenNOWiOSParityTests: XCTestCase {
+    func testDirect444HDRMetalPreservesAlternatingFullResolutionChroma() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let queue = try XCTUnwrap(device.makeCommandQueue())
+        let renderer = try XCTUnwrap(NativeStreamHDRMetalRenderer(device: device))
+        for format in [kCVPixelFormatType_444YpCbCr10BiPlanarFullRange, kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange] {
+            var buffer: CVPixelBuffer?
+            XCTAssertEqual(CVPixelBufferCreate(nil, 16, 8, format,
+                [kCVPixelBufferIOSurfacePropertiesKey: [:], kCVPixelBufferMetalCompatibilityKey: true] as CFDictionary,
+                &buffer), kCVReturnSuccess)
+            let source = try XCTUnwrap(buffer)
+            CVPixelBufferLockBaseAddress(source, [])
+            for plane in 0..<2 {
+                let base = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(source, plane)).assumingMemoryBound(to: UInt16.self)
+                let stride = CVPixelBufferGetBytesPerRowOfPlane(source, plane) / 2
+                for y in 0..<8 {
+                    for x in 0..<16 {
+                        if plane == 0 { base[y * stride + x] = 512 << 6 }
+                        else {
+                            base[y * stride + x * 2] = 512 << 6
+                            base[y * stride + x * 2 + 1] = UInt16(x.isMultiple(of: 2) ? 512 : 640) << 6
+                        }
+                    }
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(source, [])
+            CVBufferSetAttachment(source, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, .shouldPropagate)
+            CVBufferSetAttachment(source, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020, .shouldPropagate)
+            let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgr10a2Unorm, width: 16, height: 8, mipmapped: false)
+            descriptor.storageMode = .shared; descriptor.usage = [.renderTarget, .shaderRead]
+            let output = try XCTUnwrap(device.makeTexture(descriptor: descriptor))
+            let pass = MTLRenderPassDescriptor()
+            pass.colorAttachments[0].texture = output
+            pass.colorAttachments[0].loadAction = .clear; pass.colorAttachments[0].storeAction = .store
+            let command = try XCTUnwrap(queue.makeCommandBuffer())
+            XCTAssertTrue(renderer.encode(buffer: source, commandBuffer: command, descriptor: pass,
+                destination: CGRect(x: 0, y: 0, width: 16, height: 8)))
+            command.commit(); command.waitUntilCompleted()
+            XCTAssertEqual(command.status, .completed)
+            var pixels = [UInt32](repeating: 0, count: 16 * 8)
+            pixels.withUnsafeMutableBytes { bytes in
+                output.getBytes(bytes.baseAddress!, bytesPerRow: 16 * 4, from: MTLRegionMake2D(0, 0, 16, 8), mipmapLevel: 0)
+            }
+            let evenRed = Int((pixels[0] >> 20) & 1023), oddRed = Int((pixels[1] >> 20) & 1023)
+            XCTAssertGreaterThan(oddRed - evenRed, 100, "The renderer must retain adjacent 4:4:4 chroma differences")
+        }
+    }
+
+    @available(iOS 17.0, *)
+    func testStrict444RejectsHostDowngradeAndOffersOnlyTenBit444Surfaces() throws {
+        var format = NvstVideoToolboxDecoder.BitstreamFormat()
+        format.bitDepth = 10; format.chroma = .yuv444
+        XCTAssertNoThrow(try NvstVideoToolboxDecoder.validate444Bitstream(format))
+        XCTAssertEqual(NvstVideoToolboxDecoder.preferredOutputPixelFormats(for: format, requiresTenBit444: true),
+            [kCVPixelFormatType_444YpCbCr10BiPlanarFullRange, kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange])
+        format.chroma = .yuv420
+        XCTAssertThrowsError(try NvstVideoToolboxDecoder.validate444Bitstream(format))
+        format.chroma = .yuv444; format.bitDepth = 8
+        XCTAssertThrowsError(try NvstVideoToolboxDecoder.validate444Bitstream(format))
+        format.bitDepth = 12
+        XCTAssertThrowsError(try NvstVideoToolboxDecoder.validate444Bitstream(format))
+    }
+
+    func test444HDRHUDAndSurfaceValidationUseDecodedPixels() throws {
+        for format in [kCVPixelFormatType_444YpCbCr10BiPlanarFullRange, kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange] {
+            var buffer: CVPixelBuffer?
+            XCTAssertEqual(CVPixelBufferCreate(nil, 16, 8, format,
+                [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &buffer), kCVReturnSuccess)
+            let pixels = try XCTUnwrap(buffer)
+            XCTAssertTrue(NativeStreamTenBitSurface.preserves444(pixels))
+            XCTAssertEqual(CVPixelBufferGetWidthOfPlane(pixels, 1), 16)
+            XCTAssertEqual(CVPixelBufferGetHeightOfPlane(pixels, 1), 8)
+            CVBufferSetAttachment(pixels, kCVImageBufferTransferFunctionKey,
+                kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, .shouldPropagate)
+            XCTAssertEqual(NativeStreamHDRTransfer.colorMode(in: pixels), "10-bit 4:4:4 HDR PQ")
+        }
+        var buffer: CVPixelBuffer?
+        XCTAssertEqual(CVPixelBufferCreate(nil, 16, 8, kCVPixelFormatType_420YpCbCr10BiPlanarFullRange, nil, &buffer), kCVReturnSuccess)
+        XCTAssertFalse(NativeStreamTenBitSurface.preserves444(try XCTUnwrap(buffer)))
+        XCTAssertEqual(NativeStreamTenBitSurface.chroma(kCVPixelFormatType_420YpCbCr10BiPlanarFullRange), "4:2:0")
+    }
+
+    func test444ColorRequestUsesSeparateCloudMatchAndRTSPChromaEnums() throws {
+        var settings = AppSettings.default
+        settings.experimentalNativeNVSTEnabled = true
+        settings.preferredColorQuality = StreamColorQuality.tenBit444.rawValue
+        settings.preferredCodec = "H265"; settings.hdrEnabled = true
+        let cloud = CloudMatchStreamingFeatureRequest.build(settings: settings,
+            profile: StreamSettingsResolver.profile(for: settings), bitDepth: 10, chromaFormat: 2)
+        XCTAssertEqual(cloud["bitDepth"] as? Int, 1)
+        XCTAssertEqual(cloud["chromaFormat"] as? Int, 1)
+        XCTAssertEqual(cloud["trueHdr"] as? Bool, true)
+        let native = NvstRtspSdp.colorFormat(forColorQuality: StreamSettingsResolver.colorQuality(for: settings).rawValue)
+        XCTAssertEqual(native.bitDepth, 10)
+        XCTAssertEqual(native.chromaFormat, 3)
+        let roundTrip = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings))
+        XCTAssertEqual(roundTrip.preferredColorQuality, "10bit_444")
+        XCTAssertTrue(roundTrip.hdrEnabled)
+    }
+
     func testPointerCaptureReleasesForControlsPiPAndInactiveScene() {
         func capture(video: Bool = true, active: Bool = true, controls: Bool = false,
                      editing: Bool = false, guidance: Bool = false, pip: Bool = false) -> Bool {

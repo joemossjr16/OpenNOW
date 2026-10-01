@@ -175,8 +175,14 @@ struct SettingsView: View {
             }
             .onChangeCompat(of: store.settings.hdrEnabled) { enabled in
                 guard enabled else { return }
-                store.settings.preferredColorQuality = StreamColorQuality.tenBit420.rawValue
+                store.settings.preferredColorQuality = store.settings.preferredColorQuality == StreamColorQuality.tenBit444.rawValue
+                    ? StreamColorQuality.tenBit444.rawValue : StreamColorQuality.tenBit420.rawValue
                 if NativeStreamCodecProbe.report().capability(for: .h265)?.launchSafe == true {
+                    store.settings.preferredCodec = "H265"
+                }
+            }
+            .onChangeCompat(of: store.settings.preferredColorQuality) { color in
+                if color == StreamColorQuality.tenBit444.rawValue, store.settings.experimentalNativeNVSTEnabled {
                     store.settings.preferredCodec = "H265"
                 }
             }
@@ -581,13 +587,20 @@ struct SettingsView: View {
             }
 
             Picker("Color", selection: customStreamBinding(\.preferredColorQuality)) {
-                ForEach([StreamColorQuality.eightBit420, .tenBit420]) { color in
-                    Text(color.label).tag(color.rawValue)
+                ForEach([StreamColorQuality.eightBit420, .tenBit420, .tenBit444]) { color in
+                    Text(color.label + (color == .tenBit444 ? " (Experimental)" : "")).tag(color.rawValue)
+                        .disabled(color == .tenBit444 && !store.settings.experimentalNativeNVSTEnabled)
                 }
             }
 
             Toggle("HDR", isOn: $store.settings.hdrEnabled)
                 .disabled(!hdrAvailable)
+
+            if store.settings.experimentalNativeNVSTEnabled || store.settings.preferredColorQuality == StreamColorQuality.tenBit444.rawValue {
+                Text("4:4:4 uses H.265 and the native receiver. Enable HDR separately. The host and device must support 10-bit 4:4:4; unsupported or downgraded streams report an error. The Color status shows the received output.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
 
             if NativeStreamVideoCodec.normalized(store.settings.preferredCodec) == .h264 {
                 Text("H.264 streams use 8-bit SDR. Select H.265 or AV1 for 10-bit HDR.")

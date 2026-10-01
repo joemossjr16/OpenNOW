@@ -13,6 +13,9 @@ import VideoToolbox
 public final class NvstVideoToolboxDecoder: @unchecked Sendable {
     public enum DecoderError: LocalizedError, Equatable, Sendable {
         case hardwareRequired
+        case requested444NotDelivered(String)
+        case unsupported444Hardware(OSStatus)
+        case output444NotPreserved
         case missingParameterSets
         case formatDescriptionFailed(OSStatus)
         case sessionCreationFailed(OSStatus)
@@ -23,6 +26,9 @@ public final class NvstVideoToolboxDecoder: @unchecked Sendable {
         public var errorDescription: String? {
             switch self {
             case .hardwareRequired: "Native NVST requires a hardware video decoder on this device."
+            case .requested444NotDelivered(let actual): "Requested 10-bit 4:4:4, but the host delivered \(actual). Select 10-bit 4:2:0 to continue."
+            case .unsupported444Hardware(let status): "This device could not create a hardware 10-bit 4:4:4 decoder (OSStatus \(status)). Select 10-bit 4:2:0 to continue."
+            case .output444NotPreserved: "The decoder did not preserve a 10-bit 4:4:4 output surface. Select 10-bit 4:2:0 to continue."
             case .missingParameterSets: "NVST video stream has not delivered a keyframe with parameter sets yet."
             case .formatDescriptionFailed(let status): "NVST decoder could not build a format description (OSStatus \(status))."
             case .sessionCreationFailed(let status): "NVST decoder could not create a decompression session (OSStatus \(status))."
@@ -42,6 +48,7 @@ public final class NvstVideoToolboxDecoder: @unchecked Sendable {
     private let stateLock = NSLock()
     let statsLock = NSLock()
     let codec: NVSTVideoCodec
+    let requiresTenBit444: Bool
     private var parameterSets = NvstElementaryStream.ParameterSets()
     private var formatDescription: CMVideoFormatDescription?
     var session: VTDecompressionSession?
@@ -96,9 +103,11 @@ public final class NvstVideoToolboxDecoder: @unchecked Sendable {
     /// Identifies the exact submission, including failures and callbacks that occur
     /// before DecodeFrame returns. Completion order must not determine frame timing.
     public var onDecodeCompleted: (@Sendable (UInt32, Bool) -> Void)?
+    public var onFatalFormatFailure: (@Sendable (String) -> Void)?
 
-    public init(codec: NVSTVideoCodec) {
+    public init(codec: NVSTVideoCodec, requiresTenBit444: Bool = false) {
         self.codec = codec
+        self.requiresTenBit444 = requiresTenBit444
     }
 
     public var decodedFrameCount: UInt64 { statsLock.lock(); defer { statsLock.unlock() }; return decodedFrames }
@@ -301,6 +310,15 @@ public final class NvstVideoToolboxDecoder: @unchecked Sendable {
                                     isKeyframe: Bool,
                                     shape: @escaping @Sendable () -> String,
                                     logFailure: ((UInt32, String) -> Void)?) {
+        if status == noErr, let imageBuffer, requiresTenBit444,
+           !NativeStreamTenBitSurface.preserves444(imageBuffer) {
+            statsLock.lock(); failedFrames &+= 1; statsLock.unlock()
+            onDecodeCompleted?(frameIndex, false)
+            let message = DecoderError.output444NotPreserved.localizedDescription
+            logFailure?(frameIndex, message)
+            onFatalFormatFailure?(message)
+            return
+        }
         guard status == noErr, let imageBuffer else {
             statsLock.lock()
             failedFrames &+= 1
@@ -407,6 +425,7 @@ public final class NvstVideoToolboxDecoder: @unchecked Sendable {
         statsLock.lock()
         let bitstream = currentBitstreamFormat ?? BitstreamFormat()
         statsLock.unlock()
+        if requiresTenBit444 { try Self.validate444Bitstream(bitstream) }
         // Ask for hardware explicitly rather than taking the default. VideoToolbox will fall back to
         // a software decoder without saying so, and a software HEVC decode at 5120x2160 cannot hold
         // 120 fps — which is indistinguishable, from the outside, from "decode is slow".
@@ -416,7 +435,7 @@ public final class NvstVideoToolboxDecoder: @unchecked Sendable {
         var created: VTDecompressionSession?
         var status: OSStatus = noErr
         var chosenFormat: OSType = 0
-        for candidate in Self.preferredOutputPixelFormats(for: bitstream) {
+        for candidate in Self.preferredOutputPixelFormats(for: bitstream, requiresTenBit444: requiresTenBit444) {
             let attributes: [CFString: Any] = [
                 kCVPixelBufferPixelFormatTypeKey: NSNumber(value: candidate),
                 kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
@@ -438,7 +457,10 @@ public final class NvstVideoToolboxDecoder: @unchecked Sendable {
             }
             onDecodeFailure?(0, "NVST decoder declined output \(Self.pixelFormatName(candidate)) for \(bitstream.summary) (OSStatus \(status)); trying the next format")
         }
-        guard status == noErr, let created else { throw DecoderError.sessionCreationFailed(status) }
+        guard status == noErr, let created else {
+            if requiresTenBit444 { throw DecoderError.unsupported444Hardware(status) }
+            throw DecoderError.sessionCreationFailed(status)
+        }
         statsLock.lock()
         outputPixelFormat = chosenFormat
         statsLock.unlock()

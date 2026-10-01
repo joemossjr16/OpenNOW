@@ -756,7 +756,7 @@ struct StreamerView: View {
             .statusBarHidden(true)
         }
         .background(NativeStreamPointerLockPreference(requested:
-            NativeStreamPointerCapturePolicy.shouldCapture(videoActive: coordinator.videoActive,
+            NativeStreamPointerCapturePolicy.shouldCapture(videoActive: coordinator.videoActive && !coordinator.showStatusOverlay,
                 sceneActive: scenePhase == .active, controlsVisible: coordinator.controlsPanelVisible,
                 editing: coordinator.touchLayoutEditing, guidanceVisible: coordinator.presentedGuidanceSheet != nil
                     || coordinator.inputModePrompt != nil,
@@ -2746,10 +2746,19 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         retryAvailable = onRetry != nil
         updateStatus("Checking codecs", detail: codecReport.summary)
 
+        let requires444 = StreamSettingsResolver.colorQuality(for: settings) == .tenBit444
+        if requires444 && !settings.experimentalNativeNVSTEnabled {
+            fail("10-bit 4:4:4 requires the Native NVST Receiver. Enable it in Settings → Stream → Connection.")
+            return
+        }
         if settings.experimentalNativeNVSTEnabled {
             guard #available(iOS 17.0, *) else { fail("Native NVST requires iOS 17 or newer"); return }
             let codec = NativeStreamVideoCodec.normalized(settings.preferredCodec)
-                ?? [.h265, .av1, .h264].first { codecReport.capability(for: $0)?.videoToolboxHardwareDecode == true } ?? .h264
+                ?? (requires444 ? .h265 : [.h265, .av1, .h264].first { codecReport.capability(for: $0)?.videoToolboxHardwareDecode == true } ?? .h264)
+            guard !requires444 || codec == .h265 else {
+                fail("Use H.265 for the experimental 10-bit 4:4:4 mode. AV1 remains available with 4:2:0.")
+                return
+            }
             guard codecReport.capability(for: codec)?.videoToolboxHardwareDecode == true else {
                 fail("\(codec.rawValue) hardware decoding is unavailable on this device"); return
             }
@@ -6174,9 +6183,8 @@ enum NativeStreamHDRTransfer {
 
     static func colorMode(in buffer: CVPixelBuffer) -> String {
         let format = CVPixelBufferGetPixelFormatType(buffer)
-        let tenBit = format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
-            || format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
-        let depth = tenBit ? "10-bit" : "8-bit"
+        let chroma = NativeStreamTenBitSurface.chroma(format)
+        let depth = chroma.map { $0 == "4:2:0" ? "10-bit" : "10-bit \($0)" } ?? "8-bit"
         switch detect(in: buffer) {
         case .pq: return "\(depth) HDR PQ"
         case .hlg: return "\(depth) HDR HLG"
@@ -6333,7 +6341,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         if direct {
             if !loggedDirectHDR {
                 loggedDirectHDR = true
-                NativeStreamVideoPerformanceLog.record("renderer direct-metal P010 BT2020 HDR")
+                NativeStreamVideoPerformanceLog.record("renderer direct-metal \(NativeStreamTenBitSurface.chroma(CVPixelBufferGetPixelFormatType(pixelBuffer)) ?? "unknown") BT2020 HDR")
             }
         } else {
             if let descriptor = view.currentRenderPassDescriptor,

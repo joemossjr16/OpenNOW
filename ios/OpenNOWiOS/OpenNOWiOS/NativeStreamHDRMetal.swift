@@ -2,7 +2,31 @@ import Foundation
 import CoreVideo
 import Metal
 
-/// Zero-copy P010 -> encoded BT.2020 RGB. PQ/HLG remain encoded; the matching
+/// Shared interpretation for rendering and actual-output status.
+enum NativeStreamTenBitSurface {
+    static func chroma(_ format: OSType) -> String? {
+        switch format {
+        case kCVPixelFormatType_420YpCbCr10BiPlanarFullRange, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange: return "4:2:0"
+        case kCVPixelFormatType_422YpCbCr10BiPlanarFullRange, kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange: return "4:2:2"
+        case kCVPixelFormatType_444YpCbCr10BiPlanarFullRange, kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange: return "4:4:4"
+        default: return nil
+        }
+    }
+
+    static func isFullRange(_ format: OSType) -> Bool {
+        [kCVPixelFormatType_420YpCbCr10BiPlanarFullRange, kCVPixelFormatType_422YpCbCr10BiPlanarFullRange,
+         kCVPixelFormatType_444YpCbCr10BiPlanarFullRange].contains(format)
+    }
+
+    static func preserves444(_ buffer: CVPixelBuffer) -> Bool {
+        chroma(CVPixelBufferGetPixelFormatType(buffer)) == "4:4:4"
+            && CVPixelBufferGetPlaneCount(buffer) == 2
+            && CVPixelBufferGetWidthOfPlane(buffer, 0) == CVPixelBufferGetWidthOfPlane(buffer, 1)
+            && CVPixelBufferGetHeightOfPlane(buffer, 0) == CVPixelBufferGetHeightOfPlane(buffer, 1)
+    }
+}
+
+/// Zero-copy bi-planar 10-bit YCbCr -> encoded BT.2020 RGB. PQ/HLG remain encoded; the matching
 /// CAMetalLayer color space owns display conversion and extended dynamic range.
 /// Unrecognized formats/matrices and sharpening retain the Core Image path.
 final class NativeStreamHDRMetalRenderer {
@@ -27,8 +51,7 @@ final class NativeStreamHDRMetalRenderer {
     func encode(buffer: CVPixelBuffer, commandBuffer: MTLCommandBuffer,
                 descriptor: MTLRenderPassDescriptor, destination: CGRect) -> Bool {
         let format = CVPixelBufferGetPixelFormatType(buffer)
-        guard format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
-                || format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
+        guard NativeStreamTenBitSurface.chroma(format) != nil,
               CVPixelBufferGetPlaneCount(buffer) == 2,
               destination.width > 0, destination.height > 0,
               descriptor.colorAttachments[0].texture?.pixelFormat == .bgr10a2Unorm,
@@ -46,8 +69,8 @@ final class NativeStreamHDRMetalRenderer {
               let yRef, let uvRef, let y = CVMetalTextureGetTexture(yRef),
               let uv = CVMetalTextureGetTexture(uvRef),
               let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else { return false }
-        let full = format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
-        // P010 stores 10-bit codes in the high bits of a 16-bit sample.
+        let full = NativeStreamTenBitSurface.isFullRange(format)
+        // These bi-planar formats store 10-bit codes in the high bits of a 16-bit sample.
         // Normalize to code/1023 before applying full/video-range offsets.
         var uniforms = Uniforms(
             range: SIMD4<Float>(full ? 0 : 64.0 / 1023, full ? 1 : 876.0 / 1023,

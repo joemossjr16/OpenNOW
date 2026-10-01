@@ -1,10 +1,18 @@
-# Joe's OpenNOW iOS build 128
+# Joe's OpenNOW iOS build 129
 
-This branch contains the source for **OpenNOW 1.1.128**, based on the upstream iOS branch at `95c0f58d42eeed176edd677f604b193c85169d9e`. It includes the earlier local iOS changes needed by the current native receiver, hardware AV1/HDR rendering, catalog and launch features.
+This branch contains the source for **OpenNOW 1.1.129**, based on the upstream iOS branch at `95c0f58d42eeed176edd677f604b193c85169d9e`. It includes the earlier local iOS changes needed by the current native receiver, hardware AV1/HDR rendering, catalog and launch features.
 
-[Unsigned IPA and build notes](https://github.com/joemossjr16/ios-apps/releases/tag/opennow-128) · [KravaSigner feed](https://raw.githubusercontent.com/joemossjr16/ios-apps/main/repo.json)
+[Unsigned IPA and build notes](https://github.com/joemossjr16/ios-apps/releases/tag/opennow-129) · [KravaSigner feed](https://raw.githubusercontent.com/joemossjr16/ios-apps/main/repo.json)
 
-## Current fixes
+## Experimental 10-bit 4:4:4 HDR
+
+Enable **Settings → Stream → Connection → Native NVST Receiver (Experimental)**, then under **Stream → Video** select **Color: 10-bit 4:4:4 (Experimental)**, **Codec: H265**, and **HDR: on**. Selecting 4:4:4 chooses H265 automatically; HDR is a separate setting. Start a fresh session after changing the format.
+
+The receiver checks the incoming HEVC bitstream for exactly 10-bit 4:4:4, requires hardware decoding, requests only matching full/video-range 4:4:4 surfaces, and checks actual output chroma-plane dimensions. Unsupported hardware or a downgraded host stream stops with a clear error rather than silently converting to 4:2:0 or 8-bit. The HDR Metal path handles full-resolution chroma without an intermediate copy.
+
+The **Color** status reports actual decoded output and transfer metadata. Look for **10-bit 4:4:4 HDR PQ** for a PQ HDR stream. Host SDR output remains labeled SDR. Hardware decoding of this specific profile on iPhone/iPad and live host delivery are still unverified; the experimental setting does not promise device support. Choose **10-bit 4:2:0** if the host or device cannot support it. AV1 remains available for 4:2:0.
+
+## Retained fixes
 
 - Gameplay uses a fullscreen UIKit hosting controller to request iPadOS pointer lock. Capture releases for controls, editing, guidance/alerts, inactive scenes and PiP, then resumes with gameplay.
 - PiP uses an independent SDR preview capped at 1280×720 and 30 FPS. It has bounded frame admission and surface allocation, a host-clock playback timeline, and CPU conversion for background operation. The main stream retains its selected resolution, 10-bit HDR and hardware decoding.
@@ -27,7 +35,7 @@ xcodebuild build \
   CODE_SIGNING_ALLOWED=NO
 ```
 
-The preparation script downloads the matching static OpenSSL/usrsctp XCFrameworks, verifies the pinned SHA-256, and installs only their framework directories. Generated libraries and build outputs are ignored by Git. WebRTC remains the vendored framework already in the upstream repository. For a source build of the native dependencies, install CMake and run:
+The preparation script downloads the matching static OpenSSL/usrsctp XCFrameworks, verifies the pinned SHA-256, and installs only their framework directories. The native C libraries are unchanged from build 128, so the preparation script reuses that checksum-pinned archive. Generated libraries and build outputs are ignored by Git. WebRTC remains the vendored framework already in the upstream repository. For a source build of the native dependencies, install CMake and run:
 
 ```sh
 python3 ios/OpenNOWiOS/BuildScripts/build-native-protocol-libs.py --cmake /path/to/cmake
@@ -39,8 +47,8 @@ The unsigned device app is in `DerivedData/Build/Products/Debug-iphoneos/OpenNOW
 
 Enable **Settings → Stream → Connection → Native NVST Receiver (Experimental)** and start or resume a session. The standard WebRTC receiver remains the default. Native NVST requires iOS 17 or later, an advertised RTSPS endpoint, and hardware decoding. A 10-bit stream cannot silently use an 8-bit output surface. Existing quality settings and device identity are preserved.
 
-Build 128 passed an unsigned arm64 device build and **162 targeted simulator tests**. The new checks cover the presented pointer preference and teardown, capture release policy, independent visible PiP conversion from 10-bit HDR, PiP clock/size bounds, and early/reordered/rejected completion bookkeeping. Existing tests cover encrypted DTLS/SCTP control and input, SRTP/FEC, RTSP, AV1/HDR metadata and settings migration.
+Build 129 passed an unsigned arm64 device build and **166 targeted simulator tests**. New tests verify strict 10-bit/4:4:4 bitstream validation, full/video-range surfaces, actual-output HDR labels, settings persistence, separate CloudMatch and RTSP chroma enums, and GPU readback of alternating one-pixel chroma detail through the HDR Metal renderer. Existing tests cover pointer preference and teardown, capture release policy, independent PiP conversion from 10-bit HDR, PiP clock/size bounds, early/reordered/rejected completion bookkeeping, encrypted DTLS/SCTP control and input, SRTP/FEC, RTSP, AV1/HDR metadata and settings migration. Simulator rendering tests do not establish physical hardware support for HEVC 10-bit 4:4:4.
 
-Physical iPad mouse capture, PiP/background behavior and the updated decode timing still need testing after installing build 128. Simulator results do not establish physical-device performance. Build 127 live samples showed roughly 120 received/decoded FPS on iPhone and on iPad after a restart; the earlier recurring iPad arrival gaps were absent in the post-restart sample, with their cause still unconfirmed.
+Physical iPad mouse capture, PiP/background behavior and the updated decode timing still need testing after installation. Simulator results do not establish physical-device performance. Build 127 live samples showed roughly 120 received/decoded FPS on iPhone and on iPad after a restart; the earlier recurring iPad arrival gaps were absent in the post-restart sample, with their cause still unconfirmed.
 
 Protocol provenance, pinned dependencies and MIT/Apache/BSD licenses are in [NVST](OpenNOWiOS/NVST/README.md). Native microphone carriage requires a host bundle that offers it and the microphone option enabled; legacy standalone microphone carriage is not implemented.
