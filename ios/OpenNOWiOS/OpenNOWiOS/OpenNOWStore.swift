@@ -888,6 +888,7 @@ struct AppSettings: Codable, Equatable {
     var metalFXUpscalingEnabled: Bool = false
     var metalFXQualityPreset: MetalFXQualityPreset = .manual
     var frameGenerationEnabled: Bool = false
+    var frameGenerationQuality: NativeStreamFrameGenerationQuality = .performance
     var streamSharpeningEnabled: Bool = false
     var streamSharpeningAmount: Double = 0.25
     var mouseSensitivity: Double = 1
@@ -1000,6 +1001,7 @@ struct AppSettings: Codable, Equatable {
         case metalFXUpscalingEnabled
         case metalFXQualityPreset
         case frameGenerationEnabled
+        case frameGenerationQuality
         case streamSharpeningEnabled
         case streamSharpeningAmount
         case mouseSensitivity
@@ -1124,6 +1126,7 @@ struct AppSettings: Codable, Equatable {
         metalFXUpscalingEnabled = try container.decodeIfPresent(Bool.self, forKey: .metalFXUpscalingEnabled) ?? false
         metalFXQualityPreset = try container.decodeIfPresent(MetalFXQualityPreset.self, forKey: .metalFXQualityPreset) ?? .manual
         frameGenerationEnabled = try container.decodeIfPresent(Bool.self, forKey: .frameGenerationEnabled) ?? false
+        frameGenerationQuality = try container.decodeIfPresent(NativeStreamFrameGenerationQuality.self, forKey: .frameGenerationQuality) ?? .performance
         streamSharpeningEnabled = try container.decodeIfPresent(Bool.self, forKey: .streamSharpeningEnabled) ?? false
         streamSharpeningAmount = try container.decodeIfPresent(Double.self, forKey: .streamSharpeningAmount) ?? 0.25
         mouseSensitivity = try container.decodeIfPresent(Double.self, forKey: .mouseSensitivity) ?? 1

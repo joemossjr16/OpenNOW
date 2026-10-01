@@ -1,8 +1,18 @@
-# Joe's OpenNOW iOS build 135
+# Joe's OpenNOW iOS build 136
 
-This branch contains the source for **OpenNOW 1.1.135**, based on the upstream iOS branch at `95c0f58d42eeed176edd677f604b193c85169d9e`. It includes the earlier local iOS changes needed by the current native receiver, hardware AV1/HDR rendering, catalog and launch features.
+This branch contains the source for **OpenNOW 1.1.136**, based on the upstream iOS branch at `95c0f58d42eeed176edd677f604b193c85169d9e`. It includes the earlier local iOS changes needed by the current native receiver, hardware AV1/HDR rendering, catalog and launch features.
 
-[Unsigned IPA and build notes](https://github.com/joemossjr16/ios-apps/releases/tag/opennow-135) · [KravaSigner feed](https://raw.githubusercontent.com/joemossjr16/ios-apps/main/repo.json)
+[Unsigned IPA and build notes](https://github.com/joemossjr16/ios-apps/releases/tag/opennow-136) · [KravaSigner feed](https://raw.githubusercontent.com/joemossjr16/ios-apps/main/repo.json)
+
+## Build 136: independent frame-generation quality
+
+**Frame Generation Quality → Performance / Native** is available in Settings and the in-stream Picture panel, separate from the MetalFX Quality preset. Performance is the new FG quality default (the FG toggle still defaults off). It interpolates smaller 8-bit NV12 inputs, capped at 960 pixels per axis / 518400 pixels, then scales the generated image for display. For 1680×720, generated images are 960×410; for 1080p they are 960×540. With MetalFX enabled, generated frames use the spatial scaler when its scale limits allow. Real decoded frames retain full resolution. Native keeps full-input interpolation. Source HDR/codec/color/FPS/bitrate and host resolution are unchanged by this selector, and it can change during gameplay.
+
+Other color formats retain native processing size; unsupported formats, original received sizes and devices remain rejected. This does not establish 10-bit/4:4:4 interpolation support. Separate MetalFX resources for different real/generated input sizes avoid repeated asynchronous setup. The HUD now reports actual processing geometry plus measured Generated/Displayed FPS. Motion artifacts and presentation delay remain possible. GPU/pool/history, power/thermal and budget safeguards remain.
+
+A current iPhone 1680×720 PQ sample decoded around 4.2 ms but interpolation/rendering averaged about 18.2 ms against an 8.33 ms display budget, producing few generated presentations. This change reduces interpolation work. Synthetic Mac checks at 1680×720 PQ measured a generated-frame encode-to-completion median of ~3.3 ms Performance vs ~8.7 ms Native, excluding separate real-frame rendering and readback. They do not establish sustained iPhone performance.
+
+Validation: unsigned iOS build passed; **184 tests passed, zero failed, one simulator skip** (185 successful executions with dynamic parameters). New geometry/migration/GPU resize/range/PQ tests passed with existing regressions. Real Mac GPU checks covered both quality modes, 1080p and 1680×720, SDR/PQ, and alternating real/generated presentation: **944 combined generated images** preserved motion midpoint, neutral color, orientation and HDR highlights. Processor limits and history-only cooldown checks passed. Physical-device testing is still needed.
 
 ## Build 135: interpolation limits and generated/displayed FPS
 

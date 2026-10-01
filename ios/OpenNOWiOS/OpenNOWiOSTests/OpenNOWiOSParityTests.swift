@@ -33,6 +33,22 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(realOnly.displayedFPS, 60, accuracy: 0.01)
     }
 
+    func testFrameGenerationPerformanceSizePreservesNativeAndBoundsGeneratedWork() {
+        let sizes = [CGSize(width: 1920, height: 1080), CGSize(width: 1680, height: 720),
+                     CGSize(width: 1080, height: 1920), CGSize(width: 640, height: 480)]
+        for size in sizes {
+            XCTAssertEqual(NativeStreamVideoEffectsPolicy.interpolationSize(source: size, quality: .native), size)
+            let result = NativeStreamVideoEffectsPolicy.interpolationSize(source: size, quality: .performance)
+            XCTAssertLessThanOrEqual(max(result.width,result.height), 960)
+            XCTAssertLessThanOrEqual(result.width*result.height, 518400)
+            XCTAssertEqual(Int(result.width)%2, 0); XCTAssertEqual(Int(result.height)%2, 0)
+            XCTAssertEqual(result.width/result.height, size.width/size.height, accuracy: 0.01)
+        }
+        XCTAssertEqual(NativeStreamVideoEffectsPolicy.interpolationSize(source: sizes[1], quality: .performance),
+                       CGSize(width: 960,height: 410))
+        XCTAssertEqual(NativeStreamVideoEffectsPolicy.interpolationSize(source: sizes[3], quality: .performance), sizes[3])
+    }
+
     func testFrameGenerationLimitsRejectOversizedBuffersAndGuideMetalFXPresets() throws {
         let limits = NativeStreamFrameGenerationLimits(maximumDimension: 1920, maximumPixels: 2073600)
         XCTAssertTrue(limits.contains(width: 1920, height: 1080))
@@ -162,11 +178,49 @@ final class OpenNOWiOSParityTests: XCTestCase {
             kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String)
     }
 
+    func testNV12PerformanceResizeRetainsHDRAndNeutralChroma() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice()), queue = try XCTUnwrap(device.makeCommandQueue())
+        let bridge = try XCTUnwrap(NativeStreamNV12RangeBridge(device: device))
+        var cache: CVMetalTextureCache?
+        XCTAssertEqual(CVMetalTextureCacheCreate(nil,nil,device,nil,&cache),kCVReturnSuccess)
+        func buffer(_ width: Int, _ height: Int, _ format: OSType) throws -> CVPixelBuffer {
+            var result: CVPixelBuffer?
+            XCTAssertEqual(CVPixelBufferCreate(nil,width,height,format,
+                [kCVPixelBufferIOSurfacePropertiesKey: [:], kCVPixelBufferMetalCompatibilityKey: true] as CFDictionary,&result),kCVReturnSuccess)
+            return try XCTUnwrap(result)
+        }
+        let source = try buffer(64,32,kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+        let destination = try buffer(32,16,kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+        CVPixelBufferLockBaseAddress(source,[])
+        let y = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(source,0)).assumingMemoryBound(to: UInt8.self)
+        let stride = CVPixelBufferGetBytesPerRowOfPlane(source,0)
+        for row in 0..<32 { for x in 0..<64 { y[row*stride+x] = row < 16 ? 0 : 255 } }
+        memset(CVPixelBufferGetBaseAddressOfPlane(source,1)!,128,CVPixelBufferGetBytesPerRowOfPlane(source,1)*16)
+        CVPixelBufferUnlockBaseAddress(source,[])
+        CVBufferSetAttachment(source,kCVImageBufferTransferFunctionKey,kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ,.shouldPropagate)
+        let command = try XCTUnwrap(queue.makeCommandBuffer())
+        XCTAssertTrue(bridge.encode(source:source,destination:destination,cache:try XCTUnwrap(cache),commandBuffer:command))
+        command.commit(); command.waitUntilCompleted(); XCTAssertEqual(command.status,.completed)
+        CVPixelBufferLockBaseAddress(destination,.readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(destination,.readOnly) }
+        let outputY = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(destination,0)).assumingMemoryBound(to:UInt8.self)
+        XCTAssertEqual(outputY[0],16)
+        XCTAssertEqual(outputY[15*CVPixelBufferGetBytesPerRowOfPlane(destination,0)],235)
+        let outputUV = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(destination,1)).assumingMemoryBound(to:UInt8.self)
+        XCTAssertEqual(outputUV[0],128); XCTAssertEqual(outputUV[1],128)
+        XCTAssertEqual(CVPixelBufferGetWidthOfPlane(destination,1),16)
+        XCTAssertEqual(CVPixelBufferGetHeightOfPlane(destination,1),8)
+        XCTAssertEqual(CVPixelBufferGetWidth(source),64)
+        XCTAssertEqual(CVBufferCopyAttachment(destination,kCVImageBufferTransferFunctionKey,nil) as? String,
+                       kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String)
+    }
+
     func testVideoEffectsSettingsMigrateOffAndRoundTripWithoutChangingStream() throws {
         let old = try JSONDecoder().decode(AppSettings.self, from: Data("{}".utf8))
         XCTAssertFalse(old.metalFXUpscalingEnabled)
         XCTAssertFalse(old.frameGenerationEnabled)
         XCTAssertEqual(old.metalFXQualityPreset, .manual)
+        XCTAssertEqual(old.frameGenerationQuality, .performance)
         var settings = AppSettings.default
         settings.preferredColorQuality = StreamColorQuality.tenBit444.rawValue
         settings.hdrEnabled = true
@@ -176,6 +230,7 @@ final class OpenNOWiOSParityTests: XCTestCase {
         settings.metalFXUpscalingEnabled = true
         settings.metalFXQualityPreset = .balanced
         settings.frameGenerationEnabled = true
+        settings.frameGenerationQuality = .native
         let decoded = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings))
         XCTAssertEqual(decoded, settings)
         XCTAssertEqual(decoded.preferredColorQuality, StreamColorQuality.tenBit444.rawValue)

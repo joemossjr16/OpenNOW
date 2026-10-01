@@ -137,14 +137,14 @@ enum NativeStreamVideoPerformanceLog { static func record(_ text: String) { prin
   rejectedCommand.commit(); await rejectedCommand.completed()
   generator.reset()
   print("PASS: oversized interpolation surface rejected before producing an unwritten frame")
-  func source(offset: Int, hdr: Bool) -> CVPixelBuffer {
+  func source(offset: Int, hdr: Bool, width:Int, height:Int) -> CVPixelBuffer {
    var allocation: CVPixelBuffer?
-   precondition(CVPixelBufferCreate(nil, 1920, 1080, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+   precondition(CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
     [kCVPixelBufferIOSurfacePropertiesKey: [:], kCVPixelBufferMetalCompatibilityKey: true] as CFDictionary, &allocation) == kCVReturnSuccess)
    let value = allocation!
    CVPixelBufferLockBaseAddress(value, [])
-   memset(CVPixelBufferGetBaseAddressOfPlane(value, 0)!, 32, CVPixelBufferGetBytesPerRowOfPlane(value, 0)*1080)
-   memset(CVPixelBufferGetBaseAddressOfPlane(value, 1)!, 128, CVPixelBufferGetBytesPerRowOfPlane(value, 1)*540)
+   memset(CVPixelBufferGetBaseAddressOfPlane(value, 0)!, 32, CVPixelBufferGetBytesPerRowOfPlane(value, 0)*height)
+   memset(CVPixelBufferGetBaseAddressOfPlane(value, 1)!, 128, CVPixelBufferGetBytesPerRowOfPlane(value, 1)*(height/2))
    let base = CVPixelBufferGetBaseAddressOfPlane(value, 0)!.assumingMemoryBound(to: UInt8.self)
    let stride = CVPixelBufferGetBytesPerRowOfPlane(value, 0)
    for y in 300..<700 { for x in (600+offset)..<(900+offset) { base[y*stride+x] = 220 } }
@@ -154,14 +154,19 @@ enum NativeStreamVideoPerformanceLog { static func record(_ text: String) { prin
    CVBufferSetAttachment(value, kCVImageBufferYCbCrMatrixKey, hdr ? kCVImageBufferYCbCrMatrix_ITU_R_2020 : kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
    return value
   }
+  for inputSize in [CGSize(width:1920,height:1080),CGSize(width:1680,height:720)] {
+  let sourceWidth = Int(inputSize.width), sourceHeight = Int(inputSize.height)
+  for quality in NativeStreamFrameGenerationQuality.allCases {
   for hdr in [false, true] {
-  let first = source(offset: 0, hdr: hdr), second = source(offset: 12, hdr: hdr)
+  let size = NativeStreamVideoEffectsPolicy.interpolationSize(source:inputSize,quality:quality)
+  let width = Int(size.width), height = Int(size.height)
+  let first = source(offset: 0, hdr: hdr,width:sourceWidth,height:sourceHeight), second = source(offset: 12, hdr: hdr,width:sourceWidth,height:sourceHeight)
   var result: CIImage?
   for i in 0..<500 {
    let command = queue.makeCommandBuffer()!
    let timestamp = Int64(1_000_000_000) + Int64(i)*16_666_667
    result = generator.encode(buffer: i.isMultiple(of: 2) ? first : second, timestamp: timestamp,
-    device: device, context: context, commandBuffer: command)
+    device: device, context: context, commandBuffer: command,quality:quality)
    command.commit(); await command.completed()
    precondition(command.status == .completed, "Interpolation GPU error")
    if result != nil {
@@ -171,43 +176,47 @@ enum NativeStreamVideoPerformanceLog { static func record(_ text: String) { prin
    try await Task.sleep(nanoseconds: 10_000_000)
   }
   precondition(result != nil, generator.status)
-  precondition(result!.extent.size == CGSize(width: 1920, height: 1080))
-  var bitmap = [UInt8](repeating: 0, count: 1920 * 1080 * 4)
+  precondition(result!.extent.size == size)
+  precondition(CVPixelBufferGetWidth(first) == sourceWidth && CVPixelBufferGetHeight(first) == sourceHeight)
+  var bitmap = [UInt8](repeating: 0, count: width * height * 4)
   bitmap.withUnsafeMutableBytes { raw in
-   context.render(result!, toBitmap: raw.baseAddress!, rowBytes: 1920*4,
+   context.render(result!, toBitmap: raw.baseAddress!, rowBytes: width*4,
     bounds: result!.extent, format: .RGBA8, colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)
   }
   var brightCount = 0, sumX = 0
-  for y in 0..<1080 { for x in 0..<1920 {
-   if bitmap[(y*1920+x)*4] > 180 { brightCount += 1; sumX += x }
+  for y in 0..<height { for x in 0..<width {
+   if bitmap[(y*width+x)*4] > 180 { brightCount += 1; sumX += x }
   } }
   let centroid = Double(sumX) / Double(max(1, brightCount))
   print("Generated-frame bright pixels:", brightCount, "motion midpoint centroid:", centroid)
-  precondition(brightCount > 100_000 && abs(centroid-755.5) < 4, "Generated motion midpoint image missing or incorrect")
+  precondition(brightCount > Int(100_000 * size.width/inputSize.width * size.height/inputSize.height) && abs(centroid-(756*size.width/inputSize.width-0.5)) < 4, "Generated motion midpoint image missing or incorrect")
   if hdr {
-   func highlight(_ image: CIImage) -> Float {
+   func highlight(_ image: CIImage, x:Double = 750,y:Double) -> Float {
     var rgba = [Float](repeating: 0, count: 4)
     rgba.withUnsafeMutableBytes { raw in
      context.render(image, toBitmap: raw.baseAddress!, rowBytes: 16,
-      bounds: CGRect(x: 750, y: 500, width: 1, height: 1), format: .RGBAf,
+      bounds: CGRect(x: x, y: y, width: 1, height: 1), format: .RGBAf,
       colorSpace: NativeStreamVideoEffectsPolicy.workingColorSpace(hdr: true))
     }
     return rgba[0]
    }
-   let inputHighlight = highlight(CIImage(cvPixelBuffer: second)), outputHighlight = highlight(result!)
+   let inputHighlight = highlight(CIImage(cvPixelBuffer: second),y:inputSize.height-500), outputHighlight = highlight(result!,x:750*size.width/inputSize.width,y:(inputSize.height-500)*size.height/inputSize.height)
    print("PQ linear HDR highlight input/output:", inputHighlight, outputHighlight)
    precondition(outputHighlight > 1 && outputHighlight / inputHighlight > 0.8 && outputHighlight / inputHighlight < 1.2,
     "HDR highlight lost or incorrectly range-mapped during interpolation")
   }
   let scaler = NativeStreamSpatialUpscaler(device:device)
+  let realScaler = quality == .native ? scaler : NativeStreamSpatialUpscaler(device:device)
   let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.rgba32Float,width:2112,height:1188,mipmapped:false)
   td.storageMode = .shared; td.usage = [.renderTarget,.shaderRead,.shaderWrite]
   let target = device.makeTexture(descriptor:td)!
   var combinedFrames = 0
+  var processingMS: [Double] = []
   for i in 0..<120 {
+   let start = ProcessInfo.processInfo.systemUptime
    let command = queue.makeCommandBuffer()!
    let image = generator.encode(buffer:i.isMultiple(of:2) ? first : second,
-    timestamp:10_000_000_000+Int64(i)*16_666_667,device:device,context:context,commandBuffer:command)
+    timestamp:10_000_000_000+Int64(i)*16_666_667,device:device,context:context,commandBuffer:command,quality:quality)
    var combined = false
    if let image,let scaled = scaler.encode(image:image,sourceSize:image.extent.size,destinationSize:CGSize(width:2112,height:1188),
     hdr:hdr,context:context,commandBuffer:command) {
@@ -218,27 +227,41 @@ enum NativeStreamVideoPerformanceLog { static func record(_ text: String) { prin
    command.commit(); await command.completed(); precondition(command.status == .completed)
    if combined {
     combinedFrames += 1
+    if i >= 16 { processingMS.append((ProcessInfo.processInfo.systemUptime-start)*1000) }
     var sample = [Float](repeating:0,count:4)
-    sample.withUnsafeMutableBytes { target.getBytes($0.baseAddress!,bytesPerRow:16,from:MTLRegionMake2D(825,550,1,1),mipmapLevel:0) }
+    sample.withUnsafeMutableBytes { target.getBytes($0.baseAddress!,bytesPerRow:16,from:MTLRegionMake2D(Int(750*2112/inputSize.width),550,1,1),mipmapLevel:0) }
     precondition(sample[0] > (hdr ? 1 : 0.5),"Combined generated/upscaled image was unwritten")
     precondition(abs(sample[1]-sample[0]) < 0.1 && abs(sample[2]-sample[0]) < 0.1,"Green flash in neutral generated/upscaled frame")
    } else { try await Task.sleep(nanoseconds:10_000_000) }
+   // Match the app's alternating full-size real / smaller generated path.
+   let realCommand = queue.makeCommandBuffer()!
+   let realImage = CIImage(cvPixelBuffer:first)
+   if let scaled = realScaler.encode(image:realImage,sourceSize:realImage.extent.size,
+       destinationSize:CGSize(width:2112,height:1188),hdr:hdr,context:context,commandBuffer:realCommand) {
+    context.render(scaled,to:target,commandBuffer:realCommand,bounds:CGRect(x:0,y:0,width:2112,height:1188),
+       colorSpace:NativeStreamVideoEffectsPolicy.workingColorSpace(hdr:hdr))
+   } else { precondition(i < 16,"Real-frame upscaler repeatedly reinitializes") }
+   realCommand.commit(); await realCommand.completed(); precondition(realCommand.status == .completed)
   }
   precondition(combinedFrames >= 60)
-  print("PASS: combined interpolation + MetalFX",hdr ? "PQ" : "SDR",combinedFrames,"frames without unwritten/green output")
+  let timings = processingMS.sorted()
+  print("Measured Mac interpolation + MetalFX wall time",quality.label,inputSize,hdr ? "PQ" : "SDR", "median ms:",timings[timings.count/2])
+  print("PASS: combined interpolation + MetalFX",quality.label,inputSize,hdr ? "PQ" : "SDR",combinedFrames,"frames without unwritten/green output")
   // A budget cooldown drops history but must retain the initialized processor.
   generator.clearHistory()
   let restartFirst = queue.makeCommandBuffer()!
   precondition(generator.encode(buffer:first,timestamp:20_000_000_000,device:device,context:context,
-   commandBuffer:restartFirst) == nil && generator.status != "Preparing")
+   commandBuffer:restartFirst,quality:quality) == nil && generator.status != "Preparing")
   restartFirst.commit(); await restartFirst.completed(); precondition(restartFirst.status == .completed)
   let restartSecond = queue.makeCommandBuffer()!
   precondition(generator.encode(buffer:second,timestamp:20_016_666_667,device:device,context:context,
-   commandBuffer:restartSecond) != nil,"Cooldown unexpectedly reloads interpolation model")
+   commandBuffer:restartSecond,quality:quality) != nil,"Cooldown unexpectedly reloads interpolation model")
   restartSecond.commit(); await restartSecond.completed(); precondition(restartSecond.status == .completed)
   print("PASS: interpolation resumes after history-only cooldown without ML session reload")
   generator.reset()
   print("PASS: real Apple low-latency interpolation with GPU full/video-range conversion", hdr ? "8-bit PQ HDR" : "8-bit SDR", "generated midpoint image, GPU completion, session reset")
+  }
+  }
   }
  }
 }

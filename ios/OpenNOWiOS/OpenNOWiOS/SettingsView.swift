@@ -635,6 +635,13 @@ struct SettingsView: View {
                 .font(.footnote).foregroundStyle(.secondary)
             Toggle("Frame Generation (Experimental)", isOn: $store.settings.frameGenerationEnabled)
             if store.settings.frameGenerationEnabled {
+                Picker("Frame Generation Quality", selection: $store.settings.frameGenerationQuality) {
+                    ForEach(NativeStreamFrameGenerationQuality.allCases) { quality in
+                        Text(quality.label).tag(quality)
+                    }
+                }
+                Text("Performance processes intermediate 8-bit 4:2:0 frames at up to 960 pixels per axis and 540p total pixels, then upscales them. Real frames keep the stream's detail. Native processes the full input size. The received stream, codec and HDR stay unchanged.")
+                    .font(.footnote).foregroundStyle(.secondary)
                 Text("Frame generation: \(NativeStreamVideoEffectsPolicy.frameGenerationLimits().label). MetalFX presets select an eligible input size for both effects. Start a fresh session after changing resolution. The HUD reports generated and total displayed FPS separately.")
                     .font(.footnote).foregroundStyle(.secondary)
             }

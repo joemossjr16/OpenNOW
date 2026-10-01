@@ -1739,9 +1739,20 @@ private struct NativeStreamControlsPanel: View {
                     isOn: Binding(get: { coordinator.liveSettings.metalFXUpscalingEnabled },
                         set: { value in coordinator.updateLiveSettings { $0.metalFXUpscalingEnabled = value } }))
                 NativeStreamToggleRow(title: "Frame generation (experimental)",
-                    value: coordinator.liveSettings.frameGenerationEnabled ? "60 → 120 FPS" : "Off",
+                    value: coordinator.liveSettings.frameGenerationEnabled ? "On · target 120 FPS" : "Off",
                     isOn: Binding(get: { coordinator.liveSettings.frameGenerationEnabled },
                         set: { value in coordinator.updateLiveSettings { $0.frameGenerationEnabled = value } }))
+                if coordinator.liveSettings.frameGenerationEnabled {
+                    Picker("Frame generation quality", selection: Binding(
+                        get: { coordinator.liveSettings.frameGenerationQuality },
+                        set: { value in coordinator.updateLiveSettings { $0.frameGenerationQuality = value } })) {
+                        ForEach(NativeStreamFrameGenerationQuality.allCases) { value in
+                            Text(value.label).tag(value)
+                        }
+                    }
+                    Text("Performance reduces detail in generated frames to save GPU time. Received frames stay at full resolution. Applies to 8-bit 4:2:0; other formats use Native.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
                 Text("Frame generation requires a 60 FPS stream and 120 Hz display. Adds delay; may show motion artifacts. Stream settings are unchanged.")
                     .font(.footnote).foregroundStyle(.secondary)
                 if let rates = coordinator.statsSnapshot.presentationRates {
@@ -3139,7 +3150,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         statsMetrics = next.streamStatsMetrics
         renderer?.setMetalPerformanceHUD(next.showMetalPerformanceHUD)
         renderer?.setVideoEffects(upscaling: next.metalFXUpscalingEnabled,
-            frameGeneration: next.frameGenerationEnabled, sourceFPS: streamProfile.fps)
+            frameGeneration: next.frameGenerationEnabled, sourceFPS: streamProfile.fps, quality: next.frameGenerationQuality)
         inputBridge.configureUserPreferences(
             mouseSensitivity: next.mouseSensitivity,
             mouseAcceleration: next.mouseAcceleration,
@@ -3526,7 +3537,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         renderer.setViewportTransform(scale: streamZoomScale, offset: streamZoomOffset)
         renderer.setMetalPerformanceHUD(liveSettings.showMetalPerformanceHUD)
         renderer.setVideoEffects(upscaling: liveSettings.metalFXUpscalingEnabled,
-            frameGeneration: liveSettings.frameGenerationEnabled, sourceFPS: streamProfile.fps)
+            frameGeneration: liveSettings.frameGenerationEnabled, sourceFPS: streamProfile.fps, quality: liveSettings.frameGenerationQuality)
         attachCurrentVideoSinkIfNeeded()
     }
 
@@ -5919,15 +5930,17 @@ private final class NativeStreamRenderView: UIView {
     private var upscalingEnabled = false
     private var frameGenerationEnabled = false
     private var effectsSourceFPS = 60
+    private var effectsFrameGenerationQuality = NativeStreamFrameGenerationQuality.performance
     var videoEffectsStatus: String { filteredMetalView?.videoEffectsStatus ?? "" }
     var presentationRates: NativeStreamPresentationRates? {
         frameGenerationEnabled && filteredRendererActive ? filteredMetalView?.presentationRates : nil
     }
 
-    func setVideoEffects(upscaling: Bool, frameGeneration: Bool, sourceFPS: Int) {
+    func setVideoEffects(upscaling: Bool, frameGeneration: Bool, sourceFPS: Int, quality: NativeStreamFrameGenerationQuality = .performance) {
         upscalingEnabled = upscaling; frameGenerationEnabled = frameGeneration; effectsSourceFPS = sourceFPS
+        effectsFrameGenerationQuality = quality
         if upscaling || frameGeneration { ensureFilteredMetalView() }
-        filteredMetalView?.setVideoEffects(upscaling: upscaling, frameGeneration: frameGeneration, sourceFPS: sourceFPS)
+        filteredMetalView?.setVideoEffects(upscaling: upscaling, frameGeneration: frameGeneration, sourceFPS: sourceFPS, quality: quality)
         updateRendererVisibility()
     }
     private var viewportTransformScale: CGFloat = 1
@@ -6108,7 +6121,7 @@ private final class NativeStreamRenderView: UIView {
         filtered.frame = videoContainerView.bounds
         filtered.stretchToFill = stretchStreamToFill
         filtered.sharpeningAmount = streamSharpeningEnabled ? streamSharpeningAmount : 0
-        filtered.setVideoEffects(upscaling: upscalingEnabled, frameGeneration: frameGenerationEnabled, sourceFPS: effectsSourceFPS)
+        filtered.setVideoEffects(upscaling: upscalingEnabled, frameGeneration: frameGenerationEnabled, sourceFPS: effectsSourceFPS, quality: effectsFrameGenerationQuality)
         filtered.isHidden = true
         videoContainerView.addSubview(filtered)
         rendererStateLock.lock()
@@ -6261,10 +6274,13 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     private let ciContext: CIContext
     private let directHDR: NativeStreamHDRMetalRenderer?
     private let spatialUpscaler: NativeStreamSpatialUpscaler
+    // Real and generated inputs can have different sizes. Keep both pipelines warm.
+    private let generatedSpatialUpscaler: NativeStreamSpatialUpscaler
     private let frameGenerator = NativeStreamFrameGenerator()
     private var upscalingEnabled = false
     private var frameGenerationEnabled = false
     private var sourceFPS = 60
+    private var frameGenerationQuality = NativeStreamFrameGenerationQuality.performance
     private var pendingRealFrame: NativeStreamLatestFrameMailbox<RTCVideoFrame>.Entry?
     private var suspendGenerationUntil: CFTimeInterval = 0
     private var suspendUpscalingUntil: CFTimeInterval = 0
@@ -6290,14 +6306,15 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         return parts.joined(separator: " · ")
     }
 
-    func setVideoEffects(upscaling: Bool, frameGeneration: Bool, sourceFPS: Int) {
-        if !upscaling { spatialUpscaler.reset() }
-        if self.frameGenerationEnabled != frameGeneration || self.sourceFPS != sourceFPS {
-            frameGenerator.reset(); pendingRealFrame = nil; suspendGenerationUntil = 0
+    func setVideoEffects(upscaling: Bool, frameGeneration: Bool, sourceFPS: Int, quality: NativeStreamFrameGenerationQuality = .performance) {
+        if !upscaling { spatialUpscaler.reset(); generatedSpatialUpscaler.reset() }
+        if self.frameGenerationEnabled != frameGeneration || self.sourceFPS != sourceFPS || self.frameGenerationQuality != quality {
+            frameGenerator.reset(); generatedSpatialUpscaler.reset(); pendingRealFrame = nil; suspendGenerationUntil = 0
             generationBudget.reset(); effectsGeneration &+= 1
             presentationLock.lock(); presentationRateMeter = NativeStreamPresentationRateMeter(); presentationLock.unlock()
         }
         upscalingEnabled = upscaling; frameGenerationEnabled = frameGeneration; self.sourceFPS = sourceFPS
+        frameGenerationQuality = quality
     }
     private var loggedDirectHDR = false
     private let sharpeningFilter = CIFilter(name: "CISharpenLuminance")
@@ -6346,6 +6363,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         self.commandQueue = commandQueue
         directHDR = NativeStreamHDRMetalRenderer(device: device)
         spatialUpscaler = NativeStreamSpatialUpscaler(device: device)
+        generatedSpatialUpscaler = NativeStreamSpatialUpscaler(device: device)
         ciContext = CIContext(mtlDevice: device, options: [.cacheIntermediates: false])
         mtkView = MTKView(frame: .zero, device: device)
         super.init(frame: .zero)
@@ -6452,7 +6470,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                 thermal: ProcessInfo.processInfo.thermalState.rawValue)
             if allowed && CACurrentMediaTime() >= suspendGenerationUntil {
                 effectImage = frameGenerator.encode(buffer: pixelBuffer, timestamp: entry.frame.timeStampNs,
-                    device: device, context: ciContext, commandBuffer: commandBuffer)
+                    device: device, context: ciContext, commandBuffer: commandBuffer, quality: frameGenerationQuality)
                 generationStatus = frameGenerator.status
                 if generationStatus == "Preparing" { generationBudget.reset() }
                 if effectImage != nil { pendingRealFrame = entry; generated = true }
@@ -6497,7 +6515,8 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                     target: targetBounds.size
                 )
             let scaledImage: CIImage
-            if shouldUpscale, let scaled = spatialUpscaler.encode(image: filteredImage,
+            let activeUpscaler = generated && sourceExtent.size != frameSize ? generatedSpatialUpscaler : spatialUpscaler
+            if shouldUpscale, let scaled = activeUpscaler.encode(image: filteredImage,
                 sourceSize: sourceExtent.size, destinationSize: destination.size, hdr: hdrTransfer != .sdr,
                 context: ciContext, commandBuffer: commandBuffer) {
                 scaledImage = scaled
@@ -6548,7 +6567,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                     self.frameGenerator.reset(); self.pendingRealFrame = nil
                     self.suspendGenerationUntil = CACurrentMediaTime() + 5
                     self.suspendUpscalingUntil = CACurrentMediaTime() + 5
-                    self.spatialUpscaler.reset()
+                    self.spatialUpscaler.reset(); self.generatedSpatialUpscaler.reset()
                     self.generationPauseReason = "Paused: processing error"
                     self.generationStatus = self.generationPauseReason
                     self.generationBudget.reset(); self.effectsGeneration &+= 1
