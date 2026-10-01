@@ -185,19 +185,6 @@ struct SettingsView: View {
                 enforceAvailableHDR()
                 applyMetalFXQualityPreset()
             }
-            .onChangeCompat(of: store.settings.hdrEnabled) { enabled in
-                guard enabled else { return }
-                store.settings.preferredColorQuality = store.settings.preferredColorQuality == StreamColorQuality.tenBit444.rawValue
-                    ? StreamColorQuality.tenBit444.rawValue : StreamColorQuality.tenBit420.rawValue
-                if NativeStreamCodecProbe.report().capability(for: .h265)?.launchSafe == true {
-                    store.settings.preferredCodec = "H265"
-                }
-            }
-            .onChangeCompat(of: store.settings.preferredColorQuality) { color in
-                if color == StreamColorQuality.tenBit444.rawValue, store.settings.experimentalNativeNVSTEnabled {
-                    store.settings.preferredCodec = "H265"
-                }
-            }
             .confirmationDialog("Reset settings?", isPresented: $showingResetConfirmation, titleVisibility: .visible) {
                 Button("Reset Settings", role: .destructive) {
                     store.resetSettings()
@@ -598,15 +585,18 @@ struct SettingsView: View {
                 ForEach(codecValues, id: \.self) { Text($0).tag($0) }
             }
 
-            Picker("Color", selection: customStreamBinding(\.preferredColorQuality)) {
+            Picker("Color", selection: streamColorBinding) {
                 ForEach([StreamColorQuality.eightBit420, .tenBit420, .tenBit444]) { color in
                     Text(color.label + (color == .tenBit444 ? " (Experimental)" : "")).tag(color.rawValue)
                         .disabled(color == .tenBit444 && !store.settings.experimentalNativeNVSTEnabled)
                 }
             }
 
-            Toggle("HDR", isOn: $store.settings.hdrEnabled)
+            Toggle("HDR", isOn: streamHDRBinding)
                 .disabled(!hdrAvailable)
+
+            Text("Selecting 8-bit turns HDR off. Color and HDR changes apply to a new session; resuming keeps the host's existing format.")
+                .font(.footnote).foregroundStyle(.secondary)
 
             if store.settings.experimentalNativeNVSTEnabled || store.settings.preferredColorQuality == StreamColorQuality.tenBit444.rawValue {
                 Text("4:4:4 uses H.265 and the native receiver. Enable HDR separately. The host and device must support 10-bit 4:4:4; unsupported or downgraded streams report an error. The Color status shows the received output.")
@@ -1622,6 +1612,17 @@ struct SettingsView: View {
         )
     }
 
+    private var streamColorBinding: Binding<String> {
+        Binding(get: { StreamSettingsResolver.colorQuality(for:store.settings).rawValue },set: { value in
+            guard let color = StreamColorQuality(rawValue:value) else { return }
+            store.setStreamColor(color)
+        })
+    }
+
+    private var streamHDRBinding: Binding<Bool> {
+        Binding(get: { store.settings.hdrEnabled },set: { store.setStreamHDR($0) })
+    }
+
     private var streamResolutionBinding: Binding<String> {
         Binding(get: { store.settings.preferredResolution }, set: { value in
             store.settings.preferredResolution = value
@@ -1758,7 +1759,7 @@ struct SettingsView: View {
     }
 
     private var selectedColorQualityLabel: String {
-        StreamColorQuality(rawValue: store.settings.preferredColorQuality)?.label ?? store.settings.preferredColorQuality
+        StreamSettingsResolver.colorQuality(for:store.settings).label
     }
 
     private var appVersion: String {

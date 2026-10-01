@@ -1,6 +1,6 @@
 # Metal 4 streaming renderer
 
-Build **1.1.143 (143)** on [`metal-4`](https://github.com/joemossjr16/OpenNOW/tree/metal-4). [Unsigned experimental IPA](https://github.com/joemossjr16/ios-apps/releases/tag/opennow-metal4-143). The original cumulative changes remain on [`ios/native-nvst-128`](https://github.com/joemossjr16/OpenNOW/tree/ios/native-nvst-128), build 136.
+Build **1.1.144 (144)** on [`metal-4`](https://github.com/joemossjr16/OpenNOW/tree/metal-4). [Unsigned experimental IPA](https://github.com/joemossjr16/ios-apps/releases/tag/opennow-metal4-144). The original cumulative changes remain on [`ios/native-nvst-128`](https://github.com/joemossjr16/OpenNOW/tree/ios/native-nvst-128), build 136.
 
 ## Rendering and effects
 
@@ -13,6 +13,12 @@ PQ converts analytically to linear BT.2020 with 203-nit reference white. HLG use
 Sharpening runs in a Metal 4 compute pass in linear light before MetalFX. Its luminance unsharp filter preserves chroma and HDR highlights and bounds overshoot before the scaler. The existing strength control remains; the new filter is not pixel-identical to Core Image's sharpening filter. Unsupported input/device paths keep the previous Core Image filter. Conversion → sharpening → `MTL4FXSpatialScaler` → presentation share one Metal 4 command buffer with explicit render/compute dependencies. With no effects, the direct PQ renderer continues to avoid the intermediate linear surface.
 
 Two slots bound each configuration; the view admits at most two GPU submissions overall. Separate cached real/generated configurations avoid repeatedly rebuilding scalers when performance interpolation uses smaller images. Setup runs off the display thread. Completion retains source IOSurfaces, color lookups, intermediates, argument tables, uniforms, scalers, producer commands and drawables. Shared GPU events order live renderer switches. Completed GPU failures recover skipped signals and select the compatible renderer. CoreSimulator uses explicit fallback because its SDK omits Metal 4.
+
+## Color selection and persistence
+
+Build 144 saves Color/HDR choices together immediately through the store. Explicitly selecting 8-bit disables HDR, so the requested output stays 8-bit SDR instead of silently promoting to 10-bit HDR. Enabling HDR promotes the selected color to its ten-bit counterpart; disabling HDR preserves the separately selected chroma/depth, allowing 10-bit SDR and 4:4:4 SDR. The picker and summary show effective request color even for older saved HDR-plus-eight-bit preferences. Codec rules remain unchanged; manual video choices select the Custom preset.
+
+The active session keeps its allocation snapshot. Preferences apply to a fresh session; resuming retains the host's existing format. UI guidance distinguishes this from saved settings. Bounded logs record explicit Color/HDR choices without session/account data. Legacy HDR preference migration remains compatible. Three new regressions cover settings reload, launch resolution, CloudMatch/RTSP SDR requests, old-session color mismatch, HDR toggling and codec selection. Rendering remains unchanged from build 143 and retains its actual GPU validation.
 
 ## Frame generation and timing
 
@@ -44,7 +50,7 @@ Metal API and GPU validation are enabled. Direct rendering covers twelve chroma/
 
 Interpolation tests eight size/quality/SDR/PQ combinations and 944 generated/scaled images alternating native/CI presentation and full-size real images, plus history-only cooldown, deadline skips and explicit rejection of unsupported HDR444 generation. No unwritten/green output occurred in the fixtures. The installed Mac processor advertises only NV12, so actual HDR444 interpolation through a half-float processor remains device-dependent; tagged half-float rendering is checked separately.
 
-The unsigned iOS device build and 206 targeted simulator protocol/render/input/PiP/HDR/FG tests passed: zero failures, one hardware MetalFX skip. New regressions cover presentation deadlines and direct-effects color metadata. Native libraries and licenses remain unchanged.
+The unsigned iOS device build and 209 targeted simulator protocol/render/input/PiP/HDR/FG tests passed: zero failures, one hardware MetalFX skip. New regressions cover video-choice persistence/requests in addition to presentation deadlines and direct-effects color metadata. Native libraries and licenses remain unchanged.
 
 ## Apple references
 

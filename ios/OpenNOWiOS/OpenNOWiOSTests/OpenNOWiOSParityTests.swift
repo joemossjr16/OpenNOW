@@ -62,6 +62,77 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertNil(NativeStreamMetalVideoInput.color(half))
     }
 
+    func testSelectingEightBitDisablesHDRAndSurvivesSettingsReloadAndLaunch() throws {
+        var initial = AppSettings.default
+        initial.experimentalNativeNVSTEnabled = true
+        initial.preferredCodec = "H265"
+        initial.preferredColorQuality = StreamColorQuality.tenBit444.rawValue
+        initial.hdrEnabled = true
+        initial.metalFXUpscalingEnabled = true
+        initial.frameGenerationEnabled = true
+        let selected = StreamSettingsResolver.selectingColor(.eightBit420,in:initial)
+        let restored = try JSONDecoder().decode(AppSettings.self,from:JSONEncoder().encode(selected))
+        let launch = NativeStreamLaunchSettingsResolver.resolve(restored).settings
+        XCTAssertFalse(launch.hdrEnabled)
+        XCTAssertEqual(launch.preferredColorQuality,StreamColorQuality.eightBit420.rawValue)
+        XCTAssertEqual(StreamSettingsResolver.colorQuality(for:launch),.eightBit420)
+        XCTAssertFalse(StreamSettingsResolver.requiresDesktopColorProvisioning(for:launch))
+        XCTAssertTrue(launch.metalFXUpscalingEnabled);XCTAssertTrue(launch.frameGenerationEnabled)
+        XCTAssertEqual(launch.preferredCodec,"H265")
+        let quality = StreamSettingsResolver.colorQuality(for:launch)
+        let request = CloudMatchStreamingFeatureRequest.build(settings:launch,
+            profile:StreamSettingsResolver.profile(for:launch),bitDepth:quality.bitDepth,chromaFormat:quality.chromaFormat)
+        XCTAssertEqual(request["trueHdr"] as? Bool,false)
+        XCTAssertEqual(request["bitDepth"] as? Int,0)
+        XCTAssertEqual(request["chromaFormat"] as? Int,0)
+        XCTAssertFalse(StreamSettingsResolver.remoteColorMatches(color:.tenBit444,hdr:true,settings:launch))
+        XCTAssertTrue(StreamSettingsResolver.remoteColorMatches(color:.eightBit420,hdr:false,settings:launch))
+        XCTAssertNotEqual(StreamSettingsResolver.sessionSignature(for:initial),StreamSettingsResolver.sessionSignature(for:launch))
+        let sdp = NativeStreamSDP.buildNvstSDP(offerSDP:"",localAnswerSDP:"",
+            profile:StreamSettingsResolver.profile(for:launch),settings:launch,codec:.h265)
+        XCTAssertTrue(sdp.contains("a=video.dynamicRangeMode:0\n"))
+        XCTAssertTrue(sdp.contains("a=video.bitDepth:8\n"))
+    }
+
+    func testHDRTogglePreservesExplicitSDRChromaAndReenablesTenBit() throws {
+        var initial = AppSettings.default
+        initial.experimentalNativeNVSTEnabled = true
+        initial.preferredCodec = "H265"
+        initial.preferredColorQuality = StreamColorQuality.tenBit444.rawValue
+        initial.hdrEnabled = true
+        let off = StreamSettingsResolver.selectingHDR(false,in:initial,h265Available:true)
+        let reloaded = try JSONDecoder().decode(AppSettings.self,from:JSONEncoder().encode(off))
+        XCTAssertFalse(reloaded.hdrEnabled)
+        XCTAssertEqual(StreamSettingsResolver.colorQuality(for:reloaded),.tenBit444)
+        let chromaOff = StreamSettingsResolver.selectingColor(.tenBit420,in:reloaded)
+        XCTAssertFalse(chromaOff.hdrEnabled)
+        XCTAssertEqual(StreamSettingsResolver.colorQuality(for:chromaOff),.tenBit420)
+        let eightBit = StreamSettingsResolver.selectingColor(.eightBit420,in:chromaOff)
+        let on = StreamSettingsResolver.selectingHDR(true,in:eightBit,h265Available:true)
+        XCTAssertTrue(on.hdrEnabled)
+        XCTAssertEqual(on.preferredColorQuality,StreamColorQuality.tenBit420.rawValue)
+        XCTAssertEqual(StreamSettingsResolver.colorQuality(for:on),.tenBit420)
+        XCTAssertFalse(StreamSettingsResolver.requiresDesktopColorProvisioning(for:on))
+        XCTAssertEqual(StreamSettingsResolver.selectingColor(.tenBit420,in:initial).hdrEnabled,true)
+    }
+
+    func testVideoSelectionKeepsCodecRulesAndLegacyHDRMigration() {
+        var initial = AppSettings.default
+        initial.preferredCodec = "AV1"
+        initial.experimentalNativeNVSTEnabled = true
+        let fullChroma = StreamSettingsResolver.selectingColor(.tenBit444,in:initial)
+        XCTAssertEqual(fullChroma.preferredCodec,"H265")
+        XCTAssertFalse(fullChroma.hdrEnabled)
+        let hdr = StreamSettingsResolver.selectingHDR(true,in:initial,h265Available:false)
+        XCTAssertEqual(hdr.preferredCodec,"AV1")
+        XCTAssertEqual(hdr.preferredColorQuality,StreamColorQuality.tenBit420.rawValue)
+        // Old saved HDR + 8-bit settings retain their migration behavior. Only
+        // a new explicit 8-bit picker choice turns HDR off.
+        initial.hdrEnabled = true
+        XCTAssertEqual(StreamSettingsResolver.colorQuality(for:initial),.tenBit420)
+        XCTAssertFalse(StreamSettingsResolver.selectingColor(.eightBit420,in:initial).hdrEnabled)
+    }
+
     func testPresentationRatesCountPresentedGeneratedFramesAndExpire() throws {
         var meter = NativeStreamPresentationRateMeter()
         XCTAssertNil(meter.snapshot(now: 100))

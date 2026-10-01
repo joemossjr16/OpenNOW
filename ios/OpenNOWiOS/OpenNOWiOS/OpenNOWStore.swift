@@ -2134,6 +2134,31 @@ enum StreamSettingsResolver {
         return color == .eightBit444 ? .tenBit444 : .tenBit420
     }
 
+    /// An explicit picker choice takes priority over the preceding HDR preference.
+    /// Keep legacy decoding/launch promotion separate from new user selections.
+    static func selectingColor(_ color: StreamColorQuality, in settings: AppSettings) -> AppSettings {
+        var updated = settings
+        updated.preferredColorQuality = color.rawValue
+        updated.streamPreset = .custom
+        if color.bitDepth < 10 { updated.hdrEnabled = false }
+        if color.chromaFormat == 2 && updated.experimentalNativeNVSTEnabled {
+            updated.preferredCodec = "H265"
+        }
+        return updated
+    }
+
+    static func selectingHDR(_ enabled: Bool, in settings: AppSettings,
+                             h265Available: Bool) -> AppSettings {
+        var updated = settings
+        updated.hdrEnabled = enabled
+        updated.streamPreset = .custom
+        if enabled {
+            updated.preferredColorQuality = colorQuality(for: updated).rawValue
+            if h265Available { updated.preferredCodec = "H265" }
+        }
+        return updated
+    }
+
     static func remoteColorMatches(color: StreamColorQuality?, hdr: Bool?, settings: AppSettings) -> Bool {
         (color == nil || color == colorQuality(for: settings)) && (hdr == nil || hdr == settings.hdrEnabled)
     }
@@ -8054,6 +8079,24 @@ final class OpenNOWStore: ObservableObject {
         if let encoded = try? JSONEncoder().encode(normalized) {
             defaults.set(encoded, forKey: settingsKey)
         }
+    }
+
+    func setStreamColor(_ color: StreamColorQuality) {
+        saveVideoSelection(StreamSettingsResolver.selectingColor(color,in:settings))
+    }
+
+    func setStreamHDR(_ enabled: Bool) {
+        let h265Available = enabled && NativeStreamCodecProbe.report().capability(for:.h265)?.launchSafe == true
+        saveVideoSelection(StreamSettingsResolver.selectingHDR(enabled,in:settings,h265Available:h265Available))
+    }
+
+    private func saveVideoSelection(_ updated: AppSettings) {
+        guard updated != settings else { return }
+        // Publish the complete choice once and persist before leaving the control.
+        // The active session keeps its allocation snapshot until a fresh launch.
+        settings = updated
+        persistSettings()
+        NativeStreamVideoPerformanceLog.record("video-preference color=\(settings.preferredColorQuality) HDR=\(settings.hdrEnabled)")
     }
 
     func refreshTrackedSessionSurface() {
