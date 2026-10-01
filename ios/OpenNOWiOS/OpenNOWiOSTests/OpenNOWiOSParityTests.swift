@@ -13,6 +13,55 @@ import CoreImage
 @testable import OpenNOWiOS
 
 final class OpenNOWiOSParityTests: XCTestCase {
+    func testFramePresentationDeadlinesPreferFreshRealFrames() {
+        let policy = NativeStreamFramePresentationPolicy.self
+        XCTAssertTrue(policy.canInterpolate(now:100,target:100.008,displayHz:120,frameReceivedAt:99.997,recentCost:0.004))
+        XCTAssertFalse(policy.canInterpolate(now:100.007,target:100.008,displayHz:120,frameReceivedAt:99.997,recentCost:0.004))
+        XCTAssertFalse(policy.canInterpolate(now:100.007,target:100.008,displayHz:120,frameReceivedAt:99.997,recentCost:0))
+        XCTAssertFalse(policy.canInterpolate(now:100,target:100.008,displayHz:120,frameReceivedAt:99.975,recentCost:0.001))
+        XCTAssertFalse(policy.canInterpolate(now:100,target:nil,displayHz:120,frameReceivedAt:100,recentCost:0))
+        XCTAssertFalse(policy.canInterpolate(now:100,target:101,displayHz:120,frameReceivedAt:100,recentCost:0))
+        XCTAssertFalse(policy.canInterpolate(now:100,target:100.008,displayHz:0,frameReceivedAt:100,recentCost:0))
+        XCTAssertFalse(policy.canInterpolate(now:.nan,target:100.008,displayHz:120,frameReceivedAt:100,recentCost:0))
+        // A transient ML compile cannot poison every later scheduling decision.
+        XCTAssertTrue(policy.canInterpolate(now:100,target:100.008,displayHz:120,frameReceivedAt:100,recentCost:0.2))
+        XCTAssertFalse(policy.realFrameExpired(now:100,receivedAt:99.990,displayHz:120))
+        XCTAssertTrue(policy.realFrameExpired(now:100,receivedAt:99.980,displayHz:120))
+        XCTAssertTrue(policy.realFrameExpired(now:100,receivedAt:.nan,displayHz:120))
+        XCTAssertEqual(policy.presentationTime(now:100,target:100.008,displayHz:120,paired:true),100.008)
+        XCTAssertNil(policy.presentationTime(now:100,target:100.008,displayHz:120,paired:false))
+        XCTAssertNil(policy.presentationTime(now:100.009,target:100.008,displayHz:120,paired:true))
+    }
+
+    func testNativeEffectsColorMetadataPreservesHDRAndRejectsAmbiguity() throws {
+        func buffer(_ format:OSType) throws -> CVPixelBuffer {
+            var result:CVPixelBuffer?
+            XCTAssertEqual(CVPixelBufferCreate(nil,64,32,format,
+                [kCVPixelBufferIOSurfacePropertiesKey:[:],kCVPixelBufferMetalCompatibilityKey:true] as CFDictionary,&result),kCVReturnSuccess)
+            return try XCTUnwrap(result)
+        }
+        let yuv = try buffer(kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange)
+        XCTAssertEqual(NativeStreamMetalVideoInput.color(yuv)?.presentationTransfer,0)
+        CVBufferSetAttachment(yuv,kCVImageBufferTransferFunctionKey,kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ,.shouldPropagate)
+        XCTAssertNil(NativeStreamMetalVideoInput.color(yuv))
+        CVBufferSetAttachment(yuv,kCVImageBufferColorPrimariesKey,kCVImageBufferColorPrimaries_ITU_R_2020,.shouldPropagate)
+        XCTAssertEqual(NativeStreamMetalVideoInput.color(yuv)?.presentationTransfer,1)
+        CVBufferSetAttachment(yuv,kCVImageBufferTransferFunctionKey,kCVImageBufferTransferFunction_ITU_R_2100_HLG,.shouldPropagate)
+        XCTAssertEqual(NativeStreamMetalVideoInput.color(yuv)?.transfer,2)
+        CVBufferSetAttachment(yuv,kCVImageBufferTransferFunctionKey,"UnknownTransfer" as CFString,.shouldPropagate)
+        XCTAssertNil(NativeStreamMetalVideoInput.color(yuv))
+        let half = try buffer(kCVPixelFormatType_64RGBAHalf)
+        XCTAssertNil(NativeStreamMetalVideoInput.color(half))
+        CVBufferSetAttachment(half,kCVImageBufferTransferFunctionKey,kCVImageBufferTransferFunction_Linear,.shouldPropagate)
+        CVBufferSetAttachment(half,kCVImageBufferCGColorSpaceKey,NativeStreamVideoEffectsPolicy.workingColorSpace(hdr:true),.shouldPropagate)
+        XCTAssertEqual(NativeStreamMetalVideoInput.color(half)?.presentationTransfer,1)
+        CVBufferSetAttachment(half,kCVImageBufferColorPrimariesKey,kCVImageBufferColorPrimaries_ITU_R_709_2,.shouldPropagate)
+        XCTAssertNil(NativeStreamMetalVideoInput.color(half))
+        CVBufferRemoveAttachment(half,kCVImageBufferColorPrimariesKey)
+        CVBufferSetAttachment(half,kCVImageBufferCGColorSpaceKey,CGColorSpace(name:CGColorSpace.displayP3)!, .shouldPropagate)
+        XCTAssertNil(NativeStreamMetalVideoInput.color(half))
+    }
+
     func testPresentationRatesCountPresentedGeneratedFramesAndExpire() throws {
         var meter = NativeStreamPresentationRateMeter()
         XCTAssertNil(meter.snapshot(now: 100))

@@ -24,6 +24,26 @@ enum NativeStreamVideoPerformanceLog { static func record(_ text: String) { prin
   rejectedCommand.commit(); await rejectedCommand.completed()
   generator.reset()
   print("PASS: oversized interpolation surface rejected before producing an unwritten frame")
+  // The installed Mac processor advertises NV12 only. Verify its limitation
+  // never causes a silent depth/chroma downgrade of a 10-bit 4:4:4 HDR source.
+  let configuration = VTLowLatencyFrameInterpolationConfiguration(frameWidth:1920,frameHeight:1080,numberOfInterpolatedFrames:1)!
+  let requested = kCVPixelFormatType_444YpCbCr10BiPlanarFullRange
+  let selected = NativeStreamVideoEffectsPolicy.interpolationFormat(source:requested,supported:configuration.supportedPixelFormats,hdr:true)
+  if selected == nil {
+    var hdr444:CVPixelBuffer?
+    precondition(CVPixelBufferCreate(nil,1920,1080,requested,[kCVPixelBufferIOSurfacePropertiesKey:[:],kCVPixelBufferMetalCompatibilityKey:true] as CFDictionary,&hdr444)==kCVReturnSuccess)
+    CVBufferSetAttachment(hdr444!,kCVImageBufferTransferFunctionKey,kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ,.shouldPropagate)
+    for i in 0..<500 {
+      let command = queue.makeCommandBuffer()!
+      precondition(generator.encode(buffer:hdr444!,timestamp:Int64(i)*16_666_667,device:device,context:context,commandBuffer:command)==nil)
+      precondition(generator.generatedBuffer == nil)
+      command.commit();await command.completed();precondition(command.status == .completed)
+      if generator.status != "Preparing" { break };try await Task.sleep(nanoseconds:10_000_000)
+    }
+    precondition(generator.status == "Requires 8-bit 4:2:0 on this device")
+    generator.reset()
+    print("PASS: processor refusing HDR444 produces no downgraded or unwritten generated buffer")
+  } else { precondition(selected == requested || selected == kCVPixelFormatType_64RGBAHalf) }
   func source(offset: Int, hdr: Bool, width:Int, height:Int) -> CVPixelBuffer {
    var allocation: CVPixelBuffer?
    precondition(CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
@@ -106,9 +126,17 @@ enum NativeStreamVideoPerformanceLog { static func record(_ text: String) { prin
    var combined = false
    if let image {
     let pair = AsyncStream<Bool>.makeStream()
+    let finished: @Sendable (Double,NSError?) -> Void = { _,error in
+      if let error { print(error) };pair.continuation.yield(error == nil);pair.continuation.finish()
+    }
+    if i.isMultiple(of:2), let buffer = generator.generatedBuffer {
+      combined = renderer.submit(buffer:buffer,destination:CGRect(x:0,y:0,width:2112,height:1188),upscale:true,
+          target:target,producer:command,completion:finished)
+    } else {
     combined = renderer.submit(image:image,destination:CGRect(x:0,y:0,width:2112,height:1188),transfer:hdr ? 1 : 0,upscale:true,
       context:context,producer:command,target:target) { _,error in
       if let error { print(error) }; pair.continuation.yield(error == nil); pair.continuation.finish()
+    }
     }
     if combined { for await ok in pair.stream { precondition(ok) } }
    }
@@ -128,7 +156,11 @@ enum NativeStreamVideoPerformanceLog { static func record(_ text: String) { prin
    let realCommand = queue.makeCommandBuffer()!
    let realImage = CIImage(cvPixelBuffer:first)
    let pair=AsyncStream<Bool>.makeStream()
-   let real = renderer.submit(image:realImage,destination:CGRect(x:0,y:0,width:2112,height:1188),transfer:hdr ? 1 : 0,upscale:true,
+   let real = i.isMultiple(of:2)
+      ? renderer.submit(buffer:first,destination:CGRect(x:0,y:0,width:2112,height:1188),upscale:true,target:target) { _,error in
+        if let error { print(error) };pair.continuation.yield(error == nil);pair.continuation.finish()
+      }
+      : renderer.submit(image:realImage,destination:CGRect(x:0,y:0,width:2112,height:1188),transfer:hdr ? 1 : 0,upscale:true,
       context:context,producer:realCommand,target:target) { _,error in
       if let error { print(error) }; pair.continuation.yield(error == nil); pair.continuation.finish()
    }
@@ -151,6 +183,15 @@ enum NativeStreamVideoPerformanceLog { static func record(_ text: String) { prin
    commandBuffer:restartSecond,quality:quality) != nil,"Cooldown unexpectedly reloads interpolation model")
   restartSecond.commit(); await restartSecond.completed(); precondition(restartSecond.status == .completed)
   print("PASS: interpolation resumes after history-only cooldown without ML session reload")
+  let skipped = queue.makeCommandBuffer()!
+  precondition(generator.encode(buffer:first,timestamp:20_033_333_334,device:device,context:context,
+    commandBuffer:skipped,quality:quality,generate:false) == nil && generator.generatedBuffer == nil)
+  skipped.commit();await skipped.completed();precondition(skipped.status == .completed)
+  let afterDeadline = queue.makeCommandBuffer()!
+  precondition(generator.encode(buffer:second,timestamp:20_050_000_001,device:device,context:context,
+    commandBuffer:afterDeadline,quality:quality) != nil,"Deadline skip discarded steady input history")
+  afterDeadline.commit();await afterDeadline.completed();precondition(afterDeadline.status == .completed)
+  print("PASS: interpolation deadline skip retains history and resumes on next frame")
   generator.reset()
   print("PASS: real Apple low-latency interpolation with GPU full/video-range conversion", hdr ? "8-bit PQ HDR" : "8-bit SDR", "generated midpoint image, GPU completion, session reset")
   }

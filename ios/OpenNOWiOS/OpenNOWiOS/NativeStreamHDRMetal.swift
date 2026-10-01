@@ -279,3 +279,115 @@ final class NativeStreamMetal4HDRRenderer {
                 completion: @escaping @Sendable (Double,NSError?) -> Void) -> Bool { false }
 }
 #endif
+
+
+/// Metadata and IOSurface interpretation for direct SDR/HDR effects. Unsupported
+/// encodings retain Core Image rather than guessing transfer functions or gamut.
+enum NativeStreamMetalVideoInput {
+    struct Color: Equatable {
+        let transfer: Int // 0 sRGB, 1 PQ, 2 HLG, 3 BT.709, 4 linear
+        let bt2020: Bool
+        let rgb: Bool
+        var presentationTransfer: Int { bt2020 && transfer != 0 && transfer != 3 ? 1 : 0 }
+    }
+    static func color(_ buffer: CVPixelBuffer) -> Color? {
+        let format = CVPixelBufferGetPixelFormatType(buffer)
+        let rgb = format == kCVPixelFormatType_32BGRA || format == kCVPixelFormatType_64RGBAHalf
+        guard rgb || NativeStreamTenBitSurface.chroma(format) != nil || eightBitChroma(format) != nil else { return nil }
+        let attachment = CVBufferCopyAttachment(buffer, kCVImageBufferTransferFunctionKey, nil) as? String
+        let transfer: Int
+        if attachment == kCVImageBufferTransferFunction_sRGB as String { transfer = 0 }
+        else if attachment == kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String { transfer = 1 }
+        else if attachment == kCVImageBufferTransferFunction_ITU_R_2100_HLG as String { transfer = 2 }
+        else if attachment == kCVImageBufferTransferFunction_ITU_R_709_2 as String { transfer = 3 }
+        else if attachment == kCVImageBufferTransferFunction_Linear as String { transfer = 4 }
+        else if attachment == nil { transfer = rgb ? 0 : 3 }
+        else { return nil }
+        let primaries = CVBufferCopyAttachment(buffer, kCVImageBufferColorPrimariesKey, nil) as? String
+        let spaceAttachment = CVBufferCopyAttachment(buffer, kCVImageBufferCGColorSpaceKey, nil)
+        let space: CGColorSpace? = spaceAttachment.flatMap { CFGetTypeID($0) == CGColorSpace.typeID ? ($0 as! CGColorSpace) : nil }
+        let name = space?.name as String?
+        let bt2020 = primaries == kCVImageBufferColorPrimaries_ITU_R_2020 as String
+            || name == CGColorSpace.extendedLinearITUR_2020 as String
+        guard primaries == nil || primaries == kCVImageBufferColorPrimaries_ITU_R_2020 as String || primaries == kCVImageBufferColorPrimaries_ITU_R_709_2 as String else { return nil }
+        if let name, rgb {
+            if name == CGColorSpace.extendedLinearITUR_2020 as String {
+                guard primaries == nil || primaries == kCVImageBufferColorPrimaries_ITU_R_2020 as String else { return nil }
+            } else { guard !bt2020 else { return nil } }
+            guard transfer == (name == CGColorSpace.sRGB as String ? 0 : 4) else { return nil }
+            guard [CGColorSpace.sRGB as String, CGColorSpace.extendedLinearSRGB as String,
+                   CGColorSpace.extendedLinearITUR_2020 as String].contains(name) else { return nil }
+        }
+        guard transfer != 1 && transfer != 2 || bt2020 else { return nil }
+        // Half-float processing surfaces must carry an explicit linear working space.
+        guard format != kCVPixelFormatType_64RGBAHalf || (transfer == 4 && space != nil) else { return nil }
+        return Color(transfer: transfer, bt2020: bt2020, rgb: rgb)
+    }
+    static func eightBitChroma(_ format: OSType) -> String? {
+        switch format {
+        case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: return "4:2:0"
+        case kCVPixelFormatType_422YpCbCr8BiPlanarFullRange, kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange: return "4:2:2"
+        case kCVPixelFormatType_444YpCbCr8BiPlanarFullRange, kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange: return "4:4:4"
+        default: return nil
+        }
+    }
+    struct Input {
+        let buffer: CVPixelBuffer
+        let references: [CVMetalTexture]
+        let y, uv: any MTLTexture
+        let color: Color
+        let uniforms: NativeStreamHDRMetalProgram.Uniforms
+        init?(buffer: CVPixelBuffer, cache: CVMetalTextureCache, target: any MTLTexture) {
+            guard let color = NativeStreamMetalVideoInput.color(buffer),
+                  target.pixelFormat == (color.presentationTransfer == 0 ? .bgra8Unorm : .bgr10a2Unorm) else { return nil }
+            let format = CVPixelBufferGetPixelFormatType(buffer)
+            let ten = NativeStreamTenBitSurface.chroma(format) != nil
+            var references: [CVMetalTexture] = []
+            func texture(_ format: MTLPixelFormat, plane: Int, width: Int, height: Int) -> (any MTLTexture)? {
+                var reference: CVMetalTexture?
+                guard CVMetalTextureCacheCreateTextureFromImage(nil, cache, buffer, nil, format,
+                    width, height, plane, &reference) == kCVReturnSuccess,
+                      let reference, let result = CVMetalTextureGetTexture(reference) else { return nil }
+                references.append(reference); return result
+            }
+            let width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer)
+            var uniforms = NativeStreamHDRMetalProgram.Uniforms(range: SIMD4(0,1,0,1),
+                coefficients: SIMD4(1,0,0,color.rgb ? 1 : 0), green: SIMD4(0,0,Float(color.transfer),color.bt2020 ? 1 : 0))
+            let y, uv: any MTLTexture
+            if color.rgb {
+                guard CVPixelBufferGetPlaneCount(buffer) == 0,
+                      let rgb = texture(format == kCVPixelFormatType_64RGBAHalf ? .rgba16Float : .bgra8Unorm,
+                                        plane: 0, width: width, height: height) else { return nil }
+                y = rgb; uv = rgb
+            } else {
+                guard CVPixelBufferGetPlaneCount(buffer) == 2,
+                      let chroma = NativeStreamTenBitSurface.chroma(format) ?? eightBitChroma(format) else { return nil }
+                let horizontal = chroma == "4:4:4" ? 1 : 2, vertical = chroma == "4:2:0" ? 2 : 1
+                guard CVPixelBufferGetWidthOfPlane(buffer,0) == width, CVPixelBufferGetHeightOfPlane(buffer,0) == height,
+                      CVPixelBufferGetWidthOfPlane(buffer,1) == (width + horizontal - 1) / horizontal,
+                      CVPixelBufferGetHeightOfPlane(buffer,1) == (height + vertical - 1) / vertical,
+                      let luma = texture(ten ? .r16Unorm : .r8Unorm, plane: 0, width: width, height: height),
+                      let chromaTexture = texture(ten ? .rg16Unorm : .rg8Unorm, plane: 1,
+                        width: CVPixelBufferGetWidthOfPlane(buffer,1), height: CVPixelBufferGetHeightOfPlane(buffer,1)) else { return nil }
+                y = luma; uv = chromaTexture
+                let matrix = CVBufferCopyAttachment(buffer, kCVImageBufferYCbCrMatrixKey, nil) as? String
+                let kr: Float, kb: Float
+                if matrix == kCVImageBufferYCbCrMatrix_ITU_R_2020 as String { kr = 0.2627; kb = 0.0593 }
+                else if matrix == kCVImageBufferYCbCrMatrix_ITU_R_709_2 as String || (matrix == nil && !color.bt2020) { kr = 0.2126; kb = 0.0722 }
+                else if matrix == kCVImageBufferYCbCrMatrix_ITU_R_601_4 as String { kr = 0.299; kb = 0.114 }
+                else { return nil }
+                guard color.transfer != 1 && color.transfer != 2 || matrix == kCVImageBufferYCbCrMatrix_ITU_R_2020 as String else { return nil }
+                let full = ten ? NativeStreamTenBitSurface.isFullRange(format) : [kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                    kCVPixelFormatType_422YpCbCr8BiPlanarFullRange,kCVPixelFormatType_444YpCbCr8BiPlanarFullRange].contains(format)
+                let divisor: Float = ten ? 1023 : 255, factor: Float = ten ? 4 : 1
+                uniforms.range = SIMD4(full ? 0 : 16*factor/divisor, full ? 1 : 219*factor/divisor,
+                                       128*factor/divisor, full ? 1 : 224*factor/divisor)
+                uniforms.coefficients = SIMD4(ten ? 65535/(64*1023) : 1, 2*(1-kr), 2*(1-kb), 0)
+                uniforms.green.x = -2*kb*(1-kb)/(1-kr-kb)
+                uniforms.green.y = -2*kr*(1-kr)/(1-kr-kb)
+            }
+            self.buffer = buffer; self.references = references; self.y = y; self.uv = uv
+            self.color = color; self.uniforms = uniforms
+        }
+    }
+}

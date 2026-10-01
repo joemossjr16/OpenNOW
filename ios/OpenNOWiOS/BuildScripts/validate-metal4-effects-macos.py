@@ -46,7 +46,7 @@ CHECK = r"""
   let formats:[OSType] = [kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
     kCVPixelFormatType_422YpCbCr10BiPlanarFullRange,kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange,
     kCVPixelFormatType_444YpCbCr10BiPlanarFullRange,kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange]
-  for format in formats { for transfer in [1,2] { for upscale in [false,true] { for native in (transfer == 1 ? [false,true] : [false]) {
+  for format in formats { for transfer in [1,2] { for upscale in [false,true] { for native in [false,true] {
    let input = fixture(format: format,transfer: transfer == 1 ? kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ : kCVImageBufferTransferFunction_ITU_R_2100_HLG)
    let image = CIImage(cvPixelBuffer:input)
    let output = target(), reference = { () -> any MTLTexture in
@@ -99,10 +99,10 @@ CHECK = r"""
    for y in Int(destination.minY+4)..<Int(destination.maxY-4) { for x in Int(destination.minX+4)..<Int(destination.maxX-4) { for shift in [0,10,20] {
     maximum=max(maximum,abs(Int((actual[y*128+x]>>shift)&1023)-Int((expected[y*128+x]>>shift)&1023)))
    } } }
-   print("compare",native ? "native PQ" : "CI",String(format:"%08x",format),transfer,upscale,"maximum",maximum,"top",actual[16*128+40]&1023,expected[16*128+40]&1023,"bottom",actual[48*128+40]&1023,expected[48*128+40]&1023)
+   print("compare",native ? "native" : "CI",String(format:"%08x",format),transfer,upscale,"maximum",maximum,"top",actual[16*128+40]&1023,expected[16*128+40]&1023,"bottom",actual[48*128+40]&1023,expected[48*128+40]&1023)
    precondition(maximum<=4,"Metal 4 effects transfer/orientation differs")
    precondition(actual[0]&0x3fffffff==0,"Fit border not black")
-   print(native ? "PASS: Metal 4 native PQ effects" : "PASS: Metal 4 effects",format,transfer,upscale)
+   print(native ? "PASS: Metal 4 native HDR effects" : "PASS: Metal 4 effects",format,transfer,upscale)
   } } } }
 
   let nativeDestination = CGRect(x:16,y:8,width:96,height:48)
@@ -154,13 +154,162 @@ CHECK = r"""
   for await success in pending.stream { precondition(success);finished+=1;if finished==2 { break } }
   pending.continuation.finish()
   print("PASS: native PQ effects bound GPU work to two retained slots")
-  for transfer in [kCVImageBufferTransferFunction_ITU_R_2100_HLG,kCVImageBufferTransferFunction_ITU_R_709_2] {
+  for transfer in ["UnknownTransfer" as CFString] {
    let invalid=fixture(format:kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange,transfer:transfer)
    precondition(!renderer.submit(buffer:invalid,destination:nativeDestination,upscale:true,target:switched) { _,_ in fatalError("Invalid transfer submitted") })
   }
   CVBufferSetAttachment(warm,kCVImageBufferColorPrimariesKey,kCVImageBufferColorPrimaries_ITU_R_709_2,.shouldPropagate)
   precondition(!renderer.submit(buffer:warm,destination:nativeDestination,upscale:true,target:switched) { _,_ in fatalError("Invalid gamut submitted") })
-  print("PASS: non-PQ or non-BT.2020 inputs retain the supported fallback")
+  print("PASS: Unknown transfer or mismatched HDR gamut inputs retain the supported fallback")
+
+
+  // Direct SDR planes and interpolated linear-RGB surfaces must preserve the
+  // legacy renderer's color and orientation with/without spatial scaling.
+  func compareNative(_ input:CVPixelBuffer,hdr:Bool,upscale:Bool,sharpen:Float = 0,
+                     referenceImage:CIImage? = nil,nativeReference:CVPixelBuffer? = nil,label:String) async throws {
+   let d=MTLTextureDescriptor.texture2DDescriptor(pixelFormat:hdr ? .bgr10a2Unorm : .bgra8Unorm,width:128,height:64,mipmapped:false)
+   d.storageMode = .shared;d.usage = [.renderTarget,.shaderRead]
+   let output=device.makeTexture(descriptor:d)!
+   let rd=MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.rgba16Float,width:128,height:64,mipmapped:false)
+   rd.storageMode = .shared;rd.usage = [.renderTarget,.shaderRead,.shaderWrite]
+   let reference=device.makeTexture(descriptor:rd)!
+   let image=referenceImage ?? CIImage(cvPixelBuffer:input)
+   let destination=upscale ? CGRect(x:16,y:8,width:96,height:48) : CGRect(x:32,y:16,width:64,height:32)
+   let legacy=NativeStreamSpatialUpscaler(device:device)
+   for _ in 0..<500 {
+    let c=queue.makeCommandBuffer()!
+    let scaled=upscale ? legacy.encode(image:image,sourceSize:image.extent.size,destinationSize:destination.size,hdr:hdr,context:context,commandBuffer:c) : image
+    if let scaled { context.render(scaled.transformed(by:CGAffineTransform(translationX:destination.minX,y:destination.minY).scaledBy(x:destination.width/scaled.extent.width,y:destination.height/scaled.extent.height)),to:reference,commandBuffer:c,bounds:CGRect(x:0,y:0,width:128,height:64),colorSpace:CGColorSpace(name:hdr ? CGColorSpace.itur_2100_PQ : CGColorSpace.sRGB)!) }
+    c.commit();await c.completed();precondition(c.status == .completed)
+    if scaled != nil { break };try await Task.sleep(nanoseconds:10_000_000)
+   }
+   var submitted=false
+   for _ in 0..<500 {
+    let pair=AsyncStream<Bool>.makeStream()
+    submitted=renderer.submit(buffer:input,destination:destination,upscale:upscale,target:output,sharpening:sharpen) { _,error in
+     if let error { print(error) };pair.continuation.yield(error == nil);pair.continuation.finish()
+    }
+    if submitted { for await ok in pair.stream { precondition(ok) };break }
+    try await Task.sleep(nanoseconds:10_000_000)
+   }
+   precondition(submitted,renderer.status)
+   let actual=pixels(output)
+   var golden:[UInt32]?
+   if let nativeReference {
+    let nativeOutput=device.makeTexture(descriptor:d)!
+    var accepted=false
+    for _ in 0..<500 {
+     let pair=AsyncStream<Bool>.makeStream()
+     accepted=renderer.submit(buffer:nativeReference,destination:destination,upscale:upscale,target:nativeOutput) { _,error in
+      pair.continuation.yield(error == nil);pair.continuation.finish()
+     }
+     if accepted { for await ok in pair.stream { precondition(ok) };break }
+     try await Task.sleep(nanoseconds:10_000_000)
+    }
+    precondition(accepted);golden=pixels(nativeOutput)
+   }
+   var values=[UInt16](repeating:0,count:128*64*4)
+   values.withUnsafeMutableBytes { reference.getBytes($0.baseAddress!,bytesPerRow:128*8,from:MTLRegionMake2D(0,0,128,64),mipmapLevel:0) }
+   var maximum=0,totalError=0,sampleCount=0
+   for y in Int(destination.minY+4)..<Int(destination.maxY-4) { for x in Int(destination.minX+4)..<Int(destination.maxX-4) { for component in 0..<3 {
+    let value=Float(Float16(bitPattern:values[((63-y)*128+x)*4+component]))
+    let limit=hdr ? 1023 : 255
+    let shift=hdr ? (2-component)*10 : (2-component)*8
+    let expected=golden.map { Int(($0[y*128+x]>>shift)&UInt32(limit)) }
+        ?? Int((max(0,min(1,value))*Float(limit)).rounded())
+    let error=abs(Int((actual[y*128+x]>>shift)&UInt32(limit))-expected)
+    maximum=max(maximum,error);totalError+=error;sampleCount+=1
+   } } }
+   print("native comparison",label,hdr,upscale,sharpen,"maximum",maximum,"mean",Double(totalError)/Double(sampleCount))
+   // CPU float rounding can differ at half-float ties before the HDR scaler.
+   // Bound those dark-edge differences separately; other color cases stay strict.
+   let tolerance = nativeReference != nil && hdr && upscale ? 6 : (hdr || upscale ? 4 : 2)
+   precondition(Double(totalError)/Double(sampleCount) < 1)
+   precondition(maximum <= tolerance,"Native SDR/RGB/sharpen differs from reference")
+   precondition(actual[0] & (hdr ? 0x3fffffff : 0x00ffffff) == 0,"Native fit boundary changed")
+   print("PASS: native color/sharpen",label,hdr,upscale,sharpen)
+  }
+  let sdrFormats:[OSType] = [kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+   kCVPixelFormatType_422YpCbCr8BiPlanarFullRange,kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange,
+   kCVPixelFormatType_444YpCbCr8BiPlanarFullRange,kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange] + formats
+  for format in sdrFormats { for transfer in [kCVImageBufferTransferFunction_ITU_R_709_2,kCVImageBufferTransferFunction_sRGB] { for upscale in [false,true] { for wideGamut in [false,true] {
+   var allocation:CVPixelBuffer?
+   precondition(CVPixelBufferCreate(nil,64,32,format,[kCVPixelBufferIOSurfacePropertiesKey:[:],kCVPixelBufferMetalCompatibilityKey:true] as CFDictionary,&allocation)==kCVReturnSuccess)
+   let input=allocation!,ten=NativeStreamTenBitSurface.chroma(format) != nil
+   CVPixelBufferLockBaseAddress(input,[])
+   for plane in 0..<2 {
+    let base=CVPixelBufferGetBaseAddressOfPlane(input,plane)!,stride=CVPixelBufferGetBytesPerRowOfPlane(input,plane)
+    let width=CVPixelBufferGetWidthOfPlane(input,plane),height=CVPixelBufferGetHeightOfPlane(input,plane)
+    for y in 0..<height { for x in 0..<(plane == 0 ? width : width*2) {
+     let value=plane == 0 ? (y<height/2 ? 80 : 160) : (x.isMultiple(of:2) ? 128 : (x%4 == 1 ? 128 : 152))
+     if ten { base.assumingMemoryBound(to:UInt16.self)[y*stride/2+x]=UInt16(value*4)<<6 }
+     else { base.assumingMemoryBound(to:UInt8.self)[y*stride+x]=UInt8(value) }
+    } }
+   }
+   CVPixelBufferUnlockBaseAddress(input,[])
+   CVBufferSetAttachment(input,kCVImageBufferTransferFunctionKey,transfer,.shouldPropagate)
+   CVBufferSetAttachment(input,kCVImageBufferColorPrimariesKey,wideGamut ? kCVImageBufferColorPrimaries_ITU_R_2020 : kCVImageBufferColorPrimaries_ITU_R_709_2,.shouldPropagate)
+   CVBufferSetAttachment(input,kCVImageBufferYCbCrMatrixKey,wideGamut ? kCVImageBufferYCbCrMatrix_ITU_R_2020 : kCVImageBufferYCbCrMatrix_ITU_R_709_2,.shouldPropagate)
+   try await compareNative(input,hdr:false,upscale:upscale,label:"\(format)-\(transfer)-BT2020=\(wideGamut)")
+  } } } }
+
+  for transfer in [kCVImageBufferTransferFunction_sRGB,kCVImageBufferTransferFunction_ITU_R_709_2] { for upscale in [false,true] {
+   var allocation:CVPixelBuffer?
+   precondition(CVPixelBufferCreate(nil,64,32,kCVPixelFormatType_32BGRA,[kCVPixelBufferIOSurfacePropertiesKey:[:],kCVPixelBufferMetalCompatibilityKey:true] as CFDictionary,&allocation)==kCVReturnSuccess)
+   let input=allocation!
+   CVPixelBufferLockBaseAddress(input,[])
+   let base=CVPixelBufferGetBaseAddress(input)!.assumingMemoryBound(to:UInt8.self),stride=CVPixelBufferGetBytesPerRow(input)
+   for y in 0..<32 { for x in 0..<64 {
+    let i=y*stride+x*4;base[i]=64;base[i+1]=x<32 ? 100 : 150;base[i+2]=y<16 ? 80 : 180;base[i+3]=255
+   } }
+   CVPixelBufferUnlockBaseAddress(input,[])
+   CVBufferSetAttachment(input,kCVImageBufferTransferFunctionKey,transfer,.shouldPropagate)
+   CVBufferSetAttachment(input,kCVImageBufferColorPrimariesKey,kCVImageBufferColorPrimaries_ITU_R_709_2,.shouldPropagate)
+   try await compareNative(input,hdr:false,upscale:upscale,label:"BGRA-\(transfer)")
+  } }
+  // A CPU luminance unsharp reference tests the new compute pass independently
+  // of Core Image's different sharpening filter, including HDR highlights.
+  for hdr in [false,true] { for strength:Float in [0,0.6] { for upscale in [false,true] {
+   var allocation:CVPixelBuffer?
+   precondition(CVPixelBufferCreate(nil,64,32,kCVPixelFormatType_64RGBAHalf,[kCVPixelBufferIOSurfacePropertiesKey:[:],kCVPixelBufferMetalCompatibilityKey:true] as CFDictionary,&allocation)==kCVReturnSuccess)
+   let input=allocation!,space=NativeStreamVideoEffectsPolicy.workingColorSpace(hdr:hdr)
+   var linear=[Float](repeating:0,count:64*32*4)
+   for y in 0..<32 { for x in 0..<64 {
+    let i=(y*64+x)*4,base:Float=y<16 ? 0.05 : (hdr ? 3 : 0.65)
+    linear[i]=base;linear[i+1]=base*0.8+(x.isMultiple(of:4) ? 0.12 : 0)
+    linear[i+2]=base*0.5;linear[i+3]=1
+   } }
+   CVPixelBufferLockBaseAddress(input,[])
+   let pointer=CVPixelBufferGetBaseAddress(input)!.assumingMemoryBound(to:UInt16.self),stride=CVPixelBufferGetBytesPerRow(input)/2
+   for y in 0..<32 { for x in 0..<64 { for c in 0..<4 {
+    let i=(y*64+x)*4+c;let v=Float16(linear[i]);pointer[y*stride+x*4+c]=v.bitPattern;linear[i]=Float(v)
+   } } }
+   CVPixelBufferUnlockBaseAddress(input,[])
+   CVBufferSetAttachment(input,kCVImageBufferCGColorSpaceKey,space,.shouldPropagate)
+   CVBufferSetAttachment(input,kCVImageBufferTransferFunctionKey,kCVImageBufferTransferFunction_Linear,.shouldPropagate)
+   var expected=linear
+   let weights:[Float]=hdr ? [0.2627,0.678,0.0593] : [0.2126,0.7152,0.0722]
+   for y in 0..<32 { for x in 0..<64 {
+    let i=(y*64+x)*4
+    var blur:Float=0
+    for dy in -1...1 { for dx in -1...1 {
+     let j=(max(0,min(31,y+dy))*64+max(0,min(63,x+dx)))*4
+     let l=(0..<3).reduce(Float(0)) { $0+linear[j+$1]*weights[$1] }
+     blur+=l*Float((dx == 0 ? 2 : 1)*(dy == 0 ? 2 : 1))/16
+    } }
+    let l=(0..<3).reduce(Float(0)) { $0+linear[i+$1]*weights[$1] }
+    for c in 0..<3 { expected[i+c]=Float(Float16(max(0,min(hdr ? 65504 : 1,linear[i+c]+(l-blur)*strength*2)))) }
+   } }
+   let reference=expected.withUnsafeBytes { CIImage(bitmapData:Data($0),bytesPerRow:64*16,size:CGSize(width:64,height:32),format:.RGBAf,colorSpace:space) }
+   var goldAllocation:CVPixelBuffer?
+   precondition(CVPixelBufferCreate(nil,64,32,kCVPixelFormatType_64RGBAHalf,[kCVPixelBufferIOSurfacePropertiesKey:[:],kCVPixelBufferMetalCompatibilityKey:true] as CFDictionary,&goldAllocation)==kCVReturnSuccess)
+   let gold=goldAllocation!
+   CVPixelBufferLockBaseAddress(gold,[])
+   let gp=CVPixelBufferGetBaseAddress(gold)!.assumingMemoryBound(to:UInt16.self),gs=CVPixelBufferGetBytesPerRow(gold)/2
+   for y in 0..<32 { for x in 0..<64 { for c in 0..<4 { gp[y*gs+x*4+c]=Float16(expected[(y*64+x)*4+c]).bitPattern } } }
+   CVPixelBufferUnlockBaseAddress(gold,[]);CVBufferPropagateAttachments(input,gold)
+   try await compareNative(input,hdr:hdr,upscale:upscale,sharpen:strength,referenceImage:reference,nativeReference:strength > 0 ? gold : nil,label:"linear-RGB-compute")
+  } } }
 
   for upscale in [false,true] { for sharpen in [false,true] {
    let space = CGColorSpace(name:CGColorSpace.sRGB)!

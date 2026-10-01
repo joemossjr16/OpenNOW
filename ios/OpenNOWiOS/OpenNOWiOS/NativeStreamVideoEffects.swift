@@ -146,6 +146,32 @@ enum NativeStreamVideoEffectsPolicy {
     }
 }
 
+/// Display-clock decisions use host time, independently of remote frame timestamps.
+/// Leave room for conversion/presentation; a late midpoint must never delay real video.
+enum NativeStreamFramePresentationPolicy {
+    static func canInterpolate(now: Double, target: Double?, displayHz: Int,
+                               frameReceivedAt: Double, recentCost: Double) -> Bool {
+        guard now.isFinite, frameReceivedAt.isFinite, now >= frameReceivedAt, displayHz > 0,
+              let target, target.isFinite, target > now else { return false }
+        let interval = 1.0 / Double(displayHz)
+        guard now - frameReceivedAt <= 2 * interval else { return false }
+        // Cap the prediction so a transient slow submission cannot prevent every
+        // future sample. Sustained overload is still handled by the budget owner.
+        let cost = recentCost.isFinite ? max(0,recentCost) : 0
+        let reserved = max(0.001,min(cost,interval * 0.75)) + 0.0005
+        return target - now >= reserved && target - now <= 2 * interval
+    }
+    static func realFrameExpired(now: Double, receivedAt: Double, displayHz: Int) -> Bool {
+        guard now.isFinite, receivedAt.isFinite, displayHz > 0, now >= receivedAt else { return true }
+        return now - receivedAt > 2.0 / Double(displayHz)
+    }
+    static func presentationTime(now: Double, target: Double?, displayHz: Int, paired: Bool) -> Double? {
+        guard paired, now.isFinite, displayHz > 0, let target, target.isFinite,
+              target > now, target - now <= 2.0 / Double(displayHz) else { return nil }
+        return target
+    }
+}
+
 /// A few initial submissions may compile ML/render pipelines. Judge sustained
 /// completion cost after warm-up, without repeatedly unloading the ML session.
 struct NativeStreamFrameGenerationBudget {
@@ -347,6 +373,8 @@ final class NativeStreamFrameGenerator {
     private var generation = 0
     private var previous: (buffer: CVPixelBuffer, timestamp: Int64)?
     private(set) var status = "Off"
+    private(set) var generatedBuffer: CVPixelBuffer?
+    private(set) var requiresProducerSubmission = false
     #if !targetEnvironment(simulator)
     @available(iOS 26.0, *)
     private final class Session {
@@ -368,7 +396,7 @@ final class NativeStreamFrameGenerator {
     #endif
 
     func reset() {
-        generation += 1; key = nil; previous = nil; status = "Off"
+        generation += 1; key = nil; previous = nil; generatedBuffer = nil; requiresProducerSubmission = false; status = "Off"
         #if !targetEnvironment(simulator)
         // Session deinit can wait for ML work; never release the last reference on
         // the main thread. Submitted command buffers retain their session too.
@@ -379,11 +407,12 @@ final class NativeStreamFrameGenerator {
         #endif
     }
 
-    func clearHistory() { previous = nil }
+    func clearHistory() { previous = nil; generatedBuffer = nil; requiresProducerSubmission = false }
 
     func encode(buffer: CVPixelBuffer, timestamp: Int64, device: any MTLDevice,
                 context: CIContext, commandBuffer: any MTLCommandBuffer,
-                quality: NativeStreamFrameGenerationQuality = .native) -> CIImage? {
+                quality: NativeStreamFrameGenerationQuality = .native, generate: Bool = true) -> CIImage? {
+        generatedBuffer = nil; requiresProducerSubmission = false
         #if targetEnvironment(simulator)
         status = "Requires a physical device"; return nil
         #else
@@ -472,7 +501,7 @@ final class NativeStreamFrameGenerator {
                         cache: session.textureCache, commandBuffer: commandBuffer) == true else {
                     status = "Color-range conversion unavailable"; return nil
                 }
-                source = converted
+                source = converted; requiresProducerSubmission = true
             } else {
             // A half-float RGB bridge preserves HDR and every chroma sample.
             // Only an 8-bit NV12 source may use the smaller processing geometry.
@@ -489,11 +518,12 @@ final class NativeStreamFrameGenerator {
             CVBufferSetAttachment(converted, kCVImageBufferCGColorSpaceKey, space, .shouldPropagate)
             CVBufferSetAttachment(converted, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_Linear, .shouldPropagate)
             commandBuffer.addCompletedHandler { [reference, buffer] _ in _ = (reference, buffer) }
-            source = converted
+            source = converted; requiresProducerSubmission = true
             }
         }
         let prior = previous
         previous = (source, timestamp)
+        guard generate else { status = "Real frame: interpolation deadline missed"; return nil }
         guard let prior, NativeStreamVideoEffectsPolicy.continuousPair(previous: prior.timestamp, current: timestamp),
               let output = allocate(from: session.pool) else { status = "Waiting for steady 60 FPS input"; return nil }
         CVBufferPropagateAttachments(source, output)
@@ -509,6 +539,7 @@ final class NativeStreamFrameGenerator {
             status = "Frame preparation failed"; return nil
         }
         session.processor.process(with: commandBuffer, parameters: parameters)
+        requiresProducerSubmission = true; generatedBuffer = output
         commandBuffer.addCompletedHandler { [session, parameters] _ in _ = (session, parameters) }
         status = "Interpolating \(next.width)×\(next.height)"
         return CIImage(cvPixelBuffer: output, options: session.format == kCVPixelFormatType_64RGBAHalf ? [.colorSpace: space] : [:])

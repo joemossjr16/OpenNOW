@@ -6422,12 +6422,13 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     private let gpuAdmission = DispatchSemaphore(value: 2)
     private let telemetry = NativeStreamRenderTelemetry()
     private var displayLink: CADisplayLink?
+    private var nextPresentationTime: CFTimeInterval?
     private lazy var displayClock = DisplayClock(owner: self)
 
     private final class DisplayClock: NSObject {
         weak var owner: NativeStreamFilteredMetalView?
         init(owner: NativeStreamFilteredMetalView) { self.owner = owner }
-        @objc func tick(_ link: CADisplayLink) { owner?.displayTick() }
+        @objc func tick(_ link: CADisplayLink) { owner?.displayTick(link) }
     }
 
     deinit { displayLink?.invalidate() }
@@ -6500,7 +6501,8 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
             ProcessInfo.processInfo.thermalState.rawValue))
     }
 
-    private func displayTick() {
+    private func displayTick(_ link: CADisplayLink) {
+        nextPresentationTime = link.targetTimestamp
         let started = CACurrentMediaTime()
         telemetry.clockTick(at:started)
         mtkView.draw()
@@ -6521,7 +6523,9 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         guard gpuAdmission.wait(timeout: .now()) == .success else { return }
         var submitted = false
         defer { if !submitted { gpuAdmission.signal() } }
-        if let pending = pendingRealFrame, CACurrentMediaTime() - pending.receivedAt > 1.0 / 30 {
+        let displayHz = window?.screen.maximumFramesPerSecond ?? 60
+        if let pending = pendingRealFrame, NativeStreamFramePresentationPolicy.realFrameExpired(
+            now:drawStarted,receivedAt:pending.receivedAt,displayHz:displayHz) {
             pendingRealFrame = nil
             frameGenerator.clearHistory()
         }
@@ -6578,9 +6582,9 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         // Exclude frame conversion and acquiring a drawable from effect cost.
         let effectsStarted = CACurrentMediaTime()
         let effectsToken = effectsGeneration
-        let displayHz = window?.screen.maximumFramesPerSecond ?? 60
         var effectImage: CIImage?
         var generated = false
+        var interpolationEncoded = false
         if frameGenerationEnabled && ownsMailboxSlot, let device = view.device {
             let allowed = NativeStreamVideoEffectsPolicy.frameGenerationAllowed(sourceFPS: sourceFPS,
                 displayHz: displayHz,
@@ -6588,17 +6592,37 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                 thermal: ProcessInfo.processInfo.thermalState.rawValue)
             if allowed && CACurrentMediaTime() >= suspendGenerationUntil {
                 effectImage = frameGenerator.encode(buffer: pixelBuffer, timestamp: entry.frame.timeStampNs,
-                    device: device, context: ciContext, commandBuffer: commandBuffer, quality: frameGenerationQuality)
+                    device: device, context: ciContext, commandBuffer: commandBuffer, quality: frameGenerationQuality,
+                    generate: NativeStreamFramePresentationPolicy.canInterpolate(now:CACurrentMediaTime(),
+                        target:nextPresentationTime,displayHz:displayHz,frameReceivedAt:receivedAt,
+                        recentCost:generationBudget.averageSeconds))
                 generationStatus = frameGenerator.status
                 if generationStatus == "Preparing" { generationBudget.reset() }
-                if effectImage != nil { pendingRealFrame = entry; generated = true }
+                if effectImage != nil {
+                    interpolationEncoded = true
+                    let now = CACurrentMediaTime()
+                    let remainingCost = max(0,generationBudget.averageSeconds - (now-effectsStarted))
+                    if NativeStreamFramePresentationPolicy.canInterpolate(now:now,target:nextPresentationTime,
+                        displayHz:displayHz,frameReceivedAt:receivedAt,recentCost:remainingCost) {
+                        pendingRealFrame = entry; generated = true
+                    } else {
+                        effectImage = nil
+                        generationStatus = "Real frame: interpolation deadline missed"
+                    }
+                }
             } else {
                 frameGenerator.clearHistory()
                 generationStatus = !allowed ? "Requires 60 FPS / 120 Hz; pauses for heat or Low Power" : generationPauseReason
             }
         }
+        let presentAt = NativeStreamFramePresentationPolicy.presentationTime(now:CACurrentMediaTime(),
+            target:nextPresentationTime,displayHz:displayHz,paired:generated || delayedReal != nil)
         let shouldUpscale = upscalingEnabled && drawStarted >= suspendUpscalingUntil
-        let direct = hdrTransfer != .hlg && effectImage == nil && !shouldUpscale && sharpeningAmount <= 0.001 && view.currentRenderPassDescriptor.map {
+        let preferMetal4Effects: Bool
+        if #available(iOS 26.0, *) {
+            preferMetal4Effects = !metal4Disabled && metal4EffectsStorage != nil
+        } else { preferMetal4Effects = false }
+        let direct = !preferMetal4Effects && hdrTransfer != .hlg && effectImage == nil && !shouldUpscale && sharpeningAmount <= 0.001 && view.currentRenderPassDescriptor.map {
             directHDR?.encode(buffer: pixelBuffer, commandBuffer: commandBuffer,
                 descriptor: $0, destination: destination) == true
         } == true
@@ -6613,6 +6637,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
             let admission = gpuAdmission
             let encodeSeconds = CACurrentMediaTime() - effectsStarted
             let generatedFrame = generated
+            let processedInterpolation = interpolationEncoded
             let presentedMetal4: @Sendable (Double) -> Void = { time in
                 rendererTelemetry.recordPresentation(at: time, receivedAt: receivedAt, generated: generatedFrame)
             }
@@ -6626,20 +6651,24 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                     guard let self, self.effectsGeneration == effectsToken else { return }
                     if error != nil { self.metal4Disabled = true }
                     if self.frameGenerationEnabled || self.upscalingEnabled {
-                        self.finishEffects(failed: error != nil, generated: generatedFrame,
+                        self.finishEffects(failed: error != nil, generated: processedInterpolation,
                             completionTime: completionTime, encodeSeconds: encodeSeconds,
                             duration: duration, displayHz: displayHz)
                     }
                 }
             }
-            if #available(iOS 26.0, *), !metal4Disabled, hdrTransfer == .pq,
-               effectImage == nil, sharpeningAmount <= 0.001,
+            let effectsBuffer = generated ? frameGenerator.generatedBuffer : pixelBuffer
+            if #available(iOS 26.0, *), !metal4Disabled, let effectsBuffer,
                let effects = metal4EffectsStorage as? NativeStreamMetal4EffectsRenderer,
-               effects.submit(buffer: pixelBuffer, destination: destination, upscale: shouldUpscale,
-                    target: drawable.texture, drawable: drawable, ticket: ticket,
-                    presented: presentedMetal4, completion: completeMetal4) {
+               effects.submit(buffer: effectsBuffer, destination: destination, upscale: shouldUpscale,
+                    target: drawable.texture, sharpening:Float(sharpeningAmount),
+                    producer: ownsMailboxSlot && frameGenerator.requiresProducerSubmission ? commandBuffer : nil,
+                    drawable: drawable, ticket: ticket,
+                    presented: presentedMetal4, presentAt:presentAt, completion: completeMetal4) {
                 if let ticket { submissionTimeline?.accept(ticket) }
-                rendererBackend = "Metal 4 · native PQ conversion"
+                rendererBackend = generated ? "Metal 4 · native interpolated presentation"
+                    : hdrTransfer == .pq ? "Metal 4 · native PQ conversion"
+                    : hdrTransfer == .hlg ? "Metal 4 · native HLG conversion" : "Metal 4 · native SDR conversion"
                 metal4UpscalingStatus = shouldUpscale ? effects.status : nil
                 if videoEffectsStatus != lastEffectsStatus {
                     lastEffectsStatus = videoEffectsStatus
@@ -6680,7 +6709,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                     transfer: hdrTransfer == .pq ? 1 : hdrTransfer == .hlg ? 2 : 0,
                     upscale: shouldUpscale, context: ciContext, producer: commandBuffer,
                     target: drawable.texture, drawable: drawable, ticket: ticket,
-                    presented: presentedMetal4, completion: completeMetal4) {
+                    presented: presentedMetal4, presentAt:presentAt, completion: completeMetal4) {
                     if let ticket { submissionTimeline?.accept(ticket) }
                     rendererBackend = generated ? "Metal 4 · interpolated presentation" : "Metal 4 · effects presentation"
                     if shouldUpscale { metal4UpscalingStatus = effects.status } else { metal4UpscalingStatus = nil }
@@ -6740,7 +6769,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
             let completionTime = max(CACurrentMediaTime() - effectsStarted, duration)
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.effectsGeneration == effectsToken else { return }
-                self.finishEffects(failed: command.status == .error, generated: generated,
+                self.finishEffects(failed: command.status == .error, generated: interpolationEncoded,
                     completionTime: completionTime, encodeSeconds: encodeSeconds, duration: duration, displayHz: displayHz)
             }
         }
@@ -6749,7 +6778,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
             NativeStreamVideoPerformanceLog.record("video-effects " + videoEffectsStatus)
         }
         if let ticket { commandBuffer.encodeSignalEvent(ticket.event,value:ticket.value) }
-        commandBuffer.present(drawable)
+        if let presentAt { commandBuffer.present(drawable,atTime:presentAt) } else { commandBuffer.present(drawable) }
         submitted = true
         commandBuffer.commit()
         if let ticket { submissionTimeline?.accept(ticket) }
