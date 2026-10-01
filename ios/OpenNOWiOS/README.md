@@ -20,6 +20,10 @@ The iOS wrapper sent only RTCP PLI, whose writer did not propagate an unavailabl
 
 The recovery command is tested through a real local encrypted DTLS/SCTP association. A build 131 live iPhone sample confirmed 31 accepted control sends, 32 received keyframes including the initial keyframe, and continued decoding across 30 queue recoveries. The host now supplies recovery keyframes, but 4K/120 remained around 88 decoded FPS and 44ms completion time, with queue recovery about once per second. Thermal state was normal, Low Power Mode was off and display GPU time was around 2ms. This verifies recovery in the sampled session and does not establish sustainable 4K/120 throughput. Resolution, frame rate, HDR and color settings are preserved.
 
+### iPhone 4K/60 comparison
+
+A follow-up build 131 iPhone test changed only FPS to 60 while retaining 3840×2160, H265, 10-bit 4:4:4 and HDR. The last 30-second sample averaged **60.13 received FPS and 60.13 decoded FPS**, with decoded output still reporting **hardware=true / 10-bit 4:4:4 HDR PQ**. Median completion time stayed at **13.2ms** (sample medians 13.2–13.3ms), queue depth was zero at the last sample with a lifetime peak of two frames, and queue recoveries, skipped frames and decode errors all remained zero. Display samples presented around 60 FPS. Thermal state remained normal and Low Power Mode was off. This supports an overload diagnosis for the tested 4K/120 decoder path; it does not establish a permanent device limit or guarantee stutter-free playback outside the measured interval.
+
 ## Build 130 iPhone decode test
 
 With the same requested 4K/120 H265 10-bit 4:4:4 HDR settings, build 129 samples showed roughly 120 received FPS but only 88–90 decoded FPS and about 50ms completion latency on iPhone. Queued work grew past 20 seconds of delay. An iPad working segment showed roughly 120 decoded FPS and 7.7ms completion latency. iPhone display GPU time was about 2.5ms.
