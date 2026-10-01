@@ -56,6 +56,32 @@ enum NativeStreamVideoEffectsPolicy {
     }
 }
 
+/// A few initial submissions may compile ML/render pipelines. Judge sustained
+/// completion cost after warm-up, without repeatedly unloading the ML session.
+struct NativeStreamFrameGenerationBudget {
+    private var warmupRemaining = 8
+    private var recent: [Bool] = []
+    private(set) var averageSeconds: Double = 0
+    private var durations: [Double] = []
+
+    mutating func record(processingSeconds: Double, displayHz: Int) -> Bool {
+        guard processingSeconds.isFinite, processingSeconds >= 0, displayHz > 0 else { return false }
+        if warmupRemaining > 0 { warmupRemaining -= 1; return false }
+        recent.append(processingSeconds > 1.0 / Double(displayHz))
+        durations.append(processingSeconds)
+        if recent.count > 12 { recent.removeFirst(); durations.removeFirst() }
+        averageSeconds = durations.reduce(0, +) / Double(durations.count)
+        return recent.count == 12 && recent.filter { $0 }.count >= 9
+    }
+
+    mutating func reset(warmingUp: Bool = true) {
+        warmupRemaining = warmingUp ? 8 : 0
+        recent.removeAll(keepingCapacity: true)
+        durations.removeAll(keepingCapacity: true)
+        averageSeconds = 0
+    }
+}
+
 /// GPU-only range conversion for 8-bit NV12. Retains the exact luma/chroma plane
 /// dimensions, matrix, primaries and transfer function; no RGB round-trip or CPU wait.
 final class NativeStreamNV12RangeBridge {
@@ -193,9 +219,9 @@ final class NativeStreamSpatialUpscaler {
         // two submissions in flight. Retain the scaler across settings/size changes.
         commandBuffer.addCompletedHandler { [resources] _ in _ = resources }
         status = "\(next.width)×\(next.height) → \(next.outputWidth)×\(next.outputHeight)"
-        // CI's bitmap/image coordinates are bottom-left; a rendered Metal texture
-        // is top-left. Re-importing without this flip vertically mirrors the stream.
-        return CIImage(mtlTexture: output, options: [.colorSpace: space])?.oriented(.downMirrored)
+        // CI already accounts for Metal texture coordinates on import. An extra
+        // mirror here reverses the normal CI-to-drawable playback orientation.
+        return CIImage(mtlTexture: output, options: [.colorSpace: space])
     }
 }
 
@@ -251,6 +277,8 @@ final class NativeStreamFrameGenerator {
         }
         #endif
     }
+
+    func clearHistory() { previous = nil }
 
     func encode(buffer: CVPixelBuffer, timestamp: Int64, device: any MTLDevice,
                 context: CIContext, commandBuffer: any MTLCommandBuffer) -> CIImage? {
@@ -349,7 +377,7 @@ final class NativeStreamFrameGenerator {
         let prior = previous
         previous = (source, timestamp)
         guard let prior, NativeStreamVideoEffectsPolicy.continuousPair(previous: prior.timestamp, current: timestamp),
-              let output = allocate(from: session.pool) else { status = "Waiting for consecutive frames"; return nil }
+              let output = allocate(from: session.pool) else { status = "Waiting for steady 60 FPS input"; return nil }
         CVBufferPropagateAttachments(source, output)
         let midpoint = prior.timestamp + (timestamp - prior.timestamp) / 2
         guard let currentFrame = VTFrameProcessorFrame(buffer: source,

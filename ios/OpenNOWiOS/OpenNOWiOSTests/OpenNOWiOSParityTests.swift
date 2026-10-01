@@ -13,6 +13,23 @@ import CoreImage
 @testable import OpenNOWiOS
 
 final class OpenNOWiOSParityTests: XCTestCase {
+    func testFrameGenerationBudgetAllowsWarmupAndRejectsSustainedOverload() {
+        var budget = NativeStreamFrameGenerationBudget()
+        for _ in 0..<8 { XCTAssertFalse(budget.record(processingSeconds: 0.025, displayHz: 120)) }
+        for _ in 0..<12 { XCTAssertFalse(budget.record(processingSeconds: 0.005, displayHz: 120)) }
+        // A few spikes must not unload the processor and trigger a cold retry loop.
+        for _ in 0..<3 { XCTAssertFalse(budget.record(processingSeconds: 0.015, displayHz: 120)) }
+        for _ in 0..<12 { XCTAssertFalse(budget.record(processingSeconds: 0.005, displayHz: 120)) }
+        for _ in 0..<8 { XCTAssertFalse(budget.record(processingSeconds: 0.015, displayHz: 120)) }
+        XCTAssertTrue(budget.record(processingSeconds: 0.015, displayHz: 120))
+        budget.reset(warmingUp: false)
+        for _ in 0..<11 { XCTAssertFalse(budget.record(processingSeconds: 0.015, displayHz: 120)) }
+        XCTAssertTrue(budget.record(processingSeconds: 0.015, displayHz: 120))
+        budget.reset()
+        XCTAssertFalse(budget.record(processingSeconds: .nan, displayHz: 120))
+        XCTAssertFalse(budget.record(processingSeconds: 0.020, displayHz: 0))
+    }
+
     func testMetalFXPresetsSelectEligibleSizesAndRespectPlanAndAspect() throws {
         let phone = CGSize(width: 2796, height: 1290)
         let selected = try [MetalFXQualityPreset.quality, .balanced, .performance].map { preset in
@@ -189,8 +206,19 @@ final class OpenNOWiOSParityTests: XCTestCase {
             from: MTLRegionMake2D(0, 0, 128, 64), mipmapLevel: 0) }
         XCTAssertGreaterThan(values[(8 * 128 + 8) * 4], 3, "HDR highlights must not clamp to SDR")
         XCTAssertLessThan(values[(8 * 128 + 120) * 4], 0.5, "Horizontal orientation must be preserved")
-        XCTAssertLessThan(values[(8 * 128 + 8) * 4 + 1], 0.5)
-        XCTAssertGreaterThan(values[(56 * 128 + 8) * 4 + 1], 1.5, "Vertical orientation must be preserved")
+        let reference = try XCTUnwrap(device.makeTexture(descriptor: td))
+        let referenceCommand = try XCTUnwrap(queue.makeCommandBuffer())
+        context.render(image.transformed(by: CGAffineTransform(scaleX: 2, y: 2)), to: reference,
+            commandBuffer: referenceCommand, bounds: output.extent, colorSpace: space)
+        referenceCommand.commit(); referenceCommand.waitUntilCompleted()
+        XCTAssertEqual(referenceCommand.status, .completed)
+        var baseline = [Float](repeating: 0, count: values.count)
+        baseline.withUnsafeMutableBytes { reference.getBytes($0.baseAddress!, bytesPerRow: 128 * 16,
+            from: MTLRegionMake2D(0, 0, 128, 64), mipmapLevel: 0) }
+        for offset in [(8 * 128 + 8) * 4 + 1, (56 * 128 + 8) * 4 + 1] {
+            XCTAssertEqual(values[offset], baseline[offset], accuracy: 0.1,
+                "MetalFX must preserve ordinary playback orientation")
+        }
         #else
         throw XCTSkip("Apple does not ship MetalFX in the iOS simulator SDK; device path is tested separately on macOS Metal")
         #endif

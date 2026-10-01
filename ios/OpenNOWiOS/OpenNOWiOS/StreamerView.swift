@@ -6254,10 +6254,12 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     private var pendingRealFrame: NativeStreamLatestFrameMailbox<RTCVideoFrame>.Entry?
     private var suspendGenerationUntil: CFTimeInterval = 0
     private var suspendUpscalingUntil: CFTimeInterval = 0
-    private var slowGPUFrames = 0
+    private var generationBudget = NativeStreamFrameGenerationBudget()
+    private var effectsGeneration: UInt64 = 0
     private var generatedPresentations = 0
     private var lastEffectsStatus = ""
     private var generationStatus = "Off"
+    private var generationPauseReason = "Paused: processing over budget"
 
     var videoEffectsStatus: String {
         var parts: [String] = []
@@ -6272,7 +6274,8 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     func setVideoEffects(upscaling: Bool, frameGeneration: Bool, sourceFPS: Int) {
         if !upscaling { spatialUpscaler.reset() }
         if self.frameGenerationEnabled != frameGeneration || self.sourceFPS != sourceFPS {
-            frameGenerator.reset(); pendingRealFrame = nil; suspendGenerationUntil = 0; slowGPUFrames = 0
+            frameGenerator.reset(); pendingRealFrame = nil; suspendGenerationUntil = 0
+            generationBudget.reset(); effectsGeneration &+= 1
         }
         upscalingEnabled = upscaling; frameGenerationEnabled = frameGeneration; self.sourceFPS = sourceFPS
     }
@@ -6396,7 +6399,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         defer { if !submitted { gpuAdmission.signal() } }
         if let pending = pendingRealFrame, CACurrentMediaTime() - pending.receivedAt > 1.0 / 30 {
             pendingRealFrame = nil
-            frameGenerator.reset()
+            frameGenerator.clearHistory()
         }
         let delayedReal = pendingRealFrame
         pendingRealFrame = nil
@@ -6416,21 +6419,26 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
 
         let bounds = CGRect(origin: .zero, size: view.drawableSize)
         let destination = stretchToFill ? bounds : Self.aspectFitRect(source: frameSize, target: bounds.size)
+        // Exclude frame conversion and acquiring a drawable from effect cost.
+        let effectsStarted = CACurrentMediaTime()
+        let effectsToken = effectsGeneration
+        let displayHz = window?.screen.maximumFramesPerSecond ?? 60
         var effectImage: CIImage?
         var generated = false
         if frameGenerationEnabled && ownsMailboxSlot, let device = view.device {
             let allowed = NativeStreamVideoEffectsPolicy.frameGenerationAllowed(sourceFPS: sourceFPS,
-                displayHz: window?.screen.maximumFramesPerSecond ?? 60,
+                displayHz: displayHz,
                 lowPower: ProcessInfo.processInfo.isLowPowerModeEnabled,
                 thermal: ProcessInfo.processInfo.thermalState.rawValue)
             if allowed && CACurrentMediaTime() >= suspendGenerationUntil {
                 effectImage = frameGenerator.encode(buffer: pixelBuffer, timestamp: entry.frame.timeStampNs,
                     device: device, context: ciContext, commandBuffer: commandBuffer)
                 generationStatus = frameGenerator.status
+                if generationStatus == "Preparing" { generationBudget.reset() }
                 if effectImage != nil { pendingRealFrame = entry; generated = true }
             } else {
-                frameGenerator.reset()
-                generationStatus = !allowed ? "Requires 60 FPS / 120 Hz; pauses for heat or Low Power" : "Paused: GPU over budget"
+                frameGenerator.clearHistory()
+                generationStatus = !allowed ? "Requires 60 FPS / 120 Hz; pauses for heat or Low Power" : generationPauseReason
             }
         }
         let shouldUpscale = upscalingEnabled && drawStarted >= suspendUpscalingUntil
@@ -6497,6 +6505,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         #endif
         let admission = gpuAdmission
         let checkEffectsBudget = frameGenerationEnabled || upscalingEnabled
+        let encodeSeconds = CACurrentMediaTime() - effectsStarted
         commandBuffer.addCompletedHandler { [weak self, pixelBuffer] command in
             admission.signal()
             // Keep the pooled IOSurface alive until the GPU has finished reading it.
@@ -6512,20 +6521,30 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
             guard checkEffectsBudget else { return }
             // ML processing may run outside the reported Metal GPU timestamps.
             // Include encode/queue/completion wall time in the deadline check.
-            let completionTime = max(CACurrentMediaTime() - drawStarted, duration)
+            let completionTime = max(CACurrentMediaTime() - effectsStarted, duration)
             DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
+                guard let self, self.effectsGeneration == effectsToken else { return }
                 if command.status == .error {
                     self.frameGenerator.reset(); self.pendingRealFrame = nil
                     self.suspendGenerationUntil = CACurrentMediaTime() + 5
                     self.suspendUpscalingUntil = CACurrentMediaTime() + 5
                     self.spatialUpscaler.reset()
-                    self.generationStatus = "Paused: processing error"
+                    self.generationPauseReason = "Paused: processing error"
+                    self.generationStatus = self.generationPauseReason
+                    self.generationBudget.reset(); self.effectsGeneration &+= 1
                 } else if generated {
-                    self.slowGPUFrames = completionTime > 1.0 / 120 ? self.slowGPUFrames + 1 : 0
-                    if self.slowGPUFrames >= 3 {
-                        self.suspendGenerationUntil = CACurrentMediaTime() + 5
-                        self.frameGenerator.reset(); self.slowGPUFrames = 0
+                    if self.generationBudget.record(processingSeconds: completionTime, displayHz: displayHz) {
+                        NativeStreamVideoPerformanceLog.record(String(format:
+                            "frame-generation budget pause processing=%.2f ms avg=%.2f ms encode=%.2f ms gpu=%.2f ms display=%d Hz",
+                            completionTime * 1000, self.generationBudget.averageSeconds * 1000,
+                            encodeSeconds * 1000, duration * 1000, displayHz))
+                        self.generationPauseReason = String(format: "Paused: processing %.1f ms > %.1f ms",
+                            self.generationBudget.averageSeconds * 1000, 1000.0 / Double(displayHz))
+                        self.generationStatus = self.generationPauseReason
+                        self.suspendGenerationUntil = CACurrentMediaTime() + 2
+                        self.frameGenerator.clearHistory()
+                        self.generationBudget.reset(warmingUp: false)
+                        self.effectsGeneration &+= 1
                     }
                 }
             }
