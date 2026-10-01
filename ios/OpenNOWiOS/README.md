@@ -1,6 +1,6 @@
-# Metal 4 development branch
+# Metal 4 development build 137
 
-All build 136 changes are preserved on [`ios/native-nvst-128`](https://github.com/joemossjr16/OpenNOW/tree/ios/native-nvst-128). This `metal-4` branch adds the first direct 10-bit HDR Metal 4 renderer, with shared shader/color interpretation, bounded resources, GPU feedback, drawable synchronization and legacy fallback. MetalFX/video interpolation still use their existing pipeline during this first port stage. [Implementation, validation and remaining stages](METAL4.md).
+All build 136 changes are preserved on [`ios/native-nvst-128`](https://github.com/joemossjr16/OpenNOW/tree/ios/native-nvst-128). [Unsigned Metal 4 test IPA](https://github.com/joemossjr16/ios-apps/releases/tag/opennow-metal4-137). This `metal-4` branch adds the first direct 10-bit HDR Metal 4 renderer, with shared shader/color interpretation, bounded resources, GPU feedback, drawable synchronization and legacy fallback. MetalFX/video interpolation still use their existing pipeline during this first port stage. [Implementation, validation and remaining stages](METAL4.md).
 
 # Joe's OpenNOW iOS build 136
 

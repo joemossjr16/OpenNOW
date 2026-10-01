@@ -1,6 +1,6 @@
 # Metal 4 streaming renderer development
 
-Branch: `metal-4`. Baseline: build 136 at `ffc69ff0f13f69c60de8a22abcfe1b7a78b9ea29`. All existing changes are also pushed to [`ios/native-nvst-128`](https://github.com/joemossjr16/OpenNOW/tree/ios/native-nvst-128); subsequent Metal 4 development belongs here.
+Build: **1.1.137 (137)**. [Unsigned experimental IPA](https://github.com/joemossjr16/ios-apps/releases/tag/opennow-metal4-137). Branch: `metal-4`. Baseline: build 136 at `ffc69ff0f13f69c60de8a22abcfe1b7a78b9ea29`. All existing changes are also pushed to [`ios/native-nvst-128`](https://github.com/joemossjr16/OpenNOW/tree/ios/native-nvst-128); subsequent Metal 4 development belongs here.
 
 ## Implemented: direct 10-bit HDR rendering
 
