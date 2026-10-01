@@ -7,6 +7,7 @@ import UIKit
 
 #if os(iOS) && canImport(WebRTC)
 import AVFoundation
+import Accelerate
 import AVKit
 import CoreImage
 import MetalKit
@@ -561,7 +562,6 @@ struct StreamerView: View {
         session: ActiveSession,
         settings: AppSettings,
         membershipTier: String? = nil,
-        nativeStreamerEnabled: Bool = true,
         onTouchLayoutChange: @escaping (String, TouchControlLayout) -> Void,
         onStreamerPreferencesChange: @escaping (StreamerPreferences) -> Void,
         onStreamSharpeningChange: @escaping (Bool, Double) -> Void,
@@ -605,7 +605,6 @@ struct StreamerView: View {
                 onRetry: onRetry
             )
         )
-        _ = nativeStreamerEnabled
         _ = onNativeFallbackRequiresFreshEndpoint
     }
 
@@ -615,7 +614,7 @@ struct StreamerView: View {
                 Color.black
                     .ignoresSafeArea()
 
-                NativeStreamVideoView(coordinator: coordinator)
+                NativeStreamVideoView(coordinator: coordinator).equatable()
                     .ignoresSafeArea()
 
                 NativeStreamTouchCaptureView(
@@ -756,6 +755,12 @@ struct StreamerView: View {
             }
             .statusBarHidden(true)
         }
+        .background(NativeStreamPointerLockPreference(requested:
+            NativeStreamPointerCapturePolicy.shouldCapture(videoActive: coordinator.videoActive,
+                sceneActive: scenePhase == .active, controlsVisible: coordinator.controlsPanelVisible,
+                editing: coordinator.touchLayoutEditing, guidanceVisible: coordinator.presentedGuidanceSheet != nil
+                    || coordinator.inputModePrompt != nil,
+                pipActive: coordinator.isPictureInPictureActive)))
         .sheet(item: $coordinator.presentedGuidanceSheet) { destination in
             switch destination {
             case .streamTutorial:
@@ -823,7 +828,6 @@ struct StreamerView: View {
         session: ActiveSession,
         settings: AppSettings,
         membershipTier: String? = nil,
-        nativeStreamerEnabled: Bool = true,
         onTouchLayoutChange: @escaping (String, TouchControlLayout) -> Void,
         onStreamerPreferencesChange: @escaping (StreamerPreferences) -> Void,
         onStreamSharpeningChange: @escaping (Bool, Double) -> Void,
@@ -848,7 +852,6 @@ struct StreamerView: View {
         self.onClose = onClose
         _ = settings
         _ = membershipTier
-        _ = nativeStreamerEnabled
         _ = onTouchLayoutChange
         _ = onStreamerPreferencesChange
         _ = onStreamSharpeningChange
@@ -894,6 +897,7 @@ struct StreamerView: View {
 #if os(iOS) && canImport(WebRTC)
 private struct NativeStreamStatsSnapshot: Equatable {
     var codec = "--"
+    var colorMode = "--"
     var resolution = "--"
     var fps: Int?
     var bitrateKbps: Int?
@@ -907,6 +911,7 @@ private struct NativeStreamStatsSnapshot: Equatable {
     var decodeMs: Double?
     /// The zone the session is running in, for the HUD's Server metric.
     var serverLabel: String?
+    var gpuLabel: String?
     var targetFps: Int = 60
     var inputSummary = "r0/p0"
     var detail = ""
@@ -1301,6 +1306,10 @@ private struct NativeStreamStatsPill: View {
                 detailed: snapshot.codec
             ))
         }
+        if metrics.codec {
+            items.append(Readout(id: "color", label: "Color", compact: snapshot.colorMode,
+                                 detailed: snapshot.colorMode))
+        }
         if metrics.location, let server = snapshot.serverLabel, !server.isEmpty {
             items.append(Readout(
                 id: "server",
@@ -1308,6 +1317,9 @@ private struct NativeStreamStatsPill: View {
                 compact: server,
                 detailed: server
             ))
+        }
+        if let gpu = snapshot.gpuLabel, !gpu.isEmpty {
+            items.append(Readout(id: "gpu", label: "GPU", compact: gpu, detailed: gpu))
         }
         if metrics.connection {
             items.append(Readout(
@@ -2497,6 +2509,10 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     private let onRetry: (() -> Void)?
     private let logger = Logger(subsystem: "OpenNOWiOS", category: "NativeStreamer")
     private let workQueue = DispatchQueue(label: "OpenNOW.NativeStreamer")
+    private var nativeNVST: (any NativeStreamNVSTTransport)?
+    private var nativeNVSTStart: Task<Void, Never>?
+    private var nativeNVSTFailed = false
+
     private let networkMonitor = NWPathMonitor()
     private let networkMonitorQueue = DispatchQueue(label: "OpenNOW.NativeStreamer.Network")
     private let peerName = "peer-\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12))"
@@ -2536,6 +2552,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     private let videoSink = NativeStreamVideoSink()
     private var videoTrack: RTCVideoTrack?
     private var videoSinkAttached = false
+    private var receivedColorMode = "--"
     private var renderedFrameCount = 0
     private var renderedVideoSize: CGSize = .zero
     private var streamZoomScale: CGFloat = 1
@@ -2557,6 +2574,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     private var lastStatsFramesRendered: Int?
     private var lastStatsBytesReceived: Int?
     private var lastStatsTotalDecodeTime: Double?
+    private var receiveDelayTrace = NativeStreamReceiveDelayTrace()
     private var lastStatsPacketsLost: Int?
     private var lastStatsPacketsReceived: Int?
     private var mediaTransportConnected = false
@@ -2579,7 +2597,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     private var latestScenePhase: ScenePhase = .active
     private var backgroundPictureInPictureStartPending = false
     private var needsForegroundReconnect = false
-    private var videoActive = false
+    @Published fileprivate var videoActive = false
     private var streamTutorialCompleted: Bool
     private var controllerTouchPromptDismissed: Bool
     private var controllerTouchPromptHandledThisSession = false
@@ -2694,9 +2712,9 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
                 self?.handlePhysicalKeyboardMouseAvailabilityChanged(connected)
             }
         }
-        videoSink.onFrame = { [weak self] count, size, luma in
+        videoSink.onFrame = { [weak self] count, size, luma, colorMode in
             Task { @MainActor in
-                self?.noteRenderedFrame(count: count, size: size, luma: luma)
+                self?.noteRenderedFrame(count: count, size: size, luma: luma, colorMode: colorMode)
             }
         }
         videoSink.onPictureInPictureFrame = { [weak pictureInPictureBridge] frame in
@@ -2728,6 +2746,21 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         retryAvailable = onRetry != nil
         updateStatus("Checking codecs", detail: codecReport.summary)
 
+        if settings.experimentalNativeNVSTEnabled {
+            guard #available(iOS 17.0, *) else { fail("Native NVST requires iOS 17 or newer"); return }
+            let codec = NativeStreamVideoCodec.normalized(settings.preferredCodec)
+                ?? [.h265, .av1, .h264].first { codecReport.capability(for: $0)?.videoToolboxHardwareDecode == true } ?? .h264
+            guard codecReport.capability(for: codec)?.videoToolboxHardwareDecode == true else {
+                fail("\(codec.rawValue) hardware decoding is unavailable on this device"); return
+            }
+            selectedCodec = codec
+            startNetworkMonitoring()
+            inputBridge.attach()
+            setIdleTimerDisabled(true)
+            startNativeNVST()
+            return
+        }
+
         let requested = NativeStreamVideoCodec.normalized(settings.preferredCodec)
         let resolved = codecReport.launchSafeCodec(preferred: settings.preferredCodec)
         if let requested, requested != resolved {
@@ -2749,6 +2782,86 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         inputBridge.attach()
         setIdleTimerDisabled(true)
         connectSignaling()
+    }
+
+    @available(iOS 17.0, *)
+    private func startNativeNVST() {
+        updateStatus("Connecting native NVST", detail: "Negotiating the dedicated video connection")
+        let sink = videoSink
+        let transport = NativeStreamNVST(allocation: session, settings: settings, profile: streamProfile,
+            codec: selectedCodec, displayFPS: renderer?.window?.screen.maximumFramesPerSecond ?? UIScreen.main.maximumFramesPerSecond,
+            onFrame: { frame in sink.renderFrame(frame) },
+            onSample: { [weak self] sample in Task { @MainActor in
+                guard let self, !self.stopped else { return }
+                self.updateNativeNVSTStats(sample)
+            } },
+            onFailure: { [weak self] reason in Task { @MainActor in
+                guard let self, !self.stopped else { return }
+                self.nativeNVSTFailed = true
+                self.markMediaTransportDisconnected()
+                self.updateStatus("Native NVST failed", detail: reason)
+                self.retryAvailable = self.onRetry != nil
+            } },
+            onHaptics: { [weak self] events in Task { @MainActor in
+                guard let self, !self.stopped else { return }
+                for event in events {
+                    self.inputBridge.applyRumble(controllerId: Int(event.gamepadIndex),
+                        weakMagnitude: Int(event.rightMotor), strongMagnitude: Int(event.leftMotor))
+                }
+            } })
+        nativeNVST = transport
+        nativeNVSTStart = Task { [weak self] in
+            do {
+                try await transport.start()
+                guard let self, !self.stopped, !Task.isCancelled else { return }
+                self.markMediaTransportConnected()
+            }
+            catch {
+                guard let self, !self.stopped, !Task.isCancelled else { return }
+                self.nativeNVSTFailed = true
+                self.updateStatus("Native NVST failed", detail: error.localizedDescription)
+                self.retryAvailable = self.onRetry != nil
+            }
+        }
+    }
+
+    private func updateNativeNVSTStats(_ sample: NativeStreamNVSTSample) {
+        guard !nativeNVSTFailed else { return }
+        updateSessionTimer()
+        refreshDeviceStatus()
+        let progressed = Int(clamping: sample.decoded) > (lastStatsFramesDecoded ?? 0)
+        if !transportWasStable, recoveryProgressTracker.observe(progressed: progressed) {
+            transportWasStable = true
+            onTransportStable()
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        let decoded = Int(clamping: sample.decoded), received = Int(clamping: sample.received)
+        let bytes = Int(clamping: sample.bytes)
+        let decodedFPS = estimatedRate(current: decoded, previous: lastStatsFramesDecoded, now: now)
+        let receivedFPS = estimatedRate(current: received, previous: lastStatsFramesReceived, now: now)
+        let bitrate = estimatedBitrateKbps(bytesReceived: bytes, now: now)
+        let lost = Int(clamping: sample.lost), packets = Int(clamping: sample.packets)
+        let lostDelta = monotonicDelta(current: lost, previous: lastStatsPacketsLost)
+        let packetsDelta = monotonicDelta(current: packets, previous: lastStatsPacketsReceived)
+        let loss = Double(lost) * 100 / Double(max(1, lost + packets))
+        let resolution = sample.resolution ?? streamProfile.resolutionString
+        statsText = "Native NVST  \(sample.bitstream) \(sample.pixelFormat)  \(sample.detail)"
+        statsSnapshot = NativeStreamStatsSnapshot(codec: selectedCodec.rawValue.uppercased(), colorMode: receivedColorMode,
+            resolution: resolution, fps: decodedFPS, bitrateKbps: bitrate,
+            pingMs: sample.pingMilliseconds.map { Int($0.rounded()) }, decoded: decoded,
+            rendered: renderedFrameCount, dropped: max(0, received - decoded), lossPercent: loss,
+            jitterMs: Int(sample.jitterMilliseconds.rounded()), decodeMs: sample.decodeMilliseconds >= 0 ? sample.decodeMilliseconds : nil,
+            serverLabel: session.zone.isEmpty ? nil : session.zone, gpuLabel: session.gpuType,
+            targetFps: streamProfile.fps, inputSummary: "r\(reliableInputPackets)/p\(partiallyReliableInputPackets)", detail: statsText)
+        if decoded > 0 { handleDecodedVideoProgress(framesDecoded: decoded); raiseModeChangeNoticeIfNeeded(deliveredResolution: resolution) }
+        onRuntimeSample(StreamRuntimeSample(timestamp: now, pingMs: sample.pingMilliseconds.map { Int($0.rounded()) },
+            bitrateKbps: bitrate, jitterMs: sample.jitterMilliseconds, fps: decodedFPS, receivedFps: receivedFPS,
+            decodedFps: decodedFPS, decodeMs: sample.decodeMilliseconds >= 0 ? sample.decodeMilliseconds : nil,
+            packetsLostDelta: lostDelta, packetsReceivedDelta: packetsDelta, packetLossPercent: loss,
+            resolution: resolution, codec: selectedCodec.rawValue.uppercased(), networkKind: deviceStatus.networkTransport.sessionNetworkKind))
+        NativeStreamVideoPerformanceLog.record("native transport received=\(receivedFPS ?? 0) decoded=\(decodedFPS ?? 0) bitrate=\(bitrate ?? 0) kbps hardware=\(sample.hardware) color=\(receivedColorMode)")
+        lastStatsSampleAt = now; lastStatsFramesReceived = received; lastStatsFramesDecoded = decoded
+        lastStatsBytesReceived = bytes; lastStatsPacketsLost = lost; lastStatsPacketsReceived = packets
     }
 
     func updateViewportSize(_ size: CGSize) {
@@ -3385,6 +3498,9 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     func stop() {
         guard !stopped else { return }
         stopped = true
+        nativeNVSTStart?.cancel(); nativeNVSTStart = nil
+        let nativeTransport = nativeNVST; nativeNVST = nil
+        Task { await nativeTransport?.close() }
         guidancePresentationTask?.cancel()
         guidancePresentationTask = nil
         sessionWarningDismissTask?.cancel()
@@ -3534,6 +3650,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         decoderRecoveryGate.reset()
         videoActive = false
         renderedFrameCount = 0
+        receivedColorMode = "--"
         decodedWithoutRenderStartedAt = nil
         lastRenderKeyframeRequestAt = nil
         renderKeyframeAttempts = 0
@@ -3546,6 +3663,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         lastStatsFramesRendered = nil
         lastStatsBytesReceived = nil
         lastStatsTotalDecodeTime = nil
+        receiveDelayTrace = NativeStreamReceiveDelayTrace()
         lastStatsPacketsLost = nil
         lastStatsPacketsReceived = nil
     }
@@ -3758,6 +3876,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
 
     private func createPeerConnection(with offerSDP: String) {
         if factory == nil {
+            NativeStreamWebRTCPolicy.initialize()
             _ = RTCInitializeSSL()
             #if targetEnvironment(simulator)
             let audioDevice = NativeStreamMutedAudioDevice()
@@ -4238,6 +4357,8 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         var jitterMs: Double?
         var rttMs: Double?
         var totalDecodeTimeSeconds: Double?
+        var decoderImplementation: String?
+        var receiveDelayValues: [String: Double] = [:]
         var selectedPairValues: [String: NSObject]?
         var candidateStats: [String: [String: NSObject]] = [:]
 
@@ -4248,6 +4369,12 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
                     || stat.type == "candidate-pair" else { continue }
             if stat.type == "inbound-rtp" {
                 if let kind = stat.values["kind"] as? String, kind != "video" { continue }
+                for key in ["jitterBufferDelay", "jitterBufferTargetDelay", "jitterBufferMinimumDelay",
+                    "jitterBufferEmittedCount", "totalAssemblyTime", "framesAssembledFromMultiplePackets",
+                    "totalProcessingDelay", "framesDecoded", "framesDropped", "nackCount", "pliCount", "freezeCount"] {
+                    if let value = stat.values[key] as? NSNumber { receiveDelayValues[key] = value.doubleValue }
+                }
+                decoderImplementation = stat.values["decoderImplementation"] as? String ?? decoderImplementation
                 framesDecoded = (stat.values["framesDecoded"] as? NSNumber)?.intValue ?? framesDecoded
                 framesReceived = (stat.values["framesReceived"] as? NSNumber)?.intValue ?? framesReceived
                 framesRendered = (stat.values["framesRendered"] as? NSNumber)?.intValue ?? framesRendered
@@ -4281,6 +4408,13 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             }
         }
 
+        let receiveDelays = receiveDelayTrace.sample(receiveDelayValues)
+        if !receiveDelays.isEmpty {
+            let fields = receiveDelays.keys.sorted().map { key in
+                String(format: "%@=%.2f", key, receiveDelays[key]!)
+            }.joined(separator: " ")
+            NativeStreamVideoPerformanceLog.record("receiver-delay " + fields)
+        }
         let packetLossPercent: Double = {
             let lost = packetsLost ?? 0
             let received = packetsReceived ?? 0
@@ -4322,10 +4456,18 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         let receivedFPS = estimatedRate(current: framesReceived, previous: lastStatsFramesReceived, now: now)
         let derivedFPS = framesPerSecond ?? decodedFPS
         let derivedBitrate = estimatedBitrateKbps(bytesReceived: bytesReceived, now: now)
+        NativeStreamVideoPerformanceLog.record(String(format:
+            "transport received=%d decoded=%d fps bitrate=%d kbps loss=%.2f%% jitter=%.2f ms resolution=%@ thermal=%ld low-power=%d",
+            receivedFPS ?? 0, decodedFPS ?? 0, derivedBitrate ?? 0,
+            packetLossPercent, jitterMs ?? 0, resolution,
+            ProcessInfo.processInfo.thermalState.rawValue,
+            ProcessInfo.processInfo.isLowPowerModeEnabled ? 1 : 0))
         statsText = [
             selectedCodec.rawValue,
+            receivedColorMode,
             resolution,
             "decoded \(framesDecoded ?? 0)",
+            decoderImplementation.map { "decoder \($0)" },
             receivedFPS.map { "receivedFps \($0)" },
             decodedFPS.map { "decodedFps \($0)" },
             "rendered \(framesRendered ?? renderedFrameCount)",
@@ -4369,6 +4511,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
 
         statsSnapshot = NativeStreamStatsSnapshot(
             codec: selectedCodec.rawValue.uppercased(),
+            colorMode: receivedColorMode,
             resolution: resolution,
             fps: derivedFPS,
             bitrateKbps: derivedBitrate,
@@ -4380,6 +4523,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             jitterMs: jitterMs.map { Int($0.rounded()) },
             decodeMs: decodeMs,
             serverLabel: session.zone.isEmpty ? nil : session.zone,
+            gpuLabel: session.gpuType?.trimmingCharacters(in: .whitespacesAndNewlines),
             targetFps: streamProfile.fps,
             inputSummary: "r\(reliableInputPackets)/p\(partiallyReliableInputPackets)",
             detail: statsText
@@ -4676,7 +4820,9 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         }
     }
 
-    private func noteRenderedFrame(count: Int, size: CGSize, luma: Int?) {
+    private func noteRenderedFrame(count: Int, size: CGSize, luma: Int?, colorMode: String) {
+        guard !stopped, !nativeNVSTFailed else { return }
+        receivedColorMode = colorMode
         renderedFrameCount = count
         updateRenderedVideoSize(size)
         sampledLuma = luma ?? sampledLuma
@@ -4926,6 +5072,11 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     }
 
     private func applyLiveAudioPreference() {
+        if let nativeNVST {
+            let muted = streamerPreferences.audioMuted
+            Task { await nativeNVST.setAudioMuted(muted) }
+            return
+        }
         if mutedAudioDevice != nil {
             log("WebRTC audio held disabled until stream restart")
             return
@@ -5007,6 +5158,10 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
 extension NativeStreamCoordinator: NativeStreamInputSink {
     nonisolated func sendReliableInput(_ data: Data) {
         Task { @MainActor in
+            if let nativeNVST = self.nativeNVST {
+                if await nativeNVST.send(data) { self.reliableInputPackets += 1 }
+                return
+            }
             guard self.reliableInputChannel?.readyState == .open else { return }
             if self.reliableInputChannel?.sendData(RTCDataBuffer(data: data, isBinary: true)) == true {
                 self.reliableInputPackets += 1
@@ -5016,6 +5171,10 @@ extension NativeStreamCoordinator: NativeStreamInputSink {
 
     nonisolated func sendPartiallyReliableInput(_ data: Data) {
         Task { @MainActor in
+            if let nativeNVST = self.nativeNVST {
+                if await nativeNVST.send(data) { self.partiallyReliableInputPackets += 1 }
+                return
+            }
             if self.partiallyReliableInputChannel?.readyState == .open {
                 if self.partiallyReliableInputChannel?.sendData(RTCDataBuffer(data: data, isBinary: true)) == true {
                     self.partiallyReliableInputPackets += 1
@@ -5224,10 +5383,14 @@ private final class NativeStreamPictureInPictureBridge: NSObject {
     private weak var displayLayer: AVSampleBufferDisplayLayer?
     private var contentSource: AVPictureInPictureController.ContentSource?
     private var pictureInPictureController: AVPictureInPictureController?
+    private var possibilityObservation: NSKeyValueObservation?
+    private let frameInFlight = DispatchSemaphore(value: 1)
+    private let converter = NativeStreamPiPFrameConverter()
+    private let generationLock = NSLock()
+    private var generation: UInt64 = 0
     private var availabilityPublished = false
     private var playbackPaused = false
 
-    private var frameSequence: Int64 = 0
     private var hasFrameForPlayback = false
     private var activeForFrameQueue = false
     private var lastAcceptedFrameAt: TimeInterval = 0
@@ -5238,19 +5401,27 @@ private final class NativeStreamPictureInPictureBridge: NSObject {
 
     private static let activeFrameInterval: TimeInterval = 1.0 / 30.0
     private static let inactiveFrameInterval: TimeInterval = 0.5
-    private static let sampleTimescale: CMTimeScale = 60
 
     var isPictureInPictureActive: Bool {
         pictureInPictureController?.isPictureInPictureActive == true
     }
 
     func attach(displayLayer: AVSampleBufferDisplayLayer) {
+        generationLock.lock(); generation &+= 1; generationLock.unlock()
         self.displayLayer = displayLayer
         hasFrameForPlayback = false
         playbackPaused = false
         displayLayer.videoGravity = .resizeAspect
         displayLayer.backgroundColor = UIColor.black.cgColor
         displayLayer.flush()
+        var timebase: CMTimebase?
+        if CMTimebaseCreateWithSourceClock(allocator: kCFAllocatorDefault,
+            sourceClock: CMClockGetHostTimeClock(), timebaseOut: &timebase) == noErr, let timebase {
+            CMTimebaseSetTime(timebase, time: CMClockGetTime(CMClockGetHostTimeClock()))
+            CMTimebaseSetRate(timebase, rate: 1)
+            displayLayer.controlTimebase = timebase
+        }
+        frameQueue.async { [weak self] in self?.resetFrameState() }
 
         guard AVPictureInPictureController.isPictureInPictureSupported() else {
             publishAvailability(false)
@@ -5268,6 +5439,9 @@ private final class NativeStreamPictureInPictureBridge: NSObject {
         controller.canStartPictureInPictureAutomaticallyFromInline = true
         self.contentSource = contentSource
         self.pictureInPictureController = controller
+        possibilityObservation = controller.observe(\.isPictureInPicturePossible, options: [.new]) { [weak self] _, _ in
+            DispatchQueue.main.async { self?.updateAvailabilityFromController() }
+        }
         publishAvailability(false)
     }
 
@@ -5293,6 +5467,8 @@ private final class NativeStreamPictureInPictureBridge: NSObject {
     }
 
     func detach() {
+        generationLock.lock(); generation &+= 1; generationLock.unlock()
+        possibilityObservation = nil
         stop()
         publishActive(false)
         publishAvailability(false)
@@ -5310,18 +5486,27 @@ private final class NativeStreamPictureInPictureBridge: NSObject {
 
     func enqueue(frame: RTCVideoFrame) {
         guard let cvBuffer = frame.buffer as? RTCCVPixelBuffer else { return }
+        guard frameInFlight.wait(timeout: .now()) == .success else { return }
         let pixelBuffer = cvBuffer.pixelBuffer
-        frameQueue.async { [weak self] in
-            self?.enqueue(pixelBuffer: pixelBuffer)
+        generationLock.lock(); let frameGeneration = generation; generationLock.unlock()
+        frameQueue.async { [self] in
+            enqueue(pixelBuffer: pixelBuffer, generation: frameGeneration)
         }
     }
 
-    private func enqueue(pixelBuffer: CVPixelBuffer) {
-        guard shouldAcceptFrame() else { return }
-        guard let sampleBuffer = makeSampleBuffer(pixelBuffer: pixelBuffer) else { return }
-        DispatchQueue.main.async { [weak self] in
-            guard let self, let displayLayer = self.displayLayer else { return }
+    private func enqueue(pixelBuffer: CVPixelBuffer, generation frameGeneration: UInt64) {
+        guard shouldAcceptFrame(), let converted = converter.convert(pixelBuffer),
+              let sampleBuffer = makeSampleBuffer(pixelBuffer: converted) else {
+            frameInFlight.signal()
+            return
+        }
+        DispatchQueue.main.async { [self] in
+            defer { frameInFlight.signal() }
+            generationLock.lock(); let currentGeneration = generation; generationLock.unlock()
+            guard frameGeneration == currentGeneration, let displayLayer = displayLayer else { return }
             if displayLayer.status == .failed || displayLayer.requiresFlushToResumeDecoding {
+                let error = displayLayer.error as NSError?
+                NativeStreamVideoPerformanceLog.record("PiP display flush status=\(displayLayer.status.rawValue) code=\(error?.code ?? 0)")
                 displayLayer.flush()
             }
             guard displayLayer.isReadyForMoreMediaData else { return }
@@ -5344,12 +5529,7 @@ private final class NativeStreamPictureInPictureBridge: NSObject {
 
     private func makeSampleBuffer(pixelBuffer: CVPixelBuffer) -> CMSampleBuffer? {
         guard let formatDescription = formatDescription(for: pixelBuffer) else { return nil }
-        frameSequence += 1
-        var timing = CMSampleTimingInfo(
-            duration: CMTime(value: 1, timescale: Self.sampleTimescale),
-            presentationTimeStamp: CMTime(value: frameSequence, timescale: Self.sampleTimescale),
-            decodeTimeStamp: .invalid
-        )
+        var timing = NativeStreamPiPSampleTiming.make()
         var sampleBuffer: CMSampleBuffer?
         let status = CMSampleBufferCreateReadyWithImageBuffer(
             allocator: kCFAllocatorDefault,
@@ -5415,6 +5595,7 @@ private final class NativeStreamPictureInPictureBridge: NSObject {
     }
 
     private func publishActive(_ active: Bool) {
+        NativeStreamVideoPerformanceLog.record("PiP active=\(active)")
         playbackPaused = false
         frameQueue.async { [weak self] in
             self?.activeForFrameQueue = active
@@ -5427,7 +5608,6 @@ private final class NativeStreamPictureInPictureBridge: NSObject {
     }
 
     private func resetFrameState() {
-        frameSequence = 0
         activeForFrameQueue = false
         lastAcceptedFrameAt = 0
         cachedFormatDescription = nil
@@ -5510,7 +5690,8 @@ extension NativeStreamPictureInPictureBridge: AVPictureInPictureSampleBufferPlay
 }
 
 private final class NativeStreamVideoSink: NSObject, RTCVideoRenderer {
-    var onFrame: ((Int, CGSize, Int?) -> Void)?
+    private let cadence = NativeStreamFrameCadenceTrace(stage: "video-sink")
+    var onFrame: ((Int, CGSize, Int?, String) -> Void)?
     var onPictureInPictureFrame: ((RTCVideoFrame) -> Void)?
 
     private weak var renderView: NativeStreamRenderView?
@@ -5543,6 +5724,7 @@ private final class NativeStreamVideoSink: NSObject, RTCVideoRenderer {
     }
 
     func renderFrame(_ frame: RTCVideoFrame?) {
+        if let frame { cadence.record(timestamp: UInt32(bitPattern: frame.timeStamp)) }
         lock.lock()
         frameCount += 1
         let count = frameCount
@@ -5558,7 +5740,9 @@ private final class NativeStreamVideoSink: NSObject, RTCVideoRenderer {
             onPictureInPictureFrame?(frame)
         }
         if count <= 3 || count.isMultiple(of: 60) {
-            let luma = Self.sampleLuma(from: frame)
+            // Startup-only CPU inspection: locking a decoder IOSurface repeatedly
+            // can synchronize the video/GPU pipeline during steady playback.
+            let luma = count <= 3 ? Self.sampleLuma(from: frame) : nil
             if count <= 3 {
                 let bufferType = frame.map { String(describing: type(of: $0.buffer)) } ?? "nil"
                 NSLog(
@@ -5570,7 +5754,8 @@ private final class NativeStreamVideoSink: NSObject, RTCVideoRenderer {
                     bufferType
                 )
             }
-            onFrame?(count, size, luma)
+            let colorMode = (frame?.buffer as? RTCCVPixelBuffer).map { NativeStreamHDRTransfer.colorMode(in: $0.pixelBuffer) } ?? (frame == nil ? "--" : "8-bit SDR")
+            onFrame?(count, size, luma, colorMode)
         }
     }
 
@@ -5657,8 +5842,10 @@ private final class NativeStreamVideoSink: NSObject, RTCVideoRenderer {
     }
 }
 
-private struct NativeStreamVideoView: UIViewRepresentable {
-    @ObservedObject var coordinator: NativeStreamCoordinator
+private struct NativeStreamVideoView: UIViewRepresentable, Equatable {
+    let coordinator: NativeStreamCoordinator
+
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.coordinator === rhs.coordinator }
 
     func makeUIView(context: Context) -> NativeStreamRenderView {
         let view = NativeStreamRenderView(frame: .zero)
@@ -5881,21 +6068,170 @@ private final class NativeStreamRenderView: UIView {
 /// `RTCMTLVideoView` does not reliably present IOSurfaces in CoreSimulator or
 /// iOS 26+ runtimes. This Core Image + Metal surface is the reliable fallback
 /// there and remains opt-in through sharpening on older devices.
+/// Bridge software-decoded WebRTC I420 frames to the NV12 IOSurface used by Core Image.
+final class NativeStreamFramePixelBufferBridge {
+    private let lock = NSLock()
+    private var pool: CVPixelBufferPool?
+    private var poolSize = CGSize.zero
+
+    func pixelBuffer(for frame: RTCVideoFrame) -> CVPixelBuffer? {
+        if let native = frame.buffer as? RTCCVPixelBuffer { return native.pixelBuffer }
+        let i420 = frame.buffer.toI420()
+        let width = Int(i420.width), height = Int(i420.height)
+        guard width > 0, height > 0 else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        if pool == nil || poolSize != CGSize(width: width, height: height) {
+            let attributes: [CFString: Any] = [
+                kCVPixelBufferWidthKey: width, kCVPixelBufferHeightKey: height,
+                kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                kCVPixelBufferMetalCompatibilityKey: true,
+                kCVPixelBufferIOSurfacePropertiesKey: [:]
+            ]
+            var nextPool: CVPixelBufferPool?
+            guard CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &nextPool) == kCVReturnSuccess else { return nil }
+            pool = nextPool
+            poolSize = CGSize(width: width, height: height)
+        }
+        guard let pool else { return nil }
+        var buffer: CVPixelBuffer?
+        // Bound buffers still owned by pending GPU work; drop a frame instead of growing indefinitely.
+        let limits = [kCVPixelBufferPoolAllocationThresholdKey: 6] as CFDictionary
+        guard CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(nil, pool, limits, &buffer) == kCVReturnSuccess,
+              let buffer, CVPixelBufferLockBaseAddress(buffer, []) == kCVReturnSuccess else { return nil }
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        guard let y = CVPixelBufferGetBaseAddressOfPlane(buffer, 0),
+              let uv = CVPixelBufferGetBaseAddressOfPlane(buffer, 1) else { return nil }
+        let yStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
+        for row in 0..<height {
+            memcpy(y.advanced(by: row * yStride), i420.dataY.advanced(by: row * Int(i420.strideY)), width)
+        }
+        let chromaWidth = Int(i420.chromaWidth), chromaHeight = Int(i420.chromaHeight)
+        var u = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: i420.dataU), height: vImagePixelCount(chromaHeight), width: vImagePixelCount(chromaWidth), rowBytes: Int(i420.strideU))
+        var v = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: i420.dataV), height: vImagePixelCount(chromaHeight), width: vImagePixelCount(chromaWidth), rowBytes: Int(i420.strideV))
+        let status = withUnsafePointer(to: &u) { uPointer in
+            withUnsafePointer(to: &v) { vPointer in
+                var sources: [UnsafePointer<vImage_Buffer>?] = [uPointer, vPointer]
+                var channels: [UnsafeMutableRawPointer?] = [uv, uv.advanced(by: 1)]
+                return sources.withUnsafeMutableBufferPointer { sourcePointers in
+                    channels.withUnsafeMutableBufferPointer { destinationPointers in
+                        vImageConvert_PlanarToChunky8(sourcePointers.baseAddress!, destinationPointers.baseAddress!, 2, 2,
+                            vImagePixelCount(chromaWidth), vImagePixelCount(chromaHeight),
+                            CVPixelBufferGetBytesPerRowOfPlane(buffer, 1), vImage_Flags(kvImageNoFlags))
+                    }
+                }
+            }
+        }
+        guard status == kvImageNoError else { return nil }
+        CVBufferSetAttachment(buffer, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
+        return buffer
+    }
+}
+
+/// A bounded renderer mailbox: producers overwrite pending work while the GPU is busy.
+/// Conversion is deferred until a display tick can submit the newest frame.
+final class NativeStreamLatestFrameMailbox<Frame> {
+    struct Entry {
+        let frame: Frame
+        let receivedAt: CFTimeInterval
+    }
+
+    private let lock = NSLock()
+    private let maximumInFlight: Int
+    private var pending: Entry?
+    private var inFlight = 0
+
+    init(maximumInFlight: Int = 2) {
+        precondition(maximumInFlight > 0)
+        self.maximumInFlight = maximumInFlight
+    }
+
+    func offer(_ frame: Frame) {
+        lock.lock()
+        pending = Entry(frame: frame, receivedAt: CACurrentMediaTime())
+        lock.unlock()
+    }
+
+    func take() -> Entry? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard inFlight < maximumInFlight, let entry = pending else { return nil }
+        pending = nil
+        inFlight += 1
+        return entry
+    }
+
+    func complete() {
+        lock.lock()
+        precondition(inFlight > 0)
+        inFlight -= 1
+        lock.unlock()
+    }
+}
+
+enum NativeStreamHDRTransfer {
+    case sdr, pq, hlg
+
+    static func colorMode(in buffer: CVPixelBuffer) -> String {
+        let format = CVPixelBufferGetPixelFormatType(buffer)
+        let tenBit = format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            || format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+        let depth = tenBit ? "10-bit" : "8-bit"
+        switch detect(in: buffer) {
+        case .pq: return "\(depth) HDR PQ"
+        case .hlg: return "\(depth) HDR HLG"
+        case .sdr: return "\(depth) SDR"
+        }
+    }
+
+    static func detect(in buffer: CVPixelBuffer) -> Self {
+        let transfer = CVBufferCopyAttachment(buffer, kCVImageBufferTransferFunctionKey, nil) as? String
+        if transfer == kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String { return .pq }
+        if transfer == kCVImageBufferTransferFunction_ITU_R_2100_HLG as String { return .hlg }
+        return .sdr
+    }
+}
+
 private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     var stretchToFill = false
     var sharpeningAmount = 0.0
 
     private let commandQueue: MTLCommandQueue
     private let ciContext: CIContext
+    private let directHDR: NativeStreamHDRMetalRenderer?
+    private var loggedDirectHDR = false
     private let sharpeningFilter = CIFilter(name: "CISharpenLuminance")
-    private let colorSpace = CGColorSpaceCreateDeviceRGB()
+    private var colorSpace = CGColorSpaceCreateDeviceRGB()
+    private var hdrTransfer = NativeStreamHDRTransfer.sdr
     private let mtkView: MTKView
     /// Exposed so the render view can reach the HUD switch on whichever layer is actually live.
     var metalLayer: CALayer { mtkView.layer }
-    private let lock = NSLock()
-    private var latestPixelBuffer: CVPixelBuffer?
-    private var latestFrameSize: CGSize = .zero
-    private var renderScheduled = false
+    private let frameBridge = NativeStreamFramePixelBufferBridge()
+    private let frames = NativeStreamLatestFrameMailbox<RTCVideoFrame>()
+    private let presentationLock = NSLock()
+    private var presentationWindowStart: CFTimeInterval = 0
+    private var presentedFrames = 0
+    private var totalPresentationAge: CFTimeInterval = 0
+    private var lastPresentationTime: CFTimeInterval = 0
+    private var maximumPresentationGap: CFTimeInterval = 0
+    private var clockTicks = 0
+    private var lastClockTick: CFTimeInterval = 0
+    private var maximumClockGap: CFTimeInterval = 0
+    private var totalDrawCPU: CFTimeInterval = 0
+    private var maximumDrawCPU: CFTimeInterval = 0
+    private var gpuSamples = 0
+    private var totalGPUTime: CFTimeInterval = 0
+    private var maximumGPUTime: CFTimeInterval = 0
+    private var displayLink: CADisplayLink?
+    private lazy var displayClock = DisplayClock(owner: self)
+
+    private final class DisplayClock: NSObject {
+        weak var owner: NativeStreamFilteredMetalView?
+        init(owner: NativeStreamFilteredMetalView) { self.owner = owner }
+        @objc func tick(_ link: CADisplayLink) { owner?.displayTick() }
+    }
+
+    deinit { displayLink?.invalidate() }
 
     static func make() -> NativeStreamFilteredMetalView? {
         guard let device = MTLCreateSystemDefaultDevice(),
@@ -5907,7 +6243,8 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
 
     private init(device: MTLDevice, commandQueue: MTLCommandQueue) {
         self.commandQueue = commandQueue
-        ciContext = CIContext(mtlDevice: device)
+        directHDR = NativeStreamHDRMetalRenderer(device: device)
+        ciContext = CIContext(mtlDevice: device, options: [.cacheIntermediates: false])
         mtkView = MTKView(frame: .zero, device: device)
         super.init(frame: .zero)
         isOpaque = true
@@ -5930,86 +6267,192 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         mtkView.frame = bounds
     }
 
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        displayLink?.invalidate()
+        displayLink = nil
+        // Use one explicit display clock. MTKView's own timer remains paused.
+        // A fixed range asks ProMotion to keep video cadence instead of choosing
+        // an intermediate refresh rate during otherwise static game scenes.
+        mtkView.isPaused = true
+        guard let window else { return }
+        let refresh = Float(window.screen.maximumFramesPerSecond)
+        let link = CADisplayLink(target: displayClock, selector: #selector(DisplayClock.tick(_:)))
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: refresh, maximum: refresh, preferred: refresh)
+        link.add(to: .main, forMode: .common)
+        displayLink = link
+        NativeStreamVideoPerformanceLog.record(String(format:
+            "display-clock target=%.0f Hz low-power=%d thermal=%ld", refresh,
+            ProcessInfo.processInfo.isLowPowerModeEnabled ? 1 : 0,
+            ProcessInfo.processInfo.thermalState.rawValue))
+    }
+
+    private func displayTick() {
+        let started = CACurrentMediaTime()
+        presentationLock.lock()
+        if lastClockTick > 0 { maximumClockGap = max(maximumClockGap, started - lastClockTick) }
+        lastClockTick = started
+        clockTicks += 1
+        presentationLock.unlock()
+        mtkView.draw()
+        let duration = CACurrentMediaTime() - started
+        presentationLock.lock()
+        totalDrawCPU += duration
+        maximumDrawCPU = max(maximumDrawCPU, duration)
+        presentationLock.unlock()
+    }
+
     func display(frame: RTCVideoFrame?) {
-        guard let cvBuffer = frame?.buffer as? RTCCVPixelBuffer else { return }
-        let pixelBuffer = cvBuffer.pixelBuffer
-        let frameSize = CGSize(
-            width: frame.map { CGFloat($0.width) } ?? CGFloat(CVPixelBufferGetWidth(pixelBuffer)),
-            height: frame.map { CGFloat($0.height) } ?? CGFloat(CVPixelBufferGetHeight(pixelBuffer))
-        )
-
-        lock.lock()
-        latestPixelBuffer = pixelBuffer
-        latestFrameSize = frameSize
-        guard !renderScheduled else {
-            lock.unlock()
-            return
-        }
-        renderScheduled = true
-        lock.unlock()
-
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.lock.lock()
-            self.renderScheduled = false
-            self.lock.unlock()
-            self.mtkView.draw()
-        }
+        guard let frame else { return }
+        frames.offer(frame)
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
     func draw(in view: MTKView) {
-        lock.lock()
-        let pixelBuffer = latestPixelBuffer
-        let frameSize = latestFrameSize
-        lock.unlock()
-
-        guard let pixelBuffer,
-              let drawable = view.currentDrawable,
+        guard !isHidden, window != nil, let entry = frames.take() else { return }
+        var submitted = false
+        defer {
+            // Return the slot on conversion/drawable failures too.
+            if !submitted { frames.complete() }
+        }
+        guard let pixelBuffer = frameBridge.pixelBuffer(for: entry.frame) else { return }
+        configureColorOutput(for: pixelBuffer)
+        guard let drawable = view.currentDrawable,
               let commandBuffer = commandQueue.makeCommandBuffer() else {
             return
         }
+        let frameSize = CGSize(width: CGFloat(entry.frame.width), height: CGFloat(entry.frame.height))
 
-        if let descriptor = view.currentRenderPassDescriptor,
-           let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) {
-            encoder.endEncoding()
-        }
-
-        let sourceImage = CIImage(cvPixelBuffer: pixelBuffer)
-        let sourceExtent = sourceImage.extent
-        let filteredImage: CIImage = {
-            let normalizedAmount = min(max(sharpeningAmount, 0), 1)
-            guard normalizedAmount > 0.001,
-                  let filter = sharpeningFilter else {
-                return sourceImage
+        let bounds = CGRect(origin: .zero, size: view.drawableSize)
+        let destination = stretchToFill ? bounds : Self.aspectFitRect(source: frameSize, target: bounds.size)
+        let direct = sharpeningAmount <= 0.001 && view.currentRenderPassDescriptor.map {
+            directHDR?.encode(buffer: pixelBuffer, commandBuffer: commandBuffer,
+                descriptor: $0, destination: destination) == true
+        } == true
+        if direct {
+            if !loggedDirectHDR {
+                loggedDirectHDR = true
+                NativeStreamVideoPerformanceLog.record("renderer direct-metal P010 BT2020 HDR")
             }
-            filter.setValue(sourceImage, forKey: kCIInputImageKey)
-            filter.setValue(normalizedAmount, forKey: kCIInputSharpnessKey)
-            return (filter.outputImage ?? sourceImage).cropped(to: sourceExtent)
-        }()
-        let targetBounds = CGRect(origin: .zero, size: view.drawableSize)
-        let destination = stretchToFill
-            ? targetBounds
-            : Self.aspectFitRect(
-                source: frameSize == .zero ? sourceExtent.size : frameSize,
-                target: targetBounds.size
-            )
-        let scaleX = destination.width / max(sourceExtent.width, 1)
-        let scaleY = destination.height / max(sourceExtent.height, 1)
-        let transform = CGAffineTransform(translationX: destination.minX, y: destination.minY)
-            .scaledBy(x: scaleX, y: scaleY)
-        let outputImage = filteredImage.transformed(by: transform)
+        } else {
+            if let descriptor = view.currentRenderPassDescriptor,
+               let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) {
+                encoder.endEncoding()
+            }
 
-        ciContext.render(
-            outputImage,
-            to: drawable.texture,
-            commandBuffer: commandBuffer,
-            bounds: targetBounds,
-            colorSpace: colorSpace
-        )
+            let sourceImage = CIImage(cvPixelBuffer: pixelBuffer)
+            let sourceExtent = sourceImage.extent
+            let filteredImage: CIImage = {
+                let normalizedAmount = min(max(sharpeningAmount, 0), 1)
+                guard normalizedAmount > 0.001,
+                      let filter = sharpeningFilter else {
+                    return sourceImage
+                }
+                filter.setValue(sourceImage, forKey: kCIInputImageKey)
+                filter.setValue(normalizedAmount, forKey: kCIInputSharpnessKey)
+                return (filter.outputImage ?? sourceImage).cropped(to: sourceExtent)
+            }()
+            let targetBounds = CGRect(origin: .zero, size: view.drawableSize)
+            let destination = stretchToFill
+                ? targetBounds
+                : Self.aspectFitRect(
+                    source: frameSize == .zero ? sourceExtent.size : frameSize,
+                    target: targetBounds.size
+                )
+            let scaleX = destination.width / max(sourceExtent.width, 1)
+            let scaleY = destination.height / max(sourceExtent.height, 1)
+            let transform = CGAffineTransform(translationX: destination.minX, y: destination.minY)
+                .scaledBy(x: scaleX, y: scaleY)
+            let outputImage = filteredImage.transformed(by: transform)
+
+            ciContext.render(
+                outputImage,
+                to: drawable.texture,
+                commandBuffer: commandBuffer,
+                bounds: targetBounds,
+                colorSpace: colorSpace
+            )
+        }
+        #if !targetEnvironment(simulator)
+        // Presentation callbacks are available on the physical device, not CoreSimulator.
+        drawable.addPresentedHandler { [weak self] drawable in
+            guard drawable.presentedTime > 0 else { return }
+            self?.recordPresentation(at: drawable.presentedTime, receivedAt: entry.receivedAt)
+        }
+        #endif
+        commandBuffer.addCompletedHandler { [weak self, pixelBuffer] command in
+            // Keep the pooled IOSurface alive until the GPU has finished reading it.
+            _ = pixelBuffer
+            guard let self else { return }
+            self.frames.complete()
+            let duration = max(command.gpuEndTime - command.gpuStartTime, 0)
+            self.presentationLock.lock()
+            self.gpuSamples += 1
+            self.totalGPUTime += duration
+            self.maximumGPUTime = max(self.maximumGPUTime, duration)
+            self.presentationLock.unlock()
+        }
         commandBuffer.present(drawable)
+        submitted = true
         commandBuffer.commit()
+    }
+
+    private func configureColorOutput(for buffer: CVPixelBuffer) {
+        let transfer = NativeStreamHDRTransfer.detect(in: buffer)
+        guard transfer != hdrTransfer else { return }
+        hdrTransfer = transfer
+        let hdr = transfer != .sdr
+        // Apple’s normalized HDR path: keep PQ/HLG encoding and BT.2020 primaries
+        // in a 10-bit drawable, with an EDR layer matching the rendered color space.
+        colorSpace = hdr
+            ? CGColorSpace(name: transfer == .pq ? CGColorSpace.itur_2100_PQ : CGColorSpace.itur_2100_HLG)!
+            : CGColorSpaceCreateDeviceRGB()
+        mtkView.colorPixelFormat = hdr ? .bgr10a2Unorm : .bgra8Unorm
+        if let layer = mtkView.layer as? CAMetalLayer {
+            layer.colorspace = colorSpace
+            layer.wantsExtendedDynamicRangeContent = hdr
+        }
+        NSLog("[OpenNOW] display output=%@ pixelFormat=%lu EDR=%@",
+              transfer == .pq ? "BT2020-PQ" : transfer == .hlg ? "BT2020-HLG" : "SDR",
+              mtkView.colorPixelFormat.rawValue, hdr ? "on" : "off")
+    }
+
+    private func recordPresentation(at time: CFTimeInterval, receivedAt: CFTimeInterval) {
+        presentationLock.lock()
+        if presentationWindowStart == 0 { presentationWindowStart = time }
+        presentedFrames += 1
+        if lastPresentationTime > 0 {
+            maximumPresentationGap = max(maximumPresentationGap, time - lastPresentationTime)
+        }
+        lastPresentationTime = time
+        totalPresentationAge += max(time - receivedAt, 0)
+        let elapsed = time - presentationWindowStart
+        guard elapsed >= 2 else {
+            presentationLock.unlock()
+            return
+        }
+        let fps = Double(presentedFrames - 1) / elapsed
+        let averageAgeMs = totalPresentationAge * 1000 / Double(presentedFrames)
+        let gapMs = maximumPresentationGap * 1000
+        let tickFPS = Double(clockTicks) / elapsed
+        let clockGapMs = maximumClockGap * 1000
+        let cpuMs = totalDrawCPU * 1000 / Double(max(clockTicks, 1))
+        let maximumCPUMs = maximumDrawCPU * 1000
+        let gpuMs = totalGPUTime * 1000 / Double(max(gpuSamples, 1))
+        let maximumGPUMs = maximumGPUTime * 1000
+        clockTicks = 0; maximumClockGap = 0
+        totalDrawCPU = 0; maximumDrawCPU = 0
+        gpuSamples = 0; totalGPUTime = 0; maximumGPUTime = 0
+        maximumPresentationGap = 0
+        presentationWindowStart = time
+        presentedFrames = 1
+        totalPresentationAge = max(time - receivedAt, 0)
+        presentationLock.unlock()
+        // Console I/O must never delay Metal's presentation callback.
+        NativeStreamVideoPerformanceLog.record(String(format:
+            "display presented=%.1f fps renderer-age=%.1f ms max-gap=%.1f ms clock=%.1f Hz clock-max-gap=%.1f ms draw-cpu=%.2f/max=%.2f ms gpu=%.2f/max=%.2f ms",
+            fps, averageAgeMs, gapMs, tickFPS, clockGapMs, cpuMs, maximumCPUMs, gpuMs, maximumGPUMs))
     }
 
     private static func aspectFitRect(source: CGSize, target: CGSize) -> CGRect {

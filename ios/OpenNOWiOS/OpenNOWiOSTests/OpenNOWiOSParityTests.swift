@@ -1,8 +1,621 @@
 import XCTest
 import UIKit
+import WebRTC
+import CoreVideo
+import CoreMedia
+import SwiftUI
 @testable import OpenNOWiOS
 
 final class OpenNOWiOSParityTests: XCTestCase {
+    func testPointerCaptureReleasesForControlsPiPAndInactiveScene() {
+        func capture(video: Bool = true, active: Bool = true, controls: Bool = false,
+                     editing: Bool = false, guidance: Bool = false, pip: Bool = false) -> Bool {
+            NativeStreamPointerCapturePolicy.shouldCapture(videoActive: video, sceneActive: active,
+                controlsVisible: controls, editing: editing, guidanceVisible: guidance, pipActive: pip)
+        }
+        XCTAssertTrue(capture())
+        XCTAssertFalse(capture(video: false))
+        XCTAssertFalse(capture(active: false))
+        XCTAssertFalse(capture(controls: true))
+        XCTAssertFalse(capture(editing: true))
+        XCTAssertFalse(capture(guidance: true))
+        XCTAssertFalse(capture(pip: true))
+    }
+
+    @MainActor
+    func testStreamPresentationOwnsPointerLockAndReleasesOnTeardown() async throws {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
+        let priorWindow = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        let presenter = NativeStreamPresentationController(content: AnyView(
+            Color.black.background(NativeStreamPointerLockPreference(requested: true))))
+        window.rootViewController = presenter
+        window.makeKeyAndVisible()
+        defer { presenter.tearDown(); window.isHidden = true; priorWindow?.makeKeyAndVisible() }
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertTrue(presenter.presentedViewController === presenter.host)
+        XCTAssertTrue(presenter.host.prefersPointerLocked)
+        presenter.tearDown()
+        XCTAssertFalse(presenter.host.prefersPointerLocked)
+    }
+
+    func testPiPSamplesUseHostClockAndBoundedAspectCorrectSurfaces() {
+        XCTAssertEqual(NativeStreamPiPFrameConverter.outputSize(width: 3840, height: 2160), CGSize(width: 1280, height: 720))
+        XCTAssertEqual(NativeStreamPiPFrameConverter.outputSize(width: 2160, height: 3840), CGSize(width: 405, height: 720))
+        XCTAssertEqual(NativeStreamPiPFrameConverter.outputSize(width: 0, height: 100), .zero)
+        let now = CMClockGetTime(CMClockGetHostTimeClock())
+        let sample = NativeStreamPiPSampleTiming.make(at: now)
+        XCTAssertEqual(CMTimeCompare(sample.presentationTimeStamp, now), 0)
+        XCTAssertEqual(CMTimeGetSeconds(sample.duration), 1.0 / 30.0, accuracy: 0.00001)
+        XCTAssertFalse(sample.decodeTimeStamp.isValid)
+    }
+
+    func testPiPConvertsTenBitHDRIntoIndependentVisibleSurface() throws {
+        var created: CVPixelBuffer?
+        XCTAssertEqual(CVPixelBufferCreate(nil, 16, 8, kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
+            [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &created), kCVReturnSuccess)
+        let source = try XCTUnwrap(created)
+        CVPixelBufferLockBaseAddress(source, [])
+        for plane in 0..<2 {
+            let base = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(source, plane)).assumingMemoryBound(to: UInt16.self)
+            let words = CVPixelBufferGetBytesPerRowOfPlane(source, plane) / 2 * CVPixelBufferGetHeightOfPlane(source, plane)
+            for i in 0..<words { base[i] = UInt16(plane == 0 ? 601 : 512) << 6 }
+        }
+        CVPixelBufferUnlockBaseAddress(source, [])
+        CVBufferSetAttachment(source, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020, .shouldPropagate)
+        CVBufferSetAttachment(source, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, .shouldPropagate)
+        CVBufferSetAttachment(source, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020, .shouldPropagate)
+        let converter = NativeStreamPiPFrameConverter()
+        let output = try XCTUnwrap(converter.convert(source))
+        XCTAssertFalse(output === source)
+        XCTAssertEqual(CVPixelBufferGetPixelFormatType(output), kCVPixelFormatType_32BGRA)
+        XCTAssertEqual(CVPixelBufferGetPixelFormatType(source), kCVPixelFormatType_420YpCbCr10BiPlanarFullRange)
+        XCTAssertEqual(NativeStreamHDRTransfer.detect(in: source), .pq)
+        CVPixelBufferLockBaseAddress(output, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(output, .readOnly) }
+        let pixels = try XCTUnwrap(CVPixelBufferGetBaseAddress(output)).assumingMemoryBound(to: UInt8.self)
+        XCTAssertGreaterThan(pixels[0], 20)
+        XCTAssertGreaterThan(pixels[1], 20)
+        XCTAssertGreaterThan(pixels[2], 20)
+        XCTAssertEqual(pixels[3], 255)
+    }
+
+    func testDecodeCompletionHandlesEarlyReorderedAndFailedOutputsWithoutShiftingTiming() {
+        var ledger = NvstDecodeCompletionLedger<Double>()
+        ledger.register(frameIndex: 40, value: 100)
+        // A callback runs before the submission function returns.
+        XCTAssertEqual(ledger.take(frameIndex: 40), 100)
+        XCTAssertEqual(ledger.count, 0)
+        ledger.register(frameIndex: 41, value: 108)
+        ledger.register(frameIndex: 42, value: 116)
+        XCTAssertEqual(ledger.take(frameIndex: 42), 116)
+        // A rejection removes only its own entry; the next callback keeps its start time.
+        XCTAssertEqual(ledger.take(frameIndex: 41), 108)
+        XCTAssertNil(ledger.take(frameIndex: 40))
+        ledger.register(frameIndex: 43, value: 124)
+        XCTAssertNil(ledger.take(frameIndex: 42))
+        XCTAssertEqual(ledger.take(frameIndex: 43), 124)
+        XCTAssertEqual(ledger.count, 0)
+    }
+
+    func testReceiveDelayTraceUsesWindowDeltasAndRejectsResetOrMissingCounters() throws {
+        var trace = NativeStreamReceiveDelayTrace()
+        XCTAssertTrue(trace.sample(["jitterBufferDelay": 5, "jitterBufferEmittedCount": 100,
+            "framesDropped": 10]).isEmpty)
+        let next = trace.sample(["jitterBufferDelay": 6, "jitterBufferEmittedCount": 200,
+            "framesDropped": 12])
+        XCTAssertEqual(try XCTUnwrap(next["buffer-ms"]), 10, accuracy: 0.001)
+        XCTAssertEqual(next["framesDropped"], 2)
+        XCTAssertNil(next["assembly-ms"])
+        XCTAssertTrue(trace.sample(["jitterBufferDelay": 0.5, "jitterBufferEmittedCount": 5,
+            "framesDropped": 0]).isEmpty)
+        XCTAssertTrue(trace.sample([:]).isEmpty)
+        XCTAssertTrue(trace.sample(["jitterBufferDelay": 1, "jitterBufferEmittedCount": 10]).isEmpty)
+        XCTAssertTrue(trace.sample(["jitterBufferDelay": 2, "jitterBufferEmittedCount": 10]).isEmpty)
+    }
+
+    func testFrameCadenceMeasures120HzAcrossRTPWrap() throws {
+        var cadence = NativeStreamFrameCadence()
+        let base = UInt32.max - 500
+        var report: NativeStreamFrameCadence.Snapshot?
+        for index in 0...240 {
+            report = cadence.record(timestamp: base &+ UInt32(index * 750),
+                now: 10 + Double(index) / 120, renderTimeMs: 0) ?? report
+        }
+        let result = try XCTUnwrap(report)
+        XCTAssertEqual(result.arrivalFPS, 120, accuracy: 0.001)
+        XCTAssertEqual(result.rtpFPS, 120, accuracy: 0.001)
+        XCTAssertEqual(result.nominal120Intervals, 240)
+        XCTAssertEqual(result.discontinuities, 0)
+        XCTAssertEqual(result.repeatedTimestamps, 0)
+        XCTAssertEqual(result.burstIntervals, 0)
+        XCTAssertEqual(result.maximumGapMs, 1000 / 120, accuracy: 0.001)
+        XCTAssertEqual(result.maximumRTPGapMs, 1000 / 120, accuracy: 0.001)
+    }
+
+    func testFrameCadenceSeparatesBurstsAndTimestampDiscontinuities() throws {
+        var cadence = NativeStreamFrameCadence()
+        _ = cadence.record(timestamp: 1000, now: 0)
+        _ = cadence.record(timestamp: 1750, now: 0.001)
+        _ = cadence.record(timestamp: 1750, now: 0.002)
+        _ = cadence.record(timestamp: 1700, now: 0.1)
+        let result = try XCTUnwrap(cadence.record(timestamp: 2450, now: 2))
+        XCTAssertEqual(result.arrivalFPS, 2)
+        XCTAssertEqual(result.rtpFPS, 120)
+        XCTAssertEqual(result.nominal120Intervals, 2)
+        XCTAssertEqual(result.burstIntervals, 2)
+        XCTAssertEqual(result.repeatedTimestamps, 1)
+        XCTAssertEqual(result.discontinuities, 1)
+        XCTAssertEqual(result.maximumGapMs, 1900, accuracy: 0.001)
+        XCTAssertEqual(result.maximumRTPGapMs, 1000 / 120, accuracy: 0.001)
+        // The next window must include the interval crossing the old boundary.
+        let next = try XCTUnwrap(cadence.record(timestamp: 182450, now: 4))
+        XCTAssertEqual(next.arrivalFPS, 0.5)
+        XCTAssertEqual(next.discontinuities, 1)
+        XCTAssertEqual(next.maximumGapMs, 2000)
+        XCTAssertEqual(next.burstIntervals, 0)
+    }
+
+    func testGameImportParsesNamesIDsAndFragmentLinks() throws {
+        XCTAssertEqual(try GFNGameImportReference.parse(" Cubiscape 2 ").search, "Cubiscape 2")
+        XCTAssertEqual(try GFNGameImportReference.parse("105389455").launchID, "105389455")
+        let id = "73c174bd-ab5e-4be8-89df-e6fd59477d53"
+        let reference = try GFNGameImportReference.parse("https://play.geforcenow.com/mall/#/game/\(id)?appId=105389455&store=STEAM")
+        XCTAssertEqual(reference.catalogID, id)
+        XCTAssertEqual(reference.launchID, "105389455")
+        XCTAssertEqual(reference.store, "STEAM")
+        XCTAssertThrowsError(try GFNGameImportReference.parse("https://store.steampowered.com/app/105389455"))
+        XCTAssertThrowsError(try GFNGameImportReference.parse("https://play.geforcenow.com.attacker.example/game/\(id)"))
+        XCTAssertThrowsError(try GFNGameImportReference.parse("https://play.geforcenow.com/"))
+    }
+
+    func testSharedGameRoundTripsTitleStoreAndGFNIdentifiers() throws {
+        let game = CloudGame(id: "test", title: "A Game & Friends: + Edition", genre: "Cloud Game",
+            platform: "EPIC", icon: "gamecontroller.fill", imageUrl: nil, launchAppId: "12345",
+            launchOptions: [], uuid: "73c174bd-ab5e-4be8-89df-e6fd59477d53",
+            summary: nil, longDescription: nil, publisher: nil, developer: nil, releaseDate: nil,
+            featureLabels: nil, tags: nil, stores: nil, playType: nil, membershipTierLabel: nil,
+            catalogSectionId: nil, catalogSectionTitle: nil, contentRatings: nil)
+        let option = GameLaunchOption(storefront: "STEAM", appId: "105389455", supportedControls: nil)
+        let url = try XCTUnwrap(GFNGameImportReference.shareURL(game: game, option: option))
+        let reference = try GFNGameImportReference.parse(url.absoluteString)
+        XCTAssertEqual(reference.launchID, option.appId)
+        XCTAssertEqual(reference.store, option.storefront)
+        XCTAssertEqual(reference.title, game.title)
+        XCTAssertEqual(reference.catalogID, game.uuid)
+        XCTAssertNil(reference.search)
+    }
+
+    func testHomeScreenLinkPreservesSelectedGameAndStoreWithoutCredentials() throws {
+        let game = Self.makeGame(title: "A Game & Friends: + Edition", controls: [])
+        let option = GameLaunchOption(storefront: "EPIC", appId: "101606111", supportedControls: nil)
+        let url = try XCTUnwrap(GFNGameImportReference.homeScreenURL(game: game, option: option))
+        XCTAssertEqual(url.scheme, "https")
+        XCTAssertEqual(url.host, "joemossjr16.github.io")
+        XCTAssertEqual(URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedPath, "/ios-apps/launch/")
+        let query = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems)
+        XCTAssertEqual(query.first { $0.name == "appid" }?.value, option.appId)
+        XCTAssertEqual(query.first { $0.name == "store" }?.value, "EPIC")
+        XCTAssertEqual(query.first { $0.name == "title" }?.value, game.title)
+        XCTAssertEqual(Set(query.map(\.name)), Set(["appid", "title", "store"]))
+        let restored = try GFNGameImportReference.parse("opennowios://launch/101606111?title=A%20Game%20%26%20Friends&store=EPIC")
+        XCTAssertEqual(restored.launchID, "101606111")
+        XCTAssertEqual(restored.store, "EPIC")
+        XCTAssertEqual(restored.title, "A Game & Friends")
+    }
+
+    func testHomeScreenSetupRetainsGameIdentityAndPreventsImmediateLaunch() throws {
+        let game = Self.makeGame(title: "Cyberpunk & Friends", controls: [])
+        let option = GameLaunchOption(storefront: "STEAM", appId: "101606111", supportedControls: nil)
+        let url = try XCTUnwrap(GFNGameImportReference.homeScreenSetupURL(game: game, option: option))
+        let components = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
+        let items = try XCTUnwrap(components.queryItems)
+        XCTAssertEqual(items.first { $0.name == "setup" }?.value, "1")
+        XCTAssertEqual(items.first { $0.name == "appid" }?.value, option.appId)
+        XCTAssertEqual(items.first { $0.name == "store" }?.value, "STEAM")
+        XCTAssertEqual(items.first { $0.name == "title" }?.value, game.title)
+        var saved = components
+        saved.queryItems = items.filter { $0.name != "setup" }
+        XCTAssertEqual(saved.url, GFNGameImportReference.homeScreenURL(game: game, option: option))
+    }
+
+    func test5080BadgeRequiresNvidiaReadyCollectionInsteadOfInstallToPlay() {
+        let panels: [[String: Any]] = [["sections": [
+            ["title": "Install-to-Play", "items": [["app": ["id": "unconfirmed"]]]],
+            ["title": "GeForce RTX 5080 Ready", "items": [["app": ["id": "confirmed"]]]],
+            ["title": "RTX ON", "items": [["app": ["id": "rtx-only"]]]]
+        ]]]
+        XCTAssertEqual(GFNCatalogFeatureParser.readyAppIDs(panels: panels), Set(["confirmed"]))
+        XCTAssertTrue(GFNCatalogFeatureParser.readyAppIDs(panels: []).isEmpty)
+    }
+
+    func testCatalogFeatureFlagsRespectDisabledAndPerStoreCapabilities() {
+        let steam: [String: Any] = ["gfn": ["features": [
+            ["key": "RTX_ENABLED", "value": "true"],
+            ["key": "HDR_ENABLED", "value": "false"],
+            ["key": "SUPPORTED_HDR_VERSION", "values": ["HDR"]],
+            ["key": "REFLEX_ENABLED", "value": true]
+        ]]]
+        let gog: [String: Any] = ["gfn": ["features": [
+            ["key": "RTX_ENABLED", "value": "false"],
+            ["key": "SUPPORTED_HDR_VERSION", "values": [String]()]
+        ]]]
+        XCTAssertEqual(GFNCatalogFeatureParser.labels(variant: steam), ["RTX", "HDR", "Reflex"])
+        XCTAssertTrue(GFNCatalogFeatureParser.labels(variant: gog).isEmpty)
+        XCTAssertTrue(GFNCatalogFeatureParser.labels(variant: [:]).isEmpty)
+        XCTAssertEqual(Set(GFNCatalogFeatureParser.labels(app: ["variants": [steam, gog]])),
+                       Set(["RTX", "HDR", "Reflex"]))
+        XCTAssertFalse(GFNCatalogFeatureParser.labels(variant: steam).contains("RTX 5080 Ready"))
+    }
+
+    func testLaunchOptionDecodesCachedMetadataWithoutFeatureFlags() throws {
+        let old = Data(#"{"storefront":"STEAM","appId":"101606111","supportedControls":["MOUSE"]}"#.utf8)
+        let option = try JSONDecoder().decode(GameLaunchOption.self, from: old)
+        XCTAssertNil(option.featureLabels)
+        XCTAssertEqual(option.appId, "101606111")
+    }
+
+    func testHEVCOutputPreservesSourceBitDepthAndRejectsTruncatedSPS() {
+        // SPS through bit_depth_chroma_minus8: one sublayer, 4:2:0, 16x16.
+        func sps(depth: Int) -> Data {
+            func ue(_ value: Int) -> String {
+                let code = String(value + 1, radix: 2)
+                return String(repeating: "0", count: code.count - 1) + code
+            }
+            var bits = "00000001" + String(repeating: "0", count: 96)
+            bits += ue(0) + ue(1) + ue(16) + ue(16) + "0" + ue(depth - 8) + ue(depth - 8)
+            while bits.count % 8 != 0 { bits += "0" }
+            let chars = Array(bits)
+            var result = Data([0x42, 0x01])
+            var zeros = 0
+            for offset in stride(from: 0, to: chars.count, by: 8) {
+                let byte = UInt8(String(chars[offset..<offset + 8]), radix: 2)!
+                if zeros >= 2 && byte <= 3 { result.append(3); zeros = 0 }
+                result.append(byte)
+                zeros = byte == 0 ? zeros + 1 : 0
+            }
+            return result
+        }
+        XCTAssertEqual(NativeStreamHEVCOutput.bitDepth(sps: sps(depth: 8)), 8)
+        XCTAssertEqual(NativeStreamHEVCOutput.bitDepth(sps: sps(depth: 10)), 10)
+        XCTAssertEqual(NativeStreamHEVCOutput.pixelFormat(sps: sps(depth: 8)), kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+        XCTAssertEqual(NativeStreamHEVCOutput.pixelFormat(sps: sps(depth: 10)), kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+        XCTAssertNil(NativeStreamHEVCOutput.bitDepth(sps: Data(sps(depth: 10).prefix(8))))
+    }
+
+    func testHUDColorModeUsesReceivedPixelsAndTransfer() throws {
+        for format in [kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                       kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange] {
+            var buffer: CVPixelBuffer?
+            XCTAssertEqual(CVPixelBufferCreate(nil, 16, 16, format, nil, &buffer), kCVReturnSuccess)
+            let pixels = try XCTUnwrap(buffer)
+            let depth = format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ? "10-bit" : "8-bit"
+            XCTAssertEqual(NativeStreamHDRTransfer.colorMode(in: pixels), "\(depth) SDR")
+            for (transfer, suffix) in [(kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, "PQ"),
+                                       (kCVImageBufferTransferFunction_ITU_R_2100_HLG, "HLG")] {
+                CVBufferSetAttachment(pixels, kCVImageBufferTransferFunctionKey, transfer, .shouldPropagate)
+                XCTAssertEqual(NativeStreamHDRTransfer.colorMode(in: pixels), "\(depth) HDR \(suffix)")
+            }
+        }
+    }
+
+    func testHDRHandshakeRequestsHDRAndBT2020WithoutChangingTenBitSDR() {
+        for codec in [NativeStreamVideoCodec.av1, .h265, .h264] {
+            for hdr in [false, true] {
+                var settings = AppSettings.default
+                settings.hdrEnabled = hdr
+                settings.preferredColorQuality = StreamColorQuality.tenBit420.rawValue
+                let sdp = NativeStreamSDP.buildNvstSDP(
+                    offerSDP: "", localAnswerSDP: "",
+                    profile: StreamSettingsResolver.profile(for: settings), settings: settings, codec: codec)
+                let supportsHDR = hdr && codec != .h264
+                XCTAssertTrue(sdp.contains("a=video.dynamicRangeMode:\(supportsHDR ? 1 : 0)\n"))
+                XCTAssertTrue(sdp.contains("a=video.encoderCscMode:\(supportsHDR ? 5 : 3)\n"))
+                XCTAssertTrue(sdp.contains("a=video.bitDepth:\(codec == .h264 ? 8 : 10)\n"))
+            }
+        }
+    }
+
+    func testCloudMatchFeatureRequestExplicitlyRequestsHDRAndPreservesSDR() throws {
+        var settings = AppSettings.default
+        settings.preferredResolution = "2560x1600"
+        settings.preferredFPS = 120
+        settings.preferredCodec = "AV1"
+        settings.preferredColorQuality = StreamColorQuality.tenBit420.rawValue
+        settings.enableCloudGsync = false
+        for hdr in [false, true] {
+            settings.hdrEnabled = hdr
+            let features = CloudMatchStreamingFeatureRequest.build(
+                settings: settings, profile: StreamSettingsResolver.profile(for: settings),
+                bitDepth: 10, chromaFormat: 0
+            )
+            XCTAssertEqual(features["bitDepth"] as? Int, 1)
+            XCTAssertEqual(features["chromaFormat"] as? Int, 0)
+            XCTAssertEqual(features["reflex"] as? Bool, true)
+            XCTAssertEqual(features["cloudGsync"] as? Bool, false)
+            XCTAssertEqual(features["trueHdr"] as? Bool, hdr)
+            for field in ["mouseMovementFlags", "hidDevices", "sdrColorSpace", "hdrColorSpace"] {
+                XCTAssertNil(features[field], "\(field) is absent from the desktop request")
+            }
+            XCTAssertNoThrow(try JSONSerialization.data(withJSONObject: features))
+        }
+    }
+
+    func testCloudMatchReflexUsesDesktopThresholdWithoutCloudGsync() {
+        var settings = AppSettings.default
+        settings.enableCloudGsync = false
+        for fps in [30, 60, 90, 120] {
+            settings.preferredFPS = fps
+            let features = CloudMatchStreamingFeatureRequest.build(
+                settings: settings, profile: StreamSettingsResolver.profile(for: settings),
+                bitDepth: 0, chromaFormat: 0
+            )
+            XCTAssertEqual(features["reflex"] as? Bool, fps >= 120)
+        }
+        settings.enableCloudGsync = true
+        settings.preferredFPS = 60
+        let features = CloudMatchStreamingFeatureRequest.build(
+            settings: settings, profile: StreamSettingsResolver.profile(for: settings),
+            bitDepth: 0, chromaFormat: 0
+        )
+        XCTAssertEqual(features["reflex"] as? Bool, true)
+    }
+
+    func testCloudMatchInternalRejectionExplainsThatDecoderHasNotStarted() {
+        let error = NSError(domain: "OpenNOW.Session", code: 400, userInfo: [
+            NSLocalizedDescriptionKey: #"{"requestStatus":{"statusDescription":"INTERNAL_ERROR_STATUS 8A8C0000","statusCode":4}}"#
+        ])
+        let message = OpenNOWErrorPresenter.message(for: error, fallback: "Launch failed")
+        XCTAssertTrue(message.contains("8A8C0000"))
+        XCTAssertTrue(message.contains("Video decoding has not started"))
+    }
+
+    func testNativeReceiverSettingMigratesOffAndRoundTrips() throws {
+        let old = try JSONEncoder().encode(AppSettings.default)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: old) as? [String: Any])
+        object.removeValue(forKey: "experimentalNativeNVSTEnabled")
+        let migrated = try JSONDecoder().decode(AppSettings.self, from: JSONSerialization.data(withJSONObject: object))
+        XCTAssertFalse(migrated.experimentalNativeNVSTEnabled)
+        var native = migrated; native.experimentalNativeNVSTEnabled = true
+        XCTAssertTrue(try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(native)).experimentalNativeNVSTEnabled)
+        XCTAssertNotEqual(StreamSettingsResolver.sessionSignature(for: native), StreamSettingsResolver.sessionSignature(for: migrated))
+        XCTAssertEqual(native.preferredResolution, migrated.preferredResolution)
+        XCTAssertEqual(native.hdrEnabled, migrated.hdrEnabled)
+    }
+
+    func testNativeEndpointsRequireAdvertisedControlAndRetainExplicitHost() {
+        XCTAssertEqual(NativeStreamNVSTConfiguration.endpoints(sessionObj: ["connectionInfo": [["port": 443, "usage": 1, "resourcePath": "/nvst/"]]], fallbackHost: "old.example"), [])
+        XCTAssertEqual(NativeStreamNVSTConfiguration.endpoints(sessionObj: ["connectionInfo": [["port": 322, "usage": 16, "resourcePath": "rtsps://new.example:322"]]], fallbackHost: "old.example"), ["rtsps://new.example:322"])
+    }
+
+    func testNativeProvisioningPreservesQualityAndIdentityOnLaunchAndResume() throws {
+        for action: Int? in [nil, 2] {
+            var body: [String: Any] = ["sessionRequestData": [
+                "deviceHashId": "stable-device", "secureRTSPSupported": false,
+                "clientRequestMonitorSettings": [["widthInPixels": 3840, "heightInPixels": 2160, "framesPerSecond": 120, "sdrHdrMode": 1]],
+                "requestedStreamingFeatures": ["bitDepth": 1, "trueHdr": true],
+                "metaData": [["key": "GSStreamerType", "value": "WebRTC"], ["key": "wssignaling", "value": "1"]]
+            ]]
+            if let action { body["action"] = action; body["data"] = "RESUME" }
+            let original = try JSONSerialization.data(withJSONObject: NativeStreamNVSTConfiguration.requestBody(body, enabled: false), options: .sortedKeys)
+            XCTAssertEqual(original, try JSONSerialization.data(withJSONObject: body, options: .sortedKeys))
+            let converted = NativeStreamNVSTConfiguration.requestBody(body, enabled: true)
+            let native = try XCTUnwrap(converted["sessionRequestData"] as? [String: Any])
+            let before = try XCTUnwrap(body["sessionRequestData"] as? [String: Any])
+            XCTAssertEqual(native["secureRTSPSupported"] as? Bool, true)
+            XCTAssertEqual(native["deviceHashId"] as? String, "stable-device")
+            for key in ["clientRequestMonitorSettings", "requestedStreamingFeatures"] {
+                XCTAssertEqual(try JSONSerialization.data(withJSONObject: native[key]!, options: .sortedKeys), try JSONSerialization.data(withJSONObject: before[key]!, options: .sortedKeys))
+            }
+            XCTAssertEqual(native["metaData"] as? [[String: String]], [["key": "wssignaling", "value": "1"]])
+            XCTAssertEqual(converted["action"] as? Int, action)
+        }
+    }
+
+    func testNativeInputRebasesKeyboardAndGamepadTimestamps() throws {
+        let encoder = NativeStreamInputEncoder()
+        encoder.setProtocolVersion(4)
+        let key = encoder.encodeKeyDown(mapping: .init(virtualKey: 0x41, scanCode: 0x1e), modifiers: 1)
+        let outputs = try NativeStreamNVSTInput.translate(key, timestamp: 12345, sequence: 2)
+        guard case .control(let command) = outputs.first else { return XCTFail("Expected keyboard command") }
+        XCTAssertEqual(command.code, .remoteInput)
+        // The native keyboard envelope has a LE session timestamp at its tail.
+        XCTAssertEqual(Array(command.payload.suffix(8)), [0x39, 0x30, 0, 0, 0, 0, 0, 0])
+        XCTAssertEqual(Array(command.payload[16..<20]), [0, 0x41, 0, 1])
+        XCTAssertThrowsError(try NativeStreamNVSTInput.translate(Data([0x23, 1, 2]), timestamp: 0, sequence: 0))
+        // Web client gamepad event, explicit player slot 1 and bitmap 3.
+        var pad = [UInt8](repeating: 0, count: 38)
+        pad[0] = 12; pad[6] = 1; pad[8] = 3; pad[12] = 0; pad[13] = 0x10
+        let translated = try NativeStreamNVSTInput.translate(Data(pad), timestamp: 54321, sequence: 7)
+        guard case .gamepad(let packet) = translated.first else { return XCTFail("Expected gamepad packet") }
+        XCTAssertEqual(packet.gamepadIndex, 1); XCTAssertEqual(packet.connectedBitmap, 0x0303)
+        XCTAssertEqual(packet.timestampMicroseconds, 54321); XCTAssertEqual(packet.buttons, 0x1000)
+    }
+
+    @available(iOS 17.0, *)
+    func testNativeAV1PreservesHDRColorAndNeverRequestsEightBitOutputForTenBit() throws {
+        let data = try XCTUnwrap(Data(base64Encoded: "EgAKDQAAAAM3+ObXyoSIBIIyDxAAgAAAAEsPxmwcv/+vVg=="))
+        let sequence = try XCTUnwrap(NvstAv1Obu.units(in: data)?.first { $0.type == NvstAv1Obu.sequenceHeaderType })
+        let header = try XCTUnwrap(NvstAv1Obu.parseSequenceHeader(data.subdata(in: sequence.payloadOffset..<(sequence.payloadOffset+sequence.payloadLength))))
+        XCTAssertEqual(header.bitDepth, 10); XCTAssertEqual(header.colorPrimaries, 9)
+        XCTAssertEqual(header.transferCharacteristics, 16); XCTAssertEqual(header.matrixCoefficients, 9)
+        var format = NvstVideoToolboxDecoder.BitstreamFormat(); format.bitDepth = 10
+        let output = NvstVideoToolboxDecoder.preferredOutputPixelFormats(for: format)
+        XCTAssertFalse(output.contains(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange))
+        XCTAssertFalse(output.contains(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange))
+    }
+
+    func testAV1ConfigurationParsesRealSDRAndHDRSamples() throws {
+        // libaom encodes of a 128x72 flat frame; the HDR frame uses Y=600, UV=512.
+        for (encoded, depth, primaries, transfer) in [
+            ("EgAKDQAAAAM3+ObXyICAgIIyDxAAgAAAAEsX2PkL//rC4A==", 8, 1, 1),
+            ("EgAKDQAAAAM3+ObXyoSIBIIyDxAAgAAAAEsPxmwcv/+vVg==", 10, 9, 16)
+        ] {
+            let data = try XCTUnwrap(Data(base64Encoded: encoded))
+            let config = try XCTUnwrap(NativeStreamAV1Configuration.parse(data))
+            XCTAssertEqual(config.width, 128)
+            XCTAssertEqual(config.height, 72)
+            XCTAssertEqual(config.bitDepth, depth)
+            XCTAssertEqual(config.primaries, primaries)
+            XCTAssertEqual(config.transfer, transfer)
+            XCTAssertEqual(config.matrix, primaries)
+            XCTAssertEqual(config.codecConfiguration.prefix(4), Data([0x81, 0, depth == 10 ? 0x4c : 0x0c, 0]))
+            XCTAssertEqual(config.subsamplingX, 1)
+            XCTAssertEqual(config.subsamplingY, 1)
+            // Canonical configOBUs must round-trip, including a missing size field.
+            var withoutSize = config.sequenceOBU
+            withoutSize[0] &= ~2
+            withoutSize.remove(at: 1)
+            XCTAssertEqual(try NativeStreamAV1Configuration.parse(withoutSize), config)
+            for length in 3..<17 {
+                XCTAssertThrowsError(try NativeStreamAV1Configuration.parse(Data(data.prefix(length))))
+            }
+        }
+        XCTAssertThrowsError(try NativeStreamAV1Configuration.parse(Data([0x8a, 1, 0])))
+        XCTAssertThrowsError(try NativeStreamAV1Configuration.parse(Data([0x0a, 0x80])))
+    }
+
+    func testHDRPixelBufferBridgePreservesTenBitValuesAndColorAttachments() throws {
+        var buffer: CVPixelBuffer?
+        XCTAssertEqual(CVPixelBufferCreate(kCFAllocatorDefault, 16, 8,
+            kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+            [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &buffer), kCVReturnSuccess)
+        let source = try XCTUnwrap(buffer)
+        CVPixelBufferLockBaseAddress(source, [])
+        let pixels = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(source, 0)).assumingMemoryBound(to: UInt16.self)
+        pixels[0] = 601 << 6
+        CVPixelBufferUnlockBaseAddress(source, [])
+        CVBufferSetAttachment(source, kCVImageBufferColorPrimariesKey,
+            kCVImageBufferColorPrimaries_ITU_R_2020, .shouldPropagate)
+        CVBufferSetAttachment(source, kCVImageBufferTransferFunctionKey,
+            kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, .shouldPropagate)
+        let frame = RTCVideoFrame(buffer: RTCCVPixelBuffer(pixelBuffer: source), rotation: ._0, timeStampNs: 0)
+        let output = try XCTUnwrap(NativeStreamFramePixelBufferBridge().pixelBuffer(for: frame))
+        XCTAssertTrue(output === source)
+        XCTAssertEqual(CVPixelBufferGetPixelFormatType(output), kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+        XCTAssertEqual(NativeStreamHDRTransfer.detect(in: output), .pq)
+        CVPixelBufferLockBaseAddress(output, .readOnly)
+        XCTAssertEqual(try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(output, 0)).assumingMemoryBound(to: UInt16.self)[0] >> 6, 601)
+        CVPixelBufferUnlockBaseAddress(output, .readOnly)
+    }
+
+    func testCloudMatchColorReplyRecognizesTenBitEnumsAndSDRDowngrade() {
+        XCTAssertEqual(CloudMatchStreamingFeatureRequest.normalizedColorQuality(bitDepth: 1, chromaFormat: 0), .tenBit420)
+        XCTAssertEqual(CloudMatchStreamingFeatureRequest.normalizedColorQuality(bitDepth: 1, chromaFormat: 1), .tenBit444)
+        XCTAssertEqual(CloudMatchStreamingFeatureRequest.normalizedColorQuality(bitDepth: 0, chromaFormat: 0), .eightBit420)
+        XCTAssertEqual(CloudMatchStreamingFeatureRequest.normalizedColorQuality(bitDepth: 0, chromaFormat: 1), .eightBit444)
+        XCTAssertNil(CloudMatchStreamingFeatureRequest.normalizedColorQuality(bitDepth: nil, chromaFormat: nil))
+    }
+
+    func testCloudMatchUsesEnumsForTenBitAnd444WhileSDPUsesLiteralDepth() {
+        var settings = AppSettings.default
+        for color in StreamColorQuality.allCases {
+            settings.preferredColorQuality = color.rawValue
+            let features = CloudMatchStreamingFeatureRequest.build(settings: settings,
+                profile: StreamSettingsResolver.profile(for: settings),
+                bitDepth: color.bitDepth, chromaFormat: color.chromaFormat)
+            XCTAssertEqual(features["bitDepth"] as? Int, color == .tenBit420 || color == .tenBit444 ? 1 : 0)
+            XCTAssertEqual(features["chromaFormat"] as? Int, color == .eightBit444 || color == .tenBit444 ? 1 : 0)
+        }
+        settings.preferredColorQuality = StreamColorQuality.eightBit420.rawValue
+        settings.hdrEnabled = true
+        let sdp = NativeStreamSDP.buildNvstSDP(offerSDP: "", localAnswerSDP: "",
+            profile: StreamSettingsResolver.profile(for: settings), settings: settings, codec: .av1)
+        XCTAssertTrue(sdp.contains("a=video.bitDepth:10"))
+    }
+
+    func testAV1HeaderScannerSkipsLargeFramePayloadAndHandlesSlicedData() throws {
+        let sequence = try XCTUnwrap(Data(base64Encoded: "EgAKDQAAAAM3+ObXyoSIBIIyDxAAgAAAAEsPxmwcv/+vVg=="))
+        let expected = try XCTUnwrap(NativeStreamAV1Configuration.parse(sequence))
+        // A sized frame OBU containing 512 KiB of compressed bytes must be skipped,
+        // not interpreted as configuration. Follow it with a genuine sequence header.
+        var bytes = Data([0x32, 0x80, 0x80, 0x20])
+        bytes.append(Data(repeating: 0xff, count: 512 * 1024))
+        XCTAssertNil(try NativeStreamAV1Configuration.parse(bytes))
+        bytes.append(sequence)
+        XCTAssertEqual(try NativeStreamAV1Configuration.parse(bytes), expected)
+        var padded = Data([0xff, 0xff])
+        padded.append(bytes)
+        XCTAssertEqual(try NativeStreamAV1Configuration.parse(padded.dropFirst(2)), expected)
+    }
+
+    func testAsyncDecodeAdmissionBoundsWorkAndReturnsEachSlotOnce() throws {
+        let admission = NativeStreamDecodeAdmission(maximumInFlight: 2)
+        let first = try XCTUnwrap(admission.acquire(timeout: .now()))
+        let second = try XCTUnwrap(admission.acquire(timeout: .now()))
+        XCTAssertNil(admission.acquire(timeout: .now()), "Cannot accumulate a hardware decode backlog")
+        first.complete()
+        first.complete() // An error return and callback must not release two slots.
+        let third = try XCTUnwrap(admission.acquire(timeout: .now()))
+        XCTAssertNil(admission.acquire(timeout: .now()))
+        second.complete()
+        third.complete()
+        var cancelled = try XCTUnwrap(admission.acquire(timeout: .now())) as NativeStreamDecodeAdmission.Permit?
+        cancelled = nil // A cancelled callback returns admission when released.
+        XCTAssertNil(cancelled)
+        let recovered = try XCTUnwrap(admission.acquire(timeout: .now()))
+        let other = try XCTUnwrap(admission.acquire(timeout: .now()))
+        XCTAssertNil(admission.acquire(timeout: .now()))
+        recovered.complete()
+        other.complete()
+    }
+
+    func testRendererDropsBacklogAndResumesWithNewestFrame() throws {
+        let mailbox = NativeStreamLatestFrameMailbox<Int>()
+        mailbox.offer(1)
+        XCTAssertEqual(try XCTUnwrap(mailbox.take()).frame, 1)
+        mailbox.offer(2)
+        XCTAssertEqual(try XCTUnwrap(mailbox.take()).frame, 2)
+        // Simulate a stalled GPU while decoded video continues arriving.
+        for frame in 3...240 { mailbox.offer(frame) }
+        XCTAssertNil(mailbox.take(), "GPU submissions stay bounded")
+        mailbox.complete()
+        XCTAssertEqual(try XCTUnwrap(mailbox.take()).frame, 240, "Resume at the latest frame, without replaying stale video")
+        mailbox.complete()
+        mailbox.complete()
+        XCTAssertNil(mailbox.take(), "A display tick must not resubmit the same frame")
+        mailbox.offer(241)
+        XCTAssertEqual(try XCTUnwrap(mailbox.take()).frame, 241)
+        mailbox.complete()
+    }
+
+    func testSoftwareI420BridgeCopiesPaddedPlanesAndInterleavesChroma() throws {
+        let bridge = NativeStreamFramePixelBufferBridge()
+        for (width, height) in [(6, 4), (8, 6)] {
+            let source = RTCMutableI420Buffer(width: Int32(width), height: Int32(height), strideY: Int32(width + 4), strideU: Int32(width / 2 + 3), strideV: Int32(width / 2 + 5))
+            for row in 0..<height {
+                for col in 0..<width { source.mutableDataY[row * Int(source.strideY) + col] = UInt8(32 + row * width + col) }
+            }
+            for row in 0..<(height / 2) {
+                for col in 0..<(width / 2) {
+                    source.mutableDataU[row * Int(source.strideU) + col] = UInt8(70 + row * width / 2 + col)
+                    source.mutableDataV[row * Int(source.strideV) + col] = UInt8(150 + row * width / 2 + col)
+                }
+            }
+            let frame = RTCVideoFrame(buffer: source, rotation: ._0, timeStampNs: 123)
+            let output = try XCTUnwrap(bridge.pixelBuffer(for: frame))
+            XCTAssertEqual(CVPixelBufferGetWidth(output), width)
+            XCTAssertEqual(CVPixelBufferGetHeight(output), height)
+            XCTAssertEqual(CVPixelBufferGetPixelFormatType(output), kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+            CVPixelBufferLockBaseAddress(output, .readOnly)
+            let y = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(output, 0)).assumingMemoryBound(to: UInt8.self)
+            let uv = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(output, 1)).assumingMemoryBound(to: UInt8.self)
+            for row in 0..<height {
+                for col in 0..<width { XCTAssertEqual(y[row * CVPixelBufferGetBytesPerRowOfPlane(output, 0) + col], UInt8(32 + row * width + col)) }
+            }
+            for row in 0..<(height / 2) {
+                for col in 0..<(width / 2) {
+                    let offset = row * CVPixelBufferGetBytesPerRowOfPlane(output, 1) + col * 2
+                    XCTAssertEqual(uv[offset], UInt8(70 + row * width / 2 + col))
+                    XCTAssertEqual(uv[offset + 1], UInt8(150 + row * width / 2 + col))
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(output, .readOnly)
+            let nativeFrame = RTCVideoFrame(buffer: RTCCVPixelBuffer(pixelBuffer: output), rotation: ._0, timeStampNs: 123)
+            XCTAssertTrue(try XCTUnwrap(bridge.pixelBuffer(for: nativeFrame)) === output)
+        }
+    }
+
     func testAccountSnapshotRoundTripsSubscriptionStorageAndConnections() throws {
         let storage = StorageAddon(
             type: "STORAGE",
@@ -221,6 +834,33 @@ final class OpenNOWiOSParityTests: XCTestCase {
         a=candidate:1 1 udp 2122260223 \(address) \(port) typ host generation 0
         a=rtpmap:96 H264/90000
         """
+    }
+
+    func testFixedFPSRequestDisablesHostDynamicFrameControlWithoutChangingHDR() {
+        for fps in [60, 120, 240] {
+            for codec in [NativeStreamVideoCodec.av1, .h265] {
+                var settings = AppSettings.default
+                settings.preferredFPS = fps
+                settings.preferredResolution = "3840x2160"
+                settings.hdrEnabled = true
+                settings.preferredColorQuality = StreamColorQuality.tenBit420.rawValue
+                let profile = StreamVideoProfile(width: 3840, height: 2160, fps: fps, maxBitrateKbps: 100_000)
+                let offer = "a=vqos.resControl.enable:1\na=vqos.resControl.dfc.adjustResAndFps:1\na=vqos.resControl.dfc.maxResLevels:5\n"
+                let sdp = NativeStreamSDP.buildNvstSDP(offerSDP: offer, localAnswerSDP: "",
+                    profile: profile, settings: settings, codec: codec)
+                XCTAssertTrue(sdp.contains("a=vqos.dfc.enable:0\n"))
+                XCTAssertFalse(sdp.contains("a=vqos.dfc.enable:1\n"))
+                for key in ["vqos.resControl.enable", "vqos.resControl.dfc.adjustResAndFps", "vqos.resControl.dfc.maxResLevels"] {
+                    XCTAssertTrue(sdp.contains("a=\(key):0\n"))
+                    XCTAssertEqual(sdp.components(separatedBy: "a=\(key):").count - 1, 1)
+                }
+                XCTAssertFalse(sdp.contains("a=vqos.dfc.decodeFpsAdjPercent:"))
+                XCTAssertTrue(sdp.contains("a=video.maxFPS:\(fps)\n"))
+                XCTAssertTrue(sdp.contains("a=video.bitDepth:10\n"))
+                XCTAssertTrue(sdp.contains("a=video.dynamicRangeMode:1\n"))
+                XCTAssertTrue(sdp.contains("a=video.clientViewportWd:3840\n"))
+            }
+        }
     }
 
     func testNvstRequestMatchesAndroidStartupAndPacingContract() {

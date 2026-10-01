@@ -589,6 +589,12 @@ struct SettingsView: View {
             Toggle("HDR", isOn: $store.settings.hdrEnabled)
                 .disabled(!hdrAvailable)
 
+            if NativeStreamVideoCodec.normalized(store.settings.preferredCodec) == .h264 {
+                Text("H.264 streams use 8-bit SDR. Select H.265 or AV1 for 10-bit HDR.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
             Toggle("Stream Sharpening", isOn: $store.settings.streamSharpeningEnabled)
 
             if store.settings.streamSharpeningEnabled {
@@ -604,7 +610,11 @@ struct SettingsView: View {
                 }
             }
 
-            Toggle("Native Low-Latency Decoder", isOn: $store.settings.nativeStreamerEnabled)
+            HStack {
+                Text("Video Decoder")
+                Spacer()
+                Text("Native").foregroundStyle(.secondary)
+            }
             Toggle("Apple Performance HUD", isOn: $store.settings.showMetalPerformanceHUD)
         } header: {
             Text("Video")
@@ -613,7 +623,7 @@ struct SettingsView: View {
                 if !hdrAvailable {
                     Text(hdrUnavailableReason)
                 }
-                Text("The native decoder cuts a frame or two of latency. Turn it off if the picture tears or stutters.")
+                Text("Streaming uses the native decoder. Check Codec Diagnostics under Advanced for hardware codec support.")
                 Text("The Apple performance HUD is the system's own GPU readout drawn over the video. It is off unless you turn it on here — OpenNOW's stats overlay covers what most people need, and the system one sits on top of the game.")
             }
         }
@@ -629,6 +639,14 @@ struct SettingsView: View {
                 }
                 ForEach(store.availableRegions) { region in
                     Text(region.name).tag(region.url)
+                }
+            }
+
+            if #available(iOS 17.0, *) {
+                Toggle("Native NVST Receiver (Experimental)", isOn: $store.settings.experimentalNativeNVSTEnabled)
+                if store.settings.experimentalNativeNVSTEnabled {
+                    Text("Uses a dedicated video receiver and native timing feedback. Start or resume a session after changing this option.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             }
 
