@@ -2384,12 +2384,13 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(device.availableSupportedControllers, [])
         XCTAssertEqual(StreamSettingsResolver.colorQuality(for: settings), .tenBit444)
         XCTAssertTrue(settings.hdrEnabled)
-        XCTAssertEqual(StreamDeviceProfile.resolve(game: desktopGame, settings: settings, keyboardMouseConnected: true), .desktop)
+        XCTAssertEqual(StreamDeviceProfile.resolve(game: desktopGame, settings: settings, keyboardMouseConnected: true), .desktopTouch)
         settings.touch.nativeTouchMode = .never
         XCTAssertEqual(StreamDeviceProfile.resolve(game: touchGame, settings: settings, keyboardMouseConnected: false), .desktop)
         settings.touch.nativeTouchMode = .automatic
         XCTAssertEqual(StreamDeviceProfile.resolve(game: desktopGame, settings: settings, keyboardMouseConnected: false), .desktop)
         XCTAssertEqual(StreamDeviceProfile.resolve(game: touchGame, settings: settings, keyboardMouseConnected: false), .desktopTouch)
+        XCTAssertEqual(StreamDeviceProfile.resolve(game: touchGame, settings: settings, keyboardMouseConnected: true), .desktop)
     }
 
     func testNativeTouchClaimRetainsInputProfileAnd420Behavior() {
@@ -2425,7 +2426,7 @@ final class OpenNOWiOSParityTests: XCTestCase {
         settings.preferredColorQuality = StreamColorQuality.tenBit444.rawValue
         settings.touch.nativeTouchMode = .always
         let desktop = StreamSettingsResolver.sessionSignature(for: settings)
-        XCTAssertTrue(desktop.contains("provisioning=desktop-444-v1"))
+        XCTAssertTrue(desktop.contains("provisioning=desktop-444-v2"))
         settings.experimentalDesktop444TouchEnabled = true
         let touch = StreamSettingsResolver.sessionSignature(for: settings)
         XCTAssertNotEqual(desktop, touch)
@@ -2440,6 +2441,55 @@ final class OpenNOWiOSParityTests: XCTestCase {
         let old420 = StreamSettingsResolver.sessionSignature(for: settings)
         settings.experimentalDesktop444TouchEnabled = false
         XCTAssertEqual(StreamSettingsResolver.sessionSignature(for: settings), old420)
+    }
+
+    func testAlwaysTouchProvisioningAndInitialRouteOverridePhysicalInput() {
+        let game = Self.makeGame(title: "Touch Game", controls: ["TOUCHSCREEN"])
+        XCTAssertTrue(NativeTouchSupport.shouldProvisionNativeTouch(mode: .always, game: game,
+            keyboardMouseConnected: true))
+        XCTAssertTrue(NativeTouchSupport.shouldStartWithNativeTouch(mode: .always, game: game,
+            keyboardMouseConnected: true, provisioned: true, preferVirtualController: false))
+        XCTAssertFalse(NativeTouchSupport.shouldStartWithNativeTouch(mode: .always, game: game,
+            keyboardMouseConnected: true, provisioned: false, preferVirtualController: false))
+        XCTAssertFalse(NativeTouchSupport.shouldStartWithNativeTouch(mode: .always, game: game,
+            keyboardMouseConnected: false, provisioned: true, preferVirtualController: true))
+        XCTAssertFalse(NativeTouchSupport.shouldStartWithNativeTouch(mode: .automatic, game: game,
+            keyboardMouseConnected: true, provisioned: true, preferVirtualController: false))
+        XCTAssertTrue(NativeTouchSupport.shouldStartWithNativeTouch(mode: .automatic, game: game,
+            keyboardMouseConnected: false, provisioned: true, preferVirtualController: false))
+        XCTAssertFalse(NativeTouchSupport.shouldStartWithNativeTouch(mode: .never, game: game,
+            keyboardMouseConnected: false, provisioned: true, preferVirtualController: false))
+        var settings = AppSettings.default
+        settings.touch.nativeTouchMode = .always
+        XCTAssertEqual(StreamDeviceProfile.resolve(game: game, settings: settings,
+            keyboardMouseConnected: true), .touch)
+    }
+
+    func testNVSTTouchTranslationPreservesContactsAndUsesSessionClock() throws {
+        for version in [2, 3, 4] {
+            let encoder = NativeStreamInputEncoder()
+            encoder.setProtocolVersion(version)
+            let source = try XCTUnwrap(encoder.encodeTouchBatch([
+                NativeTouchRecord(slot: 0, phase: NativeTouchPhase.down, x: 0x1234, y: 0x5678,
+                    radiusX: 7, radiusY: 9, timestampUs: 99),
+                NativeTouchRecord(slot: 1, phase: NativeTouchPhase.up, x: 0xFFFF, y: 0, timestampUs: 100)
+            ]))
+            let stamp: UInt64 = 0x0102_0304_0506_0708
+            let translated = try NativeStreamNVSTInput.translate(source, timestamp: stamp, sequence: 9)
+            XCTAssertEqual(translated.count, 1)
+            guard case .touch(let command, let count) = translated.first else {
+                return XCTFail("Expected one reliable native touch command")
+            }
+            XCTAssertEqual(count, 2)
+            XCTAssertEqual(command.code, .remoteInput)
+            let body = Data([0, 40, 0, 2,
+                0, 1, 0x12, 0x34, 0x56, 0x78, 7, 9, 1, 2, 3, 4, 5, 6, 7, 8,
+                1, 2, 0xFF, 0xFF, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8])
+            let expected = NvstRemoteInput.framed(NvstRemoteInput.packet(type: .lowLevelTouch, body: body),
+                framing: .enveloped, sequence: 9, timestampMicroseconds: stamp)
+            XCTAssertEqual(command.payload, expected, "Input protocol \(version)")
+            XCTAssertThrowsError(try NativeStreamNVSTInput.translate(Data(source.dropLast()), timestamp: stamp, sequence: 10))
+        }
     }
 
     // MARK: - Failure classification

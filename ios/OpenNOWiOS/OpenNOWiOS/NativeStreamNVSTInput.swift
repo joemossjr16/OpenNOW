@@ -3,7 +3,10 @@ import Foundation
 /// Converts the existing iOS input bridge's Geronimo packets to the native control wire.
 /// All native timestamps use the same session clock as video acknowledgements.
 struct NativeStreamNVSTInput {
-    enum Output { case control(NvstControlCommand), gamepad(NvstGamepadPacket), heartbeat }
+    enum Output {
+        case control(NvstControlCommand), gamepad(NvstGamepadPacket), heartbeat
+        case touch(NvstControlCommand, records: Int)
+    }
     enum InputError: Error { case malformed, unsupported(UInt32) }
 
     static func translate(_ data: Data, timestamp: UInt64, sequence: UInt16) throws -> [Output] {
@@ -69,7 +72,9 @@ struct NativeStreamNVSTInput {
             // Native RI adds its BE length word before the existing type/body.
             var writer = NvstByteWriter(capacity: bytes.count + 4)
             writer.u32BE(UInt32(bytes.count)); writer.bytes(bytes)
-            packet = writer.data
+            return [.touch(NvstControlCommand(code: .remoteInput, payload:
+                NvstRemoteInput.framed(writer.data, framing: .enveloped,
+                    sequence: sequence, timestampMicroseconds: timestamp)), records: count)]
         default: throw InputError.unsupported(type)
         }
         return [.control(NvstControlCommand(code: .remoteInput, payload:

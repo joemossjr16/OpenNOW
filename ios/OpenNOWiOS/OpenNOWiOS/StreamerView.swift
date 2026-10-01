@@ -2692,14 +2692,15 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         self.fingerMouseEnabled = settings.fingerMouseEnabled
         self.phoneRumbleFallbackEnabled = settings.phoneRumbleFallback
         let keyboardMouseConnected = NativeStreamPhysicalInput.keyboardOrMouseConnected
-        let nativeTouchAvailable = session.touchProvisioned != false
-            && NativeTouchSupport.shouldUseNativeTouchForStream(
+        let nativeTouchAvailable = NativeTouchSupport.shouldStartWithNativeTouch(
                 mode: settings.touch.nativeTouchMode,
                 game: session.game,
+                keyboardMouseConnected: keyboardMouseConnected,
+                provisioned: session.touchProvisioned,
                 preferVirtualController: settings.streamerPreferences.touchControllerVisible
             )
         self.physicalKeyboardMouseConnected = keyboardMouseConnected
-        self.streamInputMode = nativeTouchAvailable && !keyboardMouseConnected
+        self.streamInputMode = nativeTouchAvailable
             ? .nativeTouch
             : .keyboardMouse
         self.pendingInputModePrompt = nil
@@ -2914,6 +2915,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             packetsLostDelta: lostDelta, packetsReceivedDelta: packetsDelta, packetLossPercent: loss,
             resolution: resolution, codec: selectedCodec.rawValue.uppercased(), networkKind: deviceStatus.networkTransport.sessionNetworkKind))
         NativeStreamVideoPerformanceLog.record("native transport received=\(receivedFPS ?? 0) decoded=\(decodedFPS ?? 0) bitrate=\(bitrate ?? 0) kbps hardware=\(sample.hardware) color=\(receivedColorMode)")
+        NativeStreamVideoPerformanceLog.record("native-input mode=\(liveSettings.touch.nativeTouchMode.rawValue) requested=\(session.touchProvisioned.map(String.init) ?? "unknown") active=\(nativeTouchActive) capture=\(nativeTouchCaptureEnabled) physical=\(physicalKeyboardMouseConnected) controller=\(streamerPreferences.touchControllerVisible)")
         lastStatsSampleAt = now; lastStatsFramesReceived = received; lastStatsFramesDecoded = decoded
         lastStatsBytesReceived = bytes; lastStatsPacketsLost = lost; lastStatsPacketsReceived = packets
     }

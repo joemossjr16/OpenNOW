@@ -79,6 +79,9 @@ actor NativeStreamNVST: NativeStreamNVSTTransport {
     private var lastProgressAt = Date()
     private var lastDecoded: UInt64 = 0
     private var didFail = false
+    private var touchPacketsSent = 0
+    private var touchRecordsSent = 0
+    private var touchSendFailures = 0
 
     init(allocation: ActiveSession, settings: AppSettings, profile: StreamVideoProfile,
          codec: NativeStreamVideoCodec, displayFPS: Int,
@@ -331,6 +334,15 @@ actor NativeStreamNVST: NativeStreamNVSTTransport {
                 switch output {
                 case .heartbeat: break // NVST's control keepalive already maintains liveness.
                 case .control(let command): sent = bundle.sendControl(command) && sent
+                case .touch(let command, let records):
+                    let accepted = bundle.sendControl(command)
+                    if accepted {
+                        touchPacketsSent += 1
+                        touchRecordsSent += records
+                    } else {
+                        touchSendFailures += 1
+                    }
+                    sent = accepted && sent
                 case .gamepad(let pad):
                     if pad.connectedBitmap != registeredBitmap {
                         registeredBitmap = pad.connectedBitmap
@@ -367,6 +379,7 @@ actor NativeStreamNVST: NativeStreamNVSTTransport {
 
     private func sample() async {
         guard !stopped, let receiver, let decoder, let pipeline else { return }
+        Self.log("native-iOS touch inputReady=\(activatedInput) packetsSent=\(touchPacketsSent) recordsSent=\(touchRecordsSent) sendFailures=\(touchSendFailures)")
         let stats = receiver.stats
         if let ssrc = stats.boundSSRC { feedback.updateMediaSSRC(ssrc) }
         let decoded = decoder.decodedFrameCount

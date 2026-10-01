@@ -498,8 +498,8 @@ struct ActiveSession: Identifiable, Codable, Equatable {
     var negotiatedStreamProfile: NegotiatedStreamProfile? = nil
     var requestedStreamingFeatures: StreamingFeatures? = nil
     var finalizedStreamingFeatures: StreamingFeatures? = nil
-    /// Whether this session was requested with `appLaunchMode: touchFriendly`, and therefore
-    /// whether the host has a digitizer to receive contacts at all.
+    /// Whether this session was requested with `appLaunchMode: touchFriendly`.
+    /// This records the request, not host acknowledgment of a working digitizer.
     ///
     /// The host provisions its input devices when the session is created and never revisits them,
     /// so this cannot be recomputed later from the current settings — flipping the touch setting
@@ -1994,7 +1994,7 @@ enum StreamSettingsResolver {
         // Changing the allocation identity needs a new host session, even if
         // resolution, codec and the saved touch preference are unchanged.
         if requiresDesktopColorProvisioning(for: settings) {
-            signature.append("provisioning=desktop-444-v1")
+            signature.append("provisioning=desktop-444-v2")
             signature.append("desktopTouch=\(settings.experimentalDesktop444TouchEnabled ? settings.touch.nativeTouchMode.rawValue : "off")")
         }
         return signature.joined(separator: ";")
@@ -2928,6 +2928,13 @@ enum StreamDeviceProfile: Equatable {
     /// Color delivery and actual host touch support require a live comparison.
     case desktopTouch
 
+    /// A bounded diagnostic of the input envelope requested, not a host capability assertion.
+    func recordInputRequest(settings: AppSettings, keyboardMouseConnected: Bool, action: String) {
+        #if os(iOS) && canImport(WebRTC)
+        NativeStreamVideoPerformanceLog.record("input-profile action=\(action) os=\(nvDeviceOS) type=\(nvDeviceType) launchMode=\(appLaunchMode.rawValue) touchMode=\(settings.touch.nativeTouchMode.rawValue) physical=\(keyboardMouseConnected) experimental444=\(settings.experimentalDesktop444TouchEnabled) color=\(StreamSettingsResolver.colorQuality(for: settings).rawValue) HDR=\(settings.hdrEnabled)")
+        #endif
+    }
+
     static func resolve(game: CloudGame, settings: AppSettings,
                         keyboardMouseConnected: Bool, touchProvisionedOverride: Bool? = nil) -> Self {
         // A live 5080h/B40 comparison delivered 4:2:0 and HDR off under the
@@ -2936,13 +2943,13 @@ enum StreamDeviceProfile: Equatable {
         // verified desktop 4:4:4 path and finger mouse/controller input.
         if StreamSettingsResolver.requiresDesktopColorProvisioning(for: settings) {
             let touchRequested = touchProvisionedOverride
-                ?? (NativeTouchSupport.shouldUseNativeTouch(mode: settings.touch.nativeTouchMode, game: game)
-                    && !keyboardMouseConnected)
+                ?? NativeTouchSupport.shouldProvisionNativeTouch(mode: settings.touch.nativeTouchMode,
+                    game: game, keyboardMouseConnected: keyboardMouseConnected)
             return settings.experimentalDesktop444TouchEnabled && touchRequested ? .desktopTouch : .desktop
         }
         if let touchProvisionedOverride { return touchProvisionedOverride ? .touch : .desktop }
-        return NativeTouchSupport.shouldUseNativeTouch(mode: settings.touch.nativeTouchMode, game: game)
-            && !keyboardMouseConnected ? .touch : .desktop
+        return NativeTouchSupport.shouldProvisionNativeTouch(mode: settings.touch.nativeTouchMode,
+            game: game, keyboardMouseConnected: keyboardMouseConnected) ? .touch : .desktop
     }
 
     var appLaunchMode: GFNAppLaunchMode {
@@ -4033,7 +4040,11 @@ private actor GFNAPIClient {
         let token = session.tokens.idToken ?? session.tokens.accessToken
         let baseSource = streamingBaseUrl ?? session.provider.streamingServiceUrl
         let base = baseSource.hasSuffix("/") ? String(baseSource.dropLast()) : baseSource
-        let deviceProfile = Self.streamDeviceProfile(for: game, settings: settings)
+        let physicalInputConnected = NativeStreamPhysicalInput.keyboardOrMouseConnected
+        let deviceProfile = StreamDeviceProfile.resolve(game: game, settings: settings,
+            keyboardMouseConnected: physicalInputConnected)
+        deviceProfile.recordInputRequest(settings: settings, keyboardMouseConnected: physicalInputConnected,
+            action: "create")
         let sessionQuery = URLQueryItemEncoder.encode([
             "keyboardLayout": StreamSettingsResolver.normalizedKeyboardLayout(settings.keyboardLayout),
             "languageCode": StreamSettingsResolver.normalizedGameLanguage(settings.gameLanguage)
@@ -4432,9 +4443,12 @@ private actor GFNAPIClient {
         // Claiming repeats the session request body. During recovery, retain the input device
         // profile chosen when this allocation was created instead of letting a transient hot-plug
         // silently change a touch session into a controller session (or vice versa).
+        let physicalInputConnected = NativeStreamPhysicalInput.keyboardOrMouseConnected
         let deviceProfile = StreamDeviceProfile.resolve(game: game, settings: settings,
-            keyboardMouseConnected: NativeStreamPhysicalInput.keyboardOrMouseConnected,
+            keyboardMouseConnected: physicalInputConnected,
             touchProvisionedOverride: touchProvisionedOverride)
+        deviceProfile.recordInputRequest(settings: settings, keyboardMouseConnected: physicalInputConnected,
+            action: "claim")
         let zoneBase = Self.normalizedStreamingBase(streamingBaseUrl, vpcId: vpcId)
         var effectiveServerIp = Self.remoteSessionTargetHost(
             serverIp: candidate.serverIp,
@@ -5978,20 +5992,6 @@ private actor GFNAPIClient {
             "hdrEdrSupportedFlagsInUint32": 1,
             "staticMetadataDescriptorId": 0
         ]
-    }
-
-    /// Which CloudMatch identity — and therefore which `appLaunchMode` — this session is created
-    /// under.
-    ///
-    /// Native 4:4:4 needs the desktop color envelope. Other native-touch requests
-    /// keep the digitizer profile, including their resolution/FPS choices. The
-    /// resulting `touchProvisioned` flag also gates the live touch sender.
-    private static func streamDeviceProfile(
-        for game: CloudGame,
-        settings: AppSettings
-    ) -> StreamDeviceProfile {
-        StreamDeviceProfile.resolve(game: game, settings: settings,
-            keyboardMouseConnected: NativeStreamPhysicalInput.keyboardOrMouseConnected)
     }
 
     private static func generatePKCE() -> (verifier: String, challenge: String) {
