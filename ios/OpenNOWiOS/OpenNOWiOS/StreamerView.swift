@@ -6604,9 +6604,9 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         guard source.width > 0, source.height > 0, target.width > 0, target.height > 0 else {
             return CGRect(origin: .zero, size: target)
         }
-        let scale = min(target.width / source.width, target.height / source.height)
-        let width = source.width * scale
-        let height = source.height * scale
+        let fitted = NativeStreamVideoEffectsPolicy.presentationSize(source: source, display: target, stretch: false)
+        let width = fitted.width
+        let height = fitted.height
         return CGRect(
             x: (target.width - width) / 2,
             y: (target.height - height) / 2,

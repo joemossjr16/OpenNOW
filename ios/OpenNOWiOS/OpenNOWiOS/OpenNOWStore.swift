@@ -886,6 +886,7 @@ struct AppSettings: Codable, Equatable {
     var enableL4S: Bool
     var enableCloudGsync: Bool
     var metalFXUpscalingEnabled: Bool = false
+    var metalFXQualityPreset: MetalFXQualityPreset = .manual
     var frameGenerationEnabled: Bool = false
     var streamSharpeningEnabled: Bool = false
     var streamSharpeningAmount: Double = 0.25
@@ -997,6 +998,7 @@ struct AppSettings: Codable, Equatable {
         case enableL4S
         case enableCloudGsync
         case metalFXUpscalingEnabled
+        case metalFXQualityPreset
         case frameGenerationEnabled
         case streamSharpeningEnabled
         case streamSharpeningAmount
@@ -1120,6 +1122,7 @@ struct AppSettings: Codable, Equatable {
         enableL4S = try container.decodeIfPresent(Bool.self, forKey: .enableL4S) ?? false
         enableCloudGsync = try container.decodeIfPresent(Bool.self, forKey: .enableCloudGsync) ?? false
         metalFXUpscalingEnabled = try container.decodeIfPresent(Bool.self, forKey: .metalFXUpscalingEnabled) ?? false
+        metalFXQualityPreset = try container.decodeIfPresent(MetalFXQualityPreset.self, forKey: .metalFXQualityPreset) ?? .manual
         frameGenerationEnabled = try container.decodeIfPresent(Bool.self, forKey: .frameGenerationEnabled) ?? false
         streamSharpeningEnabled = try container.decodeIfPresent(Bool.self, forKey: .streamSharpeningEnabled) ?? false
         streamSharpeningAmount = try container.decodeIfPresent(Double.self, forKey: .streamSharpeningAmount) ?? 0.25
@@ -1784,6 +1787,30 @@ enum StreamSettingsResolver {
     static func choices(forAspectRatio aspectRatio: String) -> [StreamResolutionChoice] {
         let normalizedAspect = normalizedAspectRatio(aspectRatio)
         return resolutionChoices.filter { $0.aspectRatio == normalizedAspect }
+    }
+
+    static func metalFXResolution(preset: MetalFXQualityPreset, aspectRatio: String,
+                                  displaySize: CGSize, stretch: Bool, membershipTier: String?) -> StreamResolutionChoice? {
+        guard let scale = preset.inputScale else { return nil }
+        return choices(forAspectRatio: aspectRatio).filter { choice in
+            guard isResolutionAvailable(choice, membershipTier: membershipTier) else { return false }
+            let source = pixelSize(choice.value)
+            let target = NativeStreamVideoEffectsPolicy.presentationSize(source: source, display: displaySize, stretch: stretch)
+            return NativeStreamVideoEffectsPolicy.upscaleSize(source: source, destination: target) != nil
+        }.min { left, right in
+            func distance(_ choice: StreamResolutionChoice) -> CGFloat {
+                let source = pixelSize(choice.value)
+                let target = NativeStreamVideoEffectsPolicy.presentationSize(source: source, display: displaySize, stretch: stretch)
+                return abs(source.width / target.width - scale) + abs(source.height / target.height - scale)
+            }
+            return distance(left) < distance(right)
+        }
+    }
+
+    static func pixelSize(_ resolution: String) -> CGSize {
+        let values = resolution.split(separator: "x").compactMap { Double($0) }
+        guard values.count == 2 else { return .zero }
+        return CGSize(width: values[0], height: values[1])
     }
 
     static func resolutionChoice(value: String, aspectRatio: String) -> StreamResolutionChoice? {

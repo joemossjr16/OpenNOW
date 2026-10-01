@@ -77,9 +77,9 @@ enum NativeStreamVideoPerformanceLog { static func record(_ text: String) { prin
   let device = MTLCreateSystemDefaultDevice()!, queue = device.makeCommandQueue()!
   let context = CIContext(mtlDevice: device, options: [.cacheIntermediates: false])
   let generator = NativeStreamFrameGenerator()
-  func source(offset: Int) -> CVPixelBuffer {
+  func source(offset: Int, hdr: Bool) -> CVPixelBuffer {
    var allocation: CVPixelBuffer?
-   precondition(CVPixelBufferCreate(nil, 1920, 1080, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+   precondition(CVPixelBufferCreate(nil, 1920, 1080, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
     [kCVPixelBufferIOSurfacePropertiesKey: [:], kCVPixelBufferMetalCompatibilityKey: true] as CFDictionary, &allocation) == kCVReturnSuccess)
    let value = allocation!
    CVPixelBufferLockBaseAddress(value, [])
@@ -89,12 +89,13 @@ enum NativeStreamVideoPerformanceLog { static func record(_ text: String) { prin
    let stride = CVPixelBufferGetBytesPerRowOfPlane(value, 0)
    for y in 300..<700 { for x in (600+offset)..<(900+offset) { base[y*stride+x] = 220 } }
    CVPixelBufferUnlockBaseAddress(value, [])
-   CVBufferSetAttachment(value, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
-   CVBufferSetAttachment(value, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
-   CVBufferSetAttachment(value, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
+   CVBufferSetAttachment(value, kCVImageBufferColorPrimariesKey, hdr ? kCVImageBufferColorPrimaries_ITU_R_2020 : kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
+   CVBufferSetAttachment(value, kCVImageBufferTransferFunctionKey, hdr ? kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ : kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
+   CVBufferSetAttachment(value, kCVImageBufferYCbCrMatrixKey, hdr ? kCVImageBufferYCbCrMatrix_ITU_R_2020 : kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
    return value
   }
-  let first = source(offset: 0), second = source(offset: 12)
+  for hdr in [false, true] {
+  let first = source(offset: 0, hdr: hdr), second = source(offset: 12, hdr: hdr)
   var result: CIImage?
   for i in 0..<500 {
    let command = queue.makeCommandBuffer()!
@@ -123,8 +124,24 @@ enum NativeStreamVideoPerformanceLog { static func record(_ text: String) { prin
   let centroid = Double(sumX) / Double(max(1, brightCount))
   print("Generated-frame bright pixels:", brightCount, "motion midpoint centroid:", centroid)
   precondition(brightCount > 100_000 && abs(centroid-755.5) < 4, "Generated motion midpoint image missing or incorrect")
+  if hdr {
+   func highlight(_ image: CIImage) -> Float {
+    var rgba = [Float](repeating: 0, count: 4)
+    rgba.withUnsafeMutableBytes { raw in
+     context.render(image, toBitmap: raw.baseAddress!, rowBytes: 16,
+      bounds: CGRect(x: 750, y: 500, width: 1, height: 1), format: .RGBAf,
+      colorSpace: NativeStreamVideoEffectsPolicy.workingColorSpace(hdr: true))
+    }
+    return rgba[0]
+   }
+   let inputHighlight = highlight(CIImage(cvPixelBuffer: second)), outputHighlight = highlight(result!)
+   print("PQ linear HDR highlight input/output:", inputHighlight, outputHighlight)
+   precondition(outputHighlight > 1 && outputHighlight / inputHighlight > 0.8 && outputHighlight / inputHighlight < 1.2,
+    "HDR highlight lost or incorrectly range-mapped during interpolation")
+  }
   generator.reset()
-  print("PASS: real Apple low-latency interpolation, exact SDR format, generated image, GPU completion, session reset")
+  print("PASS: real Apple low-latency interpolation with GPU full/video-range conversion", hdr ? "8-bit PQ HDR" : "8-bit SDR", "generated midpoint image, GPU completion, session reset")
+  }
  }
 }
 """

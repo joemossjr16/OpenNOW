@@ -13,6 +13,12 @@ import VideoToolbox
 /// resolution or FPS request. In particular, frame generation cannot repair a
 /// decoder that is already receiving more frames than it can process.
 enum NativeStreamVideoEffectsPolicy {
+    static func presentationSize(source: CGSize, display: CGSize, stretch: Bool) -> CGSize {
+        guard !stretch, source.width > 0, source.height > 0 else { return display }
+        let scale = min(display.width / source.width, display.height / source.height)
+        return CGSize(width: source.width * scale, height: source.height * scale)
+    }
+
     static func upscaleSize(source: CGSize, destination: CGSize) -> CGSize? {
         guard source.width > 0, source.height > 0,
               destination.width > source.width * 1.02,
@@ -34,13 +40,81 @@ enum NativeStreamVideoEffectsPolicy {
 
     /// An RGB half-float bridge keeps every chroma sample and HDR precision when
     /// the processor cannot accept the decoder's native bi-planar format.
-    static func interpolationFormat(source: OSType, supported: [OSType]) -> OSType? {
+    static func interpolationFormat(source: OSType, supported: [OSType], hdr: Bool = false) -> OSType? {
         if supported.contains(source) { return source }
+        // Full/video range are compatible 8-bit 4:2:0 layouts, not a chroma or
+        // depth downgrade. Apple's video processor may advertise only 420v.
+        if source == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+           supported.contains(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) {
+            return kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        }
         return supported.contains(kCVPixelFormatType_64RGBAHalf) ? kCVPixelFormatType_64RGBAHalf : nil
     }
 
     static func workingColorSpace(hdr: Bool) -> CGColorSpace {
         CGColorSpace(name: hdr ? CGColorSpace.extendedLinearITUR_2020 : CGColorSpace.extendedLinearSRGB)!
+    }
+}
+
+/// GPU-only range conversion for 8-bit NV12. Retains the exact luma/chroma plane
+/// dimensions, matrix, primaries and transfer function; no RGB round-trip or CPU wait.
+final class NativeStreamNV12RangeBridge {
+    private let pipeline: any MTLComputePipelineState
+    init?(device: any MTLDevice) {
+        do {
+            let library = try device.makeLibrary(source: """
+            #include <metal_stdlib>
+            using namespace metal;
+            kernel void nv12Range(texture2d<float,access::read> input [[texture(0)]],
+                                  texture2d<float,access::write> output [[texture(1)]],
+                                  constant float2 &scaleOffset [[buffer(0)]],
+                                  uint2 p [[thread_position_in_grid]]) {
+                if (p.x >= output.get_width() || p.y >= output.get_height()) return;
+                float4 value = input.read(p);
+                output.write(float4(clamp(value.rg * scaleOffset.x + scaleOffset.y, 0.0f, 1.0f),0,1),p);
+            }
+            """, options: nil)
+            guard let function = library.makeFunction(name: "nv12Range") else { return nil }
+            pipeline = try device.makeComputePipelineState(function: function)
+        } catch { return nil }
+    }
+
+    func encode(source: CVPixelBuffer, destination: CVPixelBuffer,
+                cache: CVMetalTextureCache, commandBuffer: any MTLCommandBuffer) -> Bool {
+        guard CVPixelBufferGetPixelFormatType(source) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+              CVPixelBufferGetPixelFormatType(destination) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+              CVPixelBufferGetPlaneCount(source) == 2, CVPixelBufferGetPlaneCount(destination) == 2 else { return false }
+        var references: [CVMetalTexture] = []
+        var pairs: [(any MTLTexture, any MTLTexture)] = []
+        for plane in 0..<2 {
+            let width = CVPixelBufferGetWidthOfPlane(source, plane), height = CVPixelBufferGetHeightOfPlane(source, plane)
+            guard width == CVPixelBufferGetWidthOfPlane(destination, plane),
+                  height == CVPixelBufferGetHeightOfPlane(destination, plane) else { return false }
+            var input: CVMetalTexture?, output: CVMetalTexture?
+            let format: MTLPixelFormat = plane == 0 ? .r8Unorm : .rg8Unorm
+            let readUsage = [kCVMetalTextureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue)] as CFDictionary
+            let writeUsage = [kCVMetalTextureUsage: NSNumber(value: MTLTextureUsage.shaderWrite.rawValue)] as CFDictionary
+            guard CVMetalTextureCacheCreateTextureFromImage(nil, cache, source, readUsage, format, width, height, plane, &input) == kCVReturnSuccess,
+                  CVMetalTextureCacheCreateTextureFromImage(nil, cache, destination, writeUsage, format, width, height, plane, &output) == kCVReturnSuccess,
+                  let input, let output, let inputTexture = CVMetalTextureGetTexture(input),
+                  let outputTexture = CVMetalTextureGetTexture(output) else { return false }
+            references += [input, output]; pairs.append((inputTexture, outputTexture))
+        }
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return false }
+        encoder.setComputePipelineState(pipeline)
+        for (plane, pair) in pairs.enumerated() {
+            var scaleOffset = plane == 0 ? SIMD2<Float>(219.0 / 255, 16.0 / 255)
+                : SIMD2<Float>(224.0 / 255, (128.0 / 255) * (1 - 224.0 / 255))
+            encoder.setTexture(pair.0, index: 0); encoder.setTexture(pair.1, index: 1)
+            encoder.setBytes(&scaleOffset, length: MemoryLayout<SIMD2<Float>>.stride, index: 0)
+            encoder.dispatchThreads(MTLSize(width: pair.1.width, height: pair.1.height, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+        }
+        encoder.endEncoding()
+        CVBufferPropagateAttachments(source, destination)
+        CVBufferSetAttachment(destination, kCMFormatDescriptionExtension_FullRangeVideo, kCFBooleanFalse, .shouldPropagate)
+        commandBuffer.addCompletedHandler { [source, destination, references] _ in _ = (source, destination, references) }
+        return true
     }
 }
 
@@ -73,7 +147,7 @@ final class NativeStreamSpatialUpscaler {
             status = "Unavailable on this device"; return nil
         }
         guard let size = NativeStreamVideoEffectsPolicy.upscaleSize(source: sourceSize, destination: destinationSize) else {
-            status = "Not needed at this resolution"; return nil
+            status = "No upscale: \(Int(sourceSize.width))×\(Int(sourceSize.height)) → \(Int(destinationSize.width))×\(Int(destinationSize.height))"; return nil
         }
         let next = Key(width: Int(sourceSize.width), height: Int(sourceSize.height),
                        outputWidth: Int(size.width), outputHeight: Int(size.height), hdr: hdr)
@@ -154,10 +228,12 @@ final class NativeStreamFrameGenerator {
         let pool: CVPixelBufferPool
         let sourcePool: CVPixelBufferPool
         let textureCache: CVMetalTextureCache
+        let rangeBridge: NativeStreamNV12RangeBridge?
         init(processor: VTFrameProcessor, format: OSType, pool: CVPixelBufferPool,
-             sourcePool: CVPixelBufferPool, textureCache: CVMetalTextureCache) {
+             sourcePool: CVPixelBufferPool, textureCache: CVMetalTextureCache, rangeBridge: NativeStreamNV12RangeBridge?) {
             self.processor = processor; self.format = format; self.pool = pool
             self.sourcePool = sourcePool; self.textureCache = textureCache
+            self.rangeBridge = rangeBridge
         }
         deinit { processor.endSession() }
     }
@@ -198,8 +274,9 @@ final class NativeStreamFrameGenerator {
                     frameHeight: next.height, numberOfInterpolatedFrames: 1) {
                     let formats = config.supportedPixelFormats
                     NativeStreamVideoPerformanceLog.record("frame-generation supported-formats=\(formats.map { String(format: "%08x", $0) }.joined(separator: ",")) source=\(next.width)x\(next.height)")
-                    reason = "Unavailable without changing color format"
-                    if let format = NativeStreamVideoEffectsPolicy.interpolationFormat(source: next.format, supported: formats) {
+                    reason = formats == [kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange]
+                        ? "Requires 8-bit 4:2:0 on this device" : "Unavailable for this color format"
+                    if let format = NativeStreamVideoEffectsPolicy.interpolationFormat(source: next.format, supported: formats, hdr: next.hdr) {
                         let attributes: [CFString: Any] = [kCVPixelBufferWidthKey: next.width,
                             kCVPixelBufferHeightKey: next.height, kCVPixelBufferPixelFormatTypeKey: format,
                             kCVPixelBufferIOSurfacePropertiesKey: [:], kCVPixelBufferMetalCompatibilityKey: true]
@@ -221,7 +298,9 @@ final class NativeStreamFrameGenerator {
                                CVMetalTextureCacheCreate(nil, nil, device, nil, &cache) == kCVReturnSuccess,
                                let cache {
                                 result = Session(processor: processor, format: format, pool: pool,
-                                    sourcePool: sourcePool, textureCache: cache)
+                                    sourcePool: sourcePool, textureCache: cache,
+                                    rangeBridge: format != next.format && format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                                        ? NativeStreamNV12RangeBridge(device: device) : nil)
                             } else { processor.endSession(); reason = "Buffer allocation unavailable" }
                         } catch { reason = "Processor setup failed" }
                     }
@@ -244,6 +323,14 @@ final class NativeStreamFrameGenerator {
         var source = buffer
         let space = NativeStreamVideoEffectsPolicy.workingColorSpace(hdr: hdr)
         if session.format != next.format {
+            if session.format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange {
+                guard let converted = allocate(from: session.sourcePool),
+                      session.rangeBridge?.encode(source: buffer, destination: converted,
+                        cache: session.textureCache, commandBuffer: commandBuffer) == true else {
+                    status = "Color-range conversion unavailable"; return nil
+                }
+                source = converted
+            } else {
             // Only the full-resolution half-float RGB bridge is permitted; never
             // subsample 4:4:4 or truncate HDR to satisfy processor restrictions.
             guard let converted = allocate(from: session.sourcePool) else { status = "Buffer limit reached"; return nil }
@@ -257,6 +344,7 @@ final class NativeStreamFrameGenerator {
             CVBufferSetAttachment(converted, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_Linear, .shouldPropagate)
             commandBuffer.addCompletedHandler { [reference, buffer] _ in _ = (reference, buffer) }
             source = converted
+            }
         }
         let prior = previous
         previous = (source, timestamp)
@@ -277,7 +365,7 @@ final class NativeStreamFrameGenerator {
         session.processor.process(with: commandBuffer, parameters: parameters)
         commandBuffer.addCompletedHandler { [session, parameters] _ in _ = (session, parameters) }
         status = "60 → 120 FPS (experimental)"
-        return CIImage(cvPixelBuffer: output, options: session.format == next.format ? [:] : [.colorSpace: space])
+        return CIImage(cvPixelBuffer: output, options: session.format == kCVPixelFormatType_64RGBAHalf ? [.colorSpace: space] : [:])
         #endif
     }
 }

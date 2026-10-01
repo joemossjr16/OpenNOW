@@ -167,11 +167,19 @@ struct SettingsView: View {
             }
             .onChangeCompat(of: store.settings.preferredAspectRatio) { _ in
                 enforceAvailableResolution()
+                applyMetalFXQualityPreset()
+            }
+            .onChangeCompat(of: store.settings.metalFXUpscalingEnabled) { enabled in
+                if enabled { applyMetalFXQualityPreset() }
+            }
+            .onChangeCompat(of: store.settings.streamerPreferences.stretchStreamToFill) { _ in
+                applyMetalFXQualityPreset()
             }
             .onChangeCompat(of: currentMembershipTier ?? "") { _ in
                 enforceAvailableResolution()
                 enforceAvailableFPS()
                 enforceAvailableHDR()
+                applyMetalFXQualityPreset()
             }
             .onChangeCompat(of: store.settings.hdrEnabled) { enabled in
                 guard enabled else { return }
@@ -543,7 +551,7 @@ struct SettingsView: View {
                 }
             }
 
-            Picker("Resolution", selection: customStreamBinding(\.preferredResolution)) {
+            Picker("Resolution", selection: streamResolutionBinding) {
                 Text("Auto").tag("Auto")
                 ForEach(StreamSettingsResolver.choices(forAspectRatio: store.settings.preferredAspectRatio)) { choice in
                     let available = resolutionAvailable(choice)
@@ -609,7 +617,17 @@ struct SettingsView: View {
             }
 
             Toggle("MetalFX Upscaling", isOn: $store.settings.metalFXUpscalingEnabled)
-            Text("Upscales a lower-resolution stream to the display. HDR stays in a high-precision color path. Has no effect when the stream already fills the display at native resolution.")
+            if store.settings.metalFXUpscalingEnabled {
+                Picker("MetalFX Quality", selection: metalFXQualityBinding) {
+                    ForEach(MetalFXQualityPreset.allCases) { preset in
+                        Text(metalFXPresetLabel(preset)).tag(preset)
+                            .disabled(preset != .manual && metalFXChoice(preset) == nil)
+                    }
+                }
+                Text(metalFXResolutionSummary)
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            Text("Quality preserves more detail; Balanced and Performance request smaller streams to reduce decode work. Presets select the nearest eligible resolution available on your plan. Resolution changes apply to a fresh session. Manual keeps your selected resolution. HDR, codec and FPS stay unchanged.")
                 .font(.footnote).foregroundStyle(.secondary)
             Toggle("Frame Generation (Experimental)", isOn: $store.settings.frameGenerationEnabled)
             Text("Generates an intermediate frame for a 60 FPS stream on a 120 Hz display. Requires iOS 26 or later and a supported device, resolution and color format. Adds display delay and may show motion artifacts. Pauses if the GPU falls behind, Low Power Mode is on or the device gets hot. Stream FPS stays unchanged; select 60 FPS to try it.")
@@ -1572,10 +1590,67 @@ struct SettingsView: View {
                     applying: preset,
                     membershipTier: currentMembershipTier
                 )
+                store.settings.metalFXQualityPreset = .manual
                 enforceAvailableResolution()
                 enforceAvailableFPS()
             }
         )
+    }
+
+    private var streamResolutionBinding: Binding<String> {
+        Binding(get: { store.settings.preferredResolution }, set: { value in
+            store.settings.preferredResolution = value
+            store.settings.streamPreset = .custom
+            store.settings.metalFXQualityPreset = .manual
+        })
+    }
+
+    private var metalFXQualityBinding: Binding<MetalFXQualityPreset> {
+        Binding(get: { store.settings.metalFXQualityPreset }, set: { preset in
+            store.settings.metalFXQualityPreset = preset
+            applyMetalFXQualityPreset()
+        })
+    }
+
+    private var metalFXDisplaySize: CGSize {
+        #if canImport(UIKit)
+        let size = UIScreen.main.nativeBounds.size
+        return CGSize(width: max(size.width, size.height), height: min(size.width, size.height))
+        #else
+        return .zero
+        #endif
+    }
+
+    private func metalFXChoice(_ preset: MetalFXQualityPreset) -> StreamSettingsResolver.StreamResolutionChoice? {
+        StreamSettingsResolver.metalFXResolution(preset: preset, aspectRatio: store.settings.preferredAspectRatio,
+            displaySize: metalFXDisplaySize, stretch: store.settings.streamerPreferences.stretchStreamToFill,
+            membershipTier: currentMembershipTier)
+    }
+
+    private func metalFXPresetLabel(_ preset: MetalFXQualityPreset) -> String {
+        guard preset != .manual, let choice = metalFXChoice(preset) else { return preset.label }
+        return "\(preset.label) · \(choice.label)"
+    }
+
+    private func applyMetalFXQualityPreset() {
+        guard store.settings.metalFXUpscalingEnabled,
+              store.settings.metalFXQualityPreset != .manual else { return }
+        guard let choice = metalFXChoice(store.settings.metalFXQualityPreset) else {
+            store.settings.metalFXQualityPreset = .manual
+            return
+        }
+        store.settings.preferredResolution = choice.value
+        store.settings.streamPreset = .custom
+    }
+
+    private var metalFXResolutionSummary: String {
+        let profile = StreamSettingsResolver.profile(for: store.settings, membershipTier: currentMembershipTier)
+        let source = CGSize(width: profile.width, height: profile.height)
+        let target = NativeStreamVideoEffectsPolicy.presentationSize(source: source,
+            display: metalFXDisplaySize, stretch: store.settings.streamerPreferences.stretchStreamToFill)
+        let eligible = NativeStreamVideoEffectsPolicy.upscaleSize(source: source, destination: target) != nil
+        let status = eligible ? "Eligible for MetalFX" : "No upscale at this resolution"
+        return "\(status): \(profile.width) × \(profile.height) → \(Int(target.width.rounded())) × \(Int(target.height.rounded())). Landscape estimate; the stream status shows the actual output area. MetalFX requires a supported physical device."
     }
 
     private func customStreamBinding<Value>(
@@ -1680,10 +1755,16 @@ struct SettingsView: View {
         for choice: StreamSettingsResolver.StreamResolutionChoice,
         available: Bool
     ) -> String {
-        guard !available, let plan = choice.requiredPlan.label else {
-            return choice.label
+        var label = choice.label
+        if !available, let plan = choice.requiredPlan.label { label += " · \(plan)" }
+        if store.settings.metalFXUpscalingEnabled {
+            let source = StreamSettingsResolver.pixelSize(choice.value)
+            let target = NativeStreamVideoEffectsPolicy.presentationSize(source: source,
+                display: metalFXDisplaySize, stretch: store.settings.streamerPreferences.stretchStreamToFill)
+            label += NativeStreamVideoEffectsPolicy.upscaleSize(source: source, destination: target) != nil
+                ? " · MetalFX eligible" : " · No upscale"
         }
-        return "\(choice.label) - \(plan)"
+        return label
     }
 
     private func enforceAvailableResolution() {
