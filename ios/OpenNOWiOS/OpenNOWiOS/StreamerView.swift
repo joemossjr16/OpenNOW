@@ -6205,7 +6205,8 @@ final class NativeStreamFramePixelBufferBridge {
 
 /// A bounded renderer mailbox: producers overwrite pending work while the GPU is busy.
 /// Conversion is deferred until a display tick can submit the newest frame.
-final class NativeStreamLatestFrameMailbox<Frame> {
+/// All mailbox state is lock-protected; producers must not mutate offered frames.
+final class NativeStreamLatestFrameMailbox<Frame>: @unchecked Sendable {
     struct Entry {
         let frame: Frame
         let receivedAt: CFTimeInterval
@@ -6266,6 +6267,87 @@ enum NativeStreamHDRTransfer {
     }
 }
 
+/// GPU callbacks and the display clock share this owner, rather than crossing
+/// UIView's main-actor isolation. Every mutable field is protected by the lock.
+final class NativeStreamRenderTelemetry: @unchecked Sendable {
+    private let lock = NSLock()
+    private var presentationWindowStart: CFTimeInterval = 0
+    private var presentedFrames = 0
+    private var totalPresentationAge: CFTimeInterval = 0
+    private var lastPresentationTime: CFTimeInterval = 0
+    private var maximumPresentationGap: CFTimeInterval = 0
+    private var clockTicks = 0
+    private var lastClockTick: CFTimeInterval = 0
+    private var maximumClockGap: CFTimeInterval = 0
+    private var totalDrawCPU: CFTimeInterval = 0
+    private var maximumDrawCPU: CFTimeInterval = 0
+    private var gpuSamples = 0
+    private var totalGPUTime: CFTimeInterval = 0
+    private var maximumGPUTime: CFTimeInterval = 0
+    private var generatedPresentations = 0
+    private var presentationRateMeter = NativeStreamPresentationRateMeter()
+    func rates(now:Double) -> NativeStreamPresentationRates? {
+        lock.lock(); defer { lock.unlock() }
+        return presentationRateMeter.snapshot(now:now)
+    }
+    func resetRates() { lock.lock(); presentationRateMeter = NativeStreamPresentationRateMeter(); lock.unlock() }
+    func clockTick(at time:Double) {
+        lock.lock(); defer { lock.unlock() }
+        if lastClockTick > 0 { maximumClockGap = max(maximumClockGap,time-lastClockTick) }
+        lastClockTick = time; clockTicks += 1
+    }
+    func recordDrawCPU(_ duration:Double) {
+        lock.lock(); defer { lock.unlock() }
+        totalDrawCPU += duration; maximumDrawCPU = max(maximumDrawCPU,duration)
+    }
+    func recordGPU(_ duration:Double) {
+        lock.lock(); defer { lock.unlock() }
+        gpuSamples += 1; totalGPUTime += duration; maximumGPUTime = max(maximumGPUTime,duration)
+    }
+    func recordPresentation(at time: CFTimeInterval, receivedAt: CFTimeInterval, generated: Bool) {
+        lock.lock()
+        presentationRateMeter.observe(time: time, generatedFrame: generated)
+        if presentationWindowStart == 0 { presentationWindowStart = time }
+        presentedFrames += 1
+        if generated { generatedPresentations += 1 }
+        if lastPresentationTime > 0 {
+            maximumPresentationGap = max(maximumPresentationGap, time - lastPresentationTime)
+        }
+        lastPresentationTime = time
+        totalPresentationAge += max(time - receivedAt, 0)
+        let elapsed = time - presentationWindowStart
+        guard elapsed >= 2 else {
+            lock.unlock()
+            return
+        }
+        let fps = Double(presentedFrames - 1) / elapsed
+        let generatedCount = generatedPresentations
+        generatedPresentations = 0
+        let averageAgeMs = totalPresentationAge * 1000 / Double(presentedFrames)
+        let gapMs = maximumPresentationGap * 1000
+        let tickFPS = Double(clockTicks) / elapsed
+        let clockGapMs = maximumClockGap * 1000
+        let cpuMs = totalDrawCPU * 1000 / Double(max(clockTicks, 1))
+        let maximumCPUMs = maximumDrawCPU * 1000
+        let gpuMs = totalGPUTime * 1000 / Double(max(gpuSamples, 1))
+        let maximumGPUMs = maximumGPUTime * 1000
+        clockTicks = 0; maximumClockGap = 0
+        totalDrawCPU = 0; maximumDrawCPU = 0
+        gpuSamples = 0; totalGPUTime = 0; maximumGPUTime = 0
+        maximumPresentationGap = 0
+        presentationWindowStart = time
+        presentedFrames = 1
+        totalPresentationAge = max(time - receivedAt, 0)
+        lock.unlock()
+        // Console I/O must never delay Metal's presentation callback.
+        NativeStreamVideoPerformanceLog.record(String(format:
+            "display presented=%.1f fps renderer-age=%.1f ms max-gap=%.1f ms clock=%.1f Hz clock-max-gap=%.1f ms draw-cpu=%.2f/max=%.2f ms gpu=%.2f/max=%.2f ms",
+            fps, averageAgeMs, gapMs, tickFPS, clockGapMs, cpuMs, maximumCPUMs, gpuMs, maximumGPUMs))
+        if generatedCount > 0 { NativeStreamVideoPerformanceLog.record("display generated-presentations=\(generatedCount) window-seconds=\(elapsed)") }
+    }
+
+}
+
 private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     var stretchToFill = false
     var sharpeningAmount = 0.0
@@ -6273,6 +6355,10 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     private let commandQueue: MTLCommandQueue
     private let ciContext: CIContext
     private let directHDR: NativeStreamHDRMetalRenderer?
+    private var metal4HDRStorage: AnyObject?
+    private var metal4Disabled = false
+    private let submissionTimeline: NativeStreamMetalFrameTimeline?
+    private var rendererBackend = "Metal / Core Image"
     private let spatialUpscaler: NativeStreamSpatialUpscaler
     // Real and generated inputs can have different sizes. Keep both pipelines warm.
     private let generatedSpatialUpscaler: NativeStreamSpatialUpscaler
@@ -6286,18 +6372,15 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     private var suspendUpscalingUntil: CFTimeInterval = 0
     private var generationBudget = NativeStreamFrameGenerationBudget()
     private var effectsGeneration: UInt64 = 0
-    private var generatedPresentations = 0
-    private var presentationRateMeter = NativeStreamPresentationRateMeter()
     var presentationRates: NativeStreamPresentationRates? {
-        presentationLock.lock(); defer { presentationLock.unlock() }
-        return presentationRateMeter.snapshot(now: CACurrentMediaTime())
+        telemetry.rates(now:CACurrentMediaTime())
     }
     private var lastEffectsStatus = ""
     private var generationStatus = "Off"
     private var generationPauseReason = "Paused: processing over budget"
 
     var videoEffectsStatus: String {
-        var parts: [String] = []
+        var parts: [String] = ["Renderer: " + rendererBackend]
         if upscalingEnabled {
             parts.append("MetalFX: " + (CACurrentMediaTime() < suspendUpscalingUntil
                 ? "Paused: processing error" : spatialUpscaler.status))
@@ -6311,7 +6394,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         if self.frameGenerationEnabled != frameGeneration || self.sourceFPS != sourceFPS || self.frameGenerationQuality != quality {
             frameGenerator.reset(); generatedSpatialUpscaler.reset(); pendingRealFrame = nil; suspendGenerationUntil = 0
             generationBudget.reset(); effectsGeneration &+= 1
-            presentationLock.lock(); presentationRateMeter = NativeStreamPresentationRateMeter(); presentationLock.unlock()
+            telemetry.resetRates()
         }
         upscalingEnabled = upscaling; frameGenerationEnabled = frameGeneration; self.sourceFPS = sourceFPS
         frameGenerationQuality = quality
@@ -6326,20 +6409,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     private let frameBridge = NativeStreamFramePixelBufferBridge()
     private let frames = NativeStreamLatestFrameMailbox<RTCVideoFrame>()
     private let gpuAdmission = DispatchSemaphore(value: 2)
-    private let presentationLock = NSLock()
-    private var presentationWindowStart: CFTimeInterval = 0
-    private var presentedFrames = 0
-    private var totalPresentationAge: CFTimeInterval = 0
-    private var lastPresentationTime: CFTimeInterval = 0
-    private var maximumPresentationGap: CFTimeInterval = 0
-    private var clockTicks = 0
-    private var lastClockTick: CFTimeInterval = 0
-    private var maximumClockGap: CFTimeInterval = 0
-    private var totalDrawCPU: CFTimeInterval = 0
-    private var maximumDrawCPU: CFTimeInterval = 0
-    private var gpuSamples = 0
-    private var totalGPUTime: CFTimeInterval = 0
-    private var maximumGPUTime: CFTimeInterval = 0
+    private let telemetry = NativeStreamRenderTelemetry()
     private var displayLink: CADisplayLink?
     private lazy var displayClock = DisplayClock(owner: self)
 
@@ -6362,6 +6432,9 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     private init(device: MTLDevice, commandQueue: MTLCommandQueue) {
         self.commandQueue = commandQueue
         directHDR = NativeStreamHDRMetalRenderer(device: device)
+        if #available(iOS 26.0, *), NativeStreamMetal4HDRRenderer.isSupported(device:device) {
+            submissionTimeline = NativeStreamMetalFrameTimeline(device:device)
+        } else { submissionTimeline = nil }
         spatialUpscaler = NativeStreamSpatialUpscaler(device: device)
         generatedSpatialUpscaler = NativeStreamSpatialUpscaler(device: device)
         ciContext = CIContext(mtlDevice: device, options: [.cacheIntermediates: false])
@@ -6376,6 +6449,12 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         mtkView.backgroundColor = .black
         mtkView.delegate = self
         addSubview(mtkView)
+        if #available(iOS 26.0, *), submissionTimeline != nil {
+            DispatchQueue.global(qos:.userInitiated).async { [weak self] in
+                let renderer = NativeStreamMetal4HDRRenderer(device:device)
+                DispatchQueue.main.async { [weak self] in self?.metal4HDRStorage = renderer }
+            }
+        }
     }
 
     required init?(coder: NSCoder) {
@@ -6409,17 +6488,10 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
 
     private func displayTick() {
         let started = CACurrentMediaTime()
-        presentationLock.lock()
-        if lastClockTick > 0 { maximumClockGap = max(maximumClockGap, started - lastClockTick) }
-        lastClockTick = started
-        clockTicks += 1
-        presentationLock.unlock()
+        telemetry.clockTick(at:started)
         mtkView.draw()
         let duration = CACurrentMediaTime() - started
-        presentationLock.lock()
-        totalDrawCPU += duration
-        maximumDrawCPU = max(maximumDrawCPU, duration)
-        presentationLock.unlock()
+        telemetry.recordDrawCPU(duration)
     }
 
     func display(frame: RTCVideoFrame?) {
@@ -6457,6 +6529,38 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
 
         let bounds = CGRect(origin: .zero, size: view.drawableSize)
         let destination = stretchToFill ? bounds : Self.aspectFitRect(source: frameSize, target: bounds.size)
+        let ticket = submissionTimeline?.next()
+        let rendererTelemetry = telemetry
+        let mailbox = frames
+        let receivedAt = entry.receivedAt
+        if #available(iOS 26.0, *), !metal4Disabled,
+           !upscalingEnabled, !frameGenerationEnabled, sharpeningAmount <= 0.001,
+           let metal4 = metal4HDRStorage as? NativeStreamMetal4HDRRenderer {
+            let admission = gpuAdmission
+            if metal4.submit(buffer:pixelBuffer,target:drawable.texture,destination:destination,drawable:drawable,ticket:ticket,
+                presented: { time in
+                    rendererTelemetry.recordPresentation(at:time,receivedAt:receivedAt,generated:false)
+                }, completion: { [weak self] duration,error in
+                    admission.signal()
+                    if ownsMailboxSlot { mailbox.complete() }
+                    rendererTelemetry.recordGPU(duration)
+                    if let error {
+                        DispatchQueue.main.async { [weak self] in self?.metal4Disabled = true }
+                        NativeStreamVideoPerformanceLog.record("Metal 4 HDR failed; legacy fallback code=\(error.code)")
+                    }
+                }) {
+                if let ticket { submissionTimeline?.accept(ticket) }
+                rendererBackend = "Metal 4 · direct 10-bit HDR"
+                if rendererBackend != lastEffectsStatus {
+                    lastEffectsStatus = rendererBackend
+                    NativeStreamVideoPerformanceLog.record("renderer " + rendererBackend)
+                }
+                submitted = true
+                return
+            }
+        }
+        // Cross-queue ordering also covers live switching to effects/legacy.
+        if let ticket, ticket.previous > 0 { commandBuffer.encodeWaitForEvent(ticket.event,value:ticket.previous) }
         // Exclude frame conversion and acquiring a drawable from effect cost.
         let effectsStarted = CACurrentMediaTime()
         let effectsToken = effectsGeneration
@@ -6484,6 +6588,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
             directHDR?.encode(buffer: pixelBuffer, commandBuffer: commandBuffer,
                 descriptor: $0, destination: destination) == true
         } == true
+        rendererBackend = direct ? "Metal · direct 10-bit HDR" : "Metal / Core Image"
         if direct {
             if !loggedDirectHDR {
                 loggedDirectHDR = true
@@ -6537,9 +6642,9 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         }
         #if !targetEnvironment(simulator)
         // Presentation callbacks are available on the physical device, not CoreSimulator.
-        drawable.addPresentedHandler { [weak self] drawable in
+        drawable.addPresentedHandler { drawable in
             guard drawable.presentedTime > 0 else { return }
-            self?.recordPresentation(at: drawable.presentedTime, receivedAt: entry.receivedAt, generated: generated)
+            rendererTelemetry.recordPresentation(at:drawable.presentedTime,receivedAt:receivedAt,generated:generated)
         }
         #endif
         let admission = gpuAdmission
@@ -6549,14 +6654,11 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
             admission.signal()
             // Keep the pooled IOSurface alive until the GPU has finished reading it.
             _ = pixelBuffer
+            if command.status == .error { ticket?.recoverAfterGPUFailure() }
             guard let self else { return }
             if ownsMailboxSlot { self.frames.complete() }
             let duration = max(command.gpuEndTime - command.gpuStartTime, 0)
-            self.presentationLock.lock()
-            self.gpuSamples += 1
-            self.totalGPUTime += duration
-            self.maximumGPUTime = max(self.maximumGPUTime, duration)
-            self.presentationLock.unlock()
+            rendererTelemetry.recordGPU(duration)
             guard checkEffectsBudget else { return }
             // ML processing may run outside the reported Metal GPU timestamps.
             // Include encode/queue/completion wall time in the deadline check.
@@ -6592,9 +6694,11 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
             lastEffectsStatus = videoEffectsStatus
             NativeStreamVideoPerformanceLog.record("video-effects " + videoEffectsStatus)
         }
+        if let ticket { commandBuffer.encodeSignalEvent(ticket.event,value:ticket.value) }
         commandBuffer.present(drawable)
         submitted = true
         commandBuffer.commit()
+        if let ticket { submissionTimeline?.accept(ticket) }
     }
 
     private func configureColorOutput(for buffer: CVPixelBuffer) {
@@ -6615,48 +6719,6 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         NSLog("[OpenNOW] display output=%@ pixelFormat=%lu EDR=%@",
               transfer == .pq ? "BT2020-PQ" : transfer == .hlg ? "BT2020-HLG" : "SDR",
               mtkView.colorPixelFormat.rawValue, hdr ? "on" : "off")
-    }
-
-    private func recordPresentation(at time: CFTimeInterval, receivedAt: CFTimeInterval, generated: Bool) {
-        presentationLock.lock()
-        presentationRateMeter.observe(time: time, generatedFrame: generated)
-        if presentationWindowStart == 0 { presentationWindowStart = time }
-        presentedFrames += 1
-        if generated { generatedPresentations += 1 }
-        if lastPresentationTime > 0 {
-            maximumPresentationGap = max(maximumPresentationGap, time - lastPresentationTime)
-        }
-        lastPresentationTime = time
-        totalPresentationAge += max(time - receivedAt, 0)
-        let elapsed = time - presentationWindowStart
-        guard elapsed >= 2 else {
-            presentationLock.unlock()
-            return
-        }
-        let fps = Double(presentedFrames - 1) / elapsed
-        let generatedCount = generatedPresentations
-        generatedPresentations = 0
-        let averageAgeMs = totalPresentationAge * 1000 / Double(presentedFrames)
-        let gapMs = maximumPresentationGap * 1000
-        let tickFPS = Double(clockTicks) / elapsed
-        let clockGapMs = maximumClockGap * 1000
-        let cpuMs = totalDrawCPU * 1000 / Double(max(clockTicks, 1))
-        let maximumCPUMs = maximumDrawCPU * 1000
-        let gpuMs = totalGPUTime * 1000 / Double(max(gpuSamples, 1))
-        let maximumGPUMs = maximumGPUTime * 1000
-        clockTicks = 0; maximumClockGap = 0
-        totalDrawCPU = 0; maximumDrawCPU = 0
-        gpuSamples = 0; totalGPUTime = 0; maximumGPUTime = 0
-        maximumPresentationGap = 0
-        presentationWindowStart = time
-        presentedFrames = 1
-        totalPresentationAge = max(time - receivedAt, 0)
-        presentationLock.unlock()
-        // Console I/O must never delay Metal's presentation callback.
-        NativeStreamVideoPerformanceLog.record(String(format:
-            "display presented=%.1f fps renderer-age=%.1f ms max-gap=%.1f ms clock=%.1f Hz clock-max-gap=%.1f ms draw-cpu=%.2f/max=%.2f ms gpu=%.2f/max=%.2f ms",
-            fps, averageAgeMs, gapMs, tickFPS, clockGapMs, cpuMs, maximumCPUMs, gpuMs, maximumGPUMs))
-        if generatedCount > 0 { NativeStreamVideoPerformanceLog.record("display generated-presentations=\(generatedCount) window-seconds=\(elapsed)") }
     }
 
     private static func aspectFitRect(source: CGSize, target: CGSize) -> CGRect {

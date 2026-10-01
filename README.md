@@ -1,5 +1,7 @@
 <h1 align="center">OpenNOW</h1>
 
+**Metal 4 development:** [renderer port and validation](ios/OpenNOWiOS/METAL4.md). Existing build 136 changes are on [ios/native-nvst-128](https://github.com/joemossjr16/OpenNOW/tree/ios/native-nvst-128).
+
 **Joe's iOS build 136:** [source changes, build instructions and validation](ios/OpenNOWiOS/README.md) · [unsigned IPA](https://github.com/joemossjr16/ios-apps/releases/tag/opennow-136)
 
 <p align="center">

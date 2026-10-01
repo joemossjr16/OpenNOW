@@ -420,6 +420,75 @@ final class OpenNOWiOSParityTests: XCTestCase {
             [[kCVPixelFormatType_420YpCbCr10BiPlanarFullRange]])
     }
 
+    func testRendererTelemetryKeepsPresentationRatesDuringConcurrentGPUAndClockUpdates() throws {
+        let telemetry = NativeStreamRenderTelemetry()
+        let group = DispatchGroup()
+        group.enter()
+        DispatchQueue.global().async {
+            for i in 0...240 {
+                telemetry.recordPresentation(at:100+Double(i)/120,receivedAt:99.99+Double(i)/120,
+                                             generated:i.isMultiple(of:2))
+            }
+            group.leave()
+        }
+        group.enter()
+        DispatchQueue.global().async {
+            for _ in 0..<1000 { telemetry.recordGPU(0.004) }
+            group.leave()
+        }
+        group.enter()
+        DispatchQueue.global().async {
+            for i in 0..<1000 { telemetry.clockTick(at:100+Double(i)/120); telemetry.recordDrawCPU(0.001) }
+            group.leave()
+        }
+        XCTAssertEqual(group.wait(timeout:.now()+5),.success)
+        let rates = try XCTUnwrap(telemetry.rates(now:102))
+        XCTAssertEqual(rates.generatedFPS,60,accuracy:0.01)
+        XCTAssertEqual(rates.displayedFPS,120,accuracy:0.01)
+        telemetry.resetRates(); XCTAssertNil(telemetry.rates(now:102))
+        for i in 0...60 { telemetry.recordPresentation(at:110+Double(i)/60,receivedAt:110,generated:false) }
+        let realOnly = try XCTUnwrap(telemetry.rates(now:111))
+        XCTAssertEqual(realOnly.generatedFPS,0); XCTAssertEqual(realOnly.displayedFPS,60,accuracy:0.01)
+    }
+
+    func testHDRMetalProgramRejectsUnsupportedFormatMatrixAndTransfer() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        var cache: CVMetalTextureCache?
+        XCTAssertEqual(CVMetalTextureCacheCreate(nil,nil,device,nil,&cache),kCVReturnSuccess)
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.bgr10a2Unorm,width:16,height:8,mipmapped:false)
+        descriptor.usage = .renderTarget
+        let target = try XCTUnwrap(device.makeTexture(descriptor:descriptor))
+        let destination = CGRect(x:0,y:0,width:16,height:8)
+        for format in [kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,kCVPixelFormatType_420YpCbCr10BiPlanarFullRange] {
+            var allocation: CVPixelBuffer?
+            XCTAssertEqual(CVPixelBufferCreate(nil,16,8,format,
+                [kCVPixelBufferIOSurfacePropertiesKey:[:],kCVPixelBufferMetalCompatibilityKey:true] as CFDictionary,&allocation),kCVReturnSuccess)
+            let buffer = try XCTUnwrap(allocation)
+            func input() -> NativeStreamHDRMetalProgram.Input? {
+                NativeStreamHDRMetalProgram.Input(buffer:buffer,cache:cache!,target:target,destination:destination)
+            }
+            CVBufferSetAttachment(buffer,kCVImageBufferTransferFunctionKey,kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ,.shouldPropagate)
+            CVBufferSetAttachment(buffer,kCVImageBufferYCbCrMatrixKey,kCVImageBufferYCbCrMatrix_ITU_R_709_2,.shouldPropagate)
+            XCTAssertNil(input())
+            CVBufferSetAttachment(buffer,kCVImageBufferYCbCrMatrixKey,kCVImageBufferYCbCrMatrix_ITU_R_2020,.shouldPropagate)
+            if format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange { XCTAssertNil(input()) }
+            else {
+                XCTAssertNotNil(input())
+                CVBufferSetAttachment(buffer,kCVImageBufferTransferFunctionKey,kCVImageBufferTransferFunction_ITU_R_2100_HLG,.shouldPropagate)
+                XCTAssertNotNil(input())
+                CVBufferSetAttachment(buffer,kCVImageBufferTransferFunctionKey,kCVImageBufferTransferFunction_ITU_R_709_2,.shouldPropagate)
+                XCTAssertNil(input())
+            }
+        }
+        #if targetEnvironment(simulator)
+        if #available(iOS 26.0, *) {
+            XCTAssertFalse(NativeStreamMetal4HDRRenderer.isSupported(device:device))
+            XCTAssertNil(NativeStreamMetal4HDRRenderer(device:device))
+            XCTAssertNotNil(NativeStreamHDRMetalRenderer(device:device))
+        }
+        #endif
+    }
+
     func testDirect444HDRMetalPreservesAlternatingFullResolutionChroma() throws {
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let queue = try XCTUnwrap(device.makeCommandQueue())
