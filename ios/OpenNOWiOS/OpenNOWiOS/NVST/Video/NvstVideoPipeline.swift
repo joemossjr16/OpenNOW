@@ -10,6 +10,80 @@ struct NvstDecodeCompletionLedger<Value> {
     mutating func take(frameIndex: UInt32) -> Value? { entries.removeValue(forKey: frameIndex) }
 }
 
+/// A bounded compressed-frame queue. If a chain is discarded, dependent frames must
+/// wait for a fresh keyframe; decoding them would corrupt the reference chain.
+struct NvstDecodeFrameInbox<Value> {
+    struct Entry {
+        let value: Value
+        let enqueuedAt: UInt64
+    }
+    struct Events {
+        var discarded = 0
+        var resynchronised = false
+        var requestKeyframe = false
+    }
+    let capacity: Int
+    let maximumAgeNanoseconds: UInt64
+    private var entries: [Entry] = []
+    private(set) var awaitingKeyframe = false
+    private var lastRequestAt: UInt64?
+    var count: Int { entries.count }
+
+    init(capacity: Int = 32, maximumAgeNanoseconds: UInt64 = 250_000_000) {
+        precondition(capacity > 0)
+        self.capacity = capacity
+        self.maximumAgeNanoseconds = maximumAgeNanoseconds
+    }
+
+    mutating func offer(_ value: Value, isKeyframe: Bool, now: UInt64) -> Events {
+        var events = Events()
+        if !awaitingKeyframe && (entries.count >= capacity || oldestExpired(now: now)) {
+            events = discardChain()
+        }
+        if awaitingKeyframe && !isKeyframe {
+            events.discarded += 1
+        } else {
+            if isKeyframe { awaitingKeyframe = false; lastRequestAt = nil }
+            entries.append(Entry(value: value, enqueuedAt: now))
+        }
+        events.requestKeyframe = shouldRequestKeyframe(now: now)
+        return events
+    }
+
+    mutating func take(now: UInt64) -> (entry: Entry?, events: Events) {
+        var events = Events()
+        if oldestExpired(now: now) { events = discardChain() }
+        events.requestKeyframe = shouldRequestKeyframe(now: now)
+        return (entries.isEmpty ? nil : entries.removeFirst(), events)
+    }
+
+    mutating func removeAll() {
+        entries.removeAll()
+        awaitingKeyframe = false
+        lastRequestAt = nil
+    }
+
+    private func oldestExpired(now: UInt64) -> Bool {
+        guard let first = entries.first, now >= first.enqueuedAt else { return false }
+        return now - first.enqueuedAt > maximumAgeNanoseconds
+    }
+
+    private mutating func discardChain() -> Events {
+        let discarded = entries.count
+        entries.removeAll()
+        awaitingKeyframe = true
+        lastRequestAt = nil
+        return Events(discarded: discarded, resynchronised: true)
+    }
+
+    private mutating func shouldRequestKeyframe(now: UInt64) -> Bool {
+        guard awaitingKeyframe else { return false }
+        if let lastRequestAt, now >= lastRequestAt, now - lastRequestAt < 400_000_000 { return false }
+        lastRequestAt = now
+        return true
+    }
+}
+
 /// Session-relative time, shared by the transport actor and the video pipeline that runs off it.
 ///
 /// NVST timestamps are session-scale, not epoch-scale — a seat that sanity-checks them against its
@@ -58,7 +132,7 @@ public final class NvstVideoPipeline: @unchecked Sendable {
     public struct StageTimings: Sendable, Equatable {
         /// Receive thread finished the access unit -> this pipeline started on it (queue backlog).
         public var hop = 0.0
-        /// `VTDecompressionSessionDecodeFrame` submission, including any session rebuild.
+        /// Submission-to-output completion, including decoder queueing and any session rebuild.
         public var decode = 0.0
         /// The frame-ack (and pacing report) write onto the SCTP control channel.
         public var ack = 0.0
@@ -128,9 +202,8 @@ public final class NvstVideoPipeline: @unchecked Sendable {
         public var latencyResyncs = 0
         /// Frames dropped while waiting for that keyframe.
         public var framesSkippedForLatency = 0
-        /// Times the keyframe never arrived and decoding resumed with a broken reference chain
-        /// rather than staying frozen.
-        public var abandonedResyncs = 0
+        public var queuedFrames = 0
+        public var peakQueuedFrames = 0
         public var lastDecodeLatencyMilliseconds = 0.0
         public var peak = StageTimings()
         public var total = StageTimings()
@@ -151,11 +224,11 @@ public final class NvstVideoPipeline: @unchecked Sendable {
             let frames = Double(max(1, framesHandled))
             let inFlight = inFlightHistogram.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }.joined(separator: ",")
             return String(format: "peak[hop=%.1f decode=%.1f ack=%.1f] mean[hop=%.2f decode=%.2f ack=%.2f]ms"
-                          + " tail[p50=%.1f p99=%.1f max=%.1f]ms(n=%d) inFlight=%@",
+                          + " tail[p50=%.1f p99=%.1f max=%.1f]ms(n=%d) inFlight=%@ queue[depth=%d peak=%d resync=%d skipped=%d]",
                           peak.hop, peak.decode, peak.ack,
                           total.hop / frames, total.decode / frames, total.ack / frames,
                           decodeP50Milliseconds, decodeP99Milliseconds, decodeMaxMilliseconds, recentDecodeTimes.sampleCount,
-                          inFlight)
+                          inFlight, queuedFrames, peakQueuedFrames, latencyResyncs, framesSkippedForLatency)
         }
     }
 
@@ -165,27 +238,6 @@ public final class NvstVideoPipeline: @unchecked Sendable {
     public static let maximumLoggedSlowFrames = 60
     /// Consecutive hard decode failures before the stream is called unrecoverable.
     public static let fatalDecodeFailureCount = 30
-    /// Frames allowed to wait for decode before the pipeline is declared behind. Eight frames is
-    /// 66 ms at 120 fps — past normal jitter, under anything a player would call lag.
-    public static let maximumPendingFrames = 8
-    /// Never resynchronise more often than this. A decoder that simply cannot keep up would
-    /// otherwise sit above the threshold permanently and skip to a keyframe over and over, turning
-    /// steady lag into a stutter loop — worse to play than the lag it was meant to remove.
-    public static let minimumResyncInterval = 2.0
-    /// Consecutive over-threshold frames before the pipeline is declared behind — about 250 ms at
-    /// 120 fps.
-    ///
-    /// Queue depth alone is the wrong trigger: a burst of a dozen frames arrives normally, right
-    /// after a keyframe, and drains in milliseconds. Acting on one such burst cost a measured
-    /// session 1,937 failed decodes against 4,427 good ones, because the resync broke the reference
-    /// chain for a transient that would have cleared itself. Only a backlog that persists is a
-    /// pipeline that cannot keep up.
-    public static let sustainedBacklogFrames = 30
-    /// How long to keep skipping while waiting for the keyframe, re-asking as it goes. Resuming on
-    /// a broken chain rejects every frame until the next keyframe arrives — at the seat's own
-    /// keyframe cadence that can be many seconds — so this waits considerably longer than it did
-    /// before giving up.
-    public static let maximumKeyframeWait = 2.0
     /// How often to re-ask for the keyframe while waiting.
     public static let keyframeRetryInterval = 0.4
 
@@ -232,16 +284,11 @@ public final class NvstVideoPipeline: @unchecked Sendable {
     private var framesSincePacingReport = 0
     private var consecutiveDecodeFailures = 0
     private var isStopped = false
-    /// Frames submitted but not yet processed. The queue's depth, in other words.
-    private var pendingFrames = 0
+    private var inbox = NvstDecodeFrameInbox<NvstAccessUnit>()
+    private var workerScheduled = false
     /// Decoder failures already seen by the async-failure check, so each is answered once.
     private var observedDecodeFailures: UInt64 = 0
-    private var isAwaitingKeyframe = false
-    private var awaitingKeyframeSince: UInt64?
-    private var lastResyncAt: UInt64?
     private var lastKeyframeRequestAt: UInt64?
-    /// Consecutive frames seen with the queue over the threshold.
-    private var backlogStreak = 0
 
     /// Register before calling VideoToolbox: its output callback can run before the
     /// submission returns. Match by wire frame index instead of shifting a FIFO.
@@ -251,17 +298,6 @@ public final class NvstVideoPipeline: @unchecked Sendable {
         let startedAt: UInt64
     }
     private var pendingCompletions = NvstDecodeCompletionLedger<PendingCompletion>()
-    /// Frame index of the newest keyframe handed to `submit`, so frames still queued ahead of it can
-    /// be recognised as superseded while a resync is pending.
-    private var latestSubmittedKeyframeIndex: UInt32?
-
-    /// While a resync waits for a keyframe, a non-keyframe is dropped only when a newer keyframe is
-    /// already queued behind it — it would be decoded and then replaced before anyone saw it.
-    static func dropsStaleFrame(frameIndex: UInt32, latestSubmittedKeyframeIndex: UInt32?) -> Bool {
-        guard let keyframe = latestSubmittedKeyframeIndex else { return false }
-        return keyframe > frameIndex
-    }
-
     public init(decoder: NvstVideoToolboxDecoder,
                 clock: NvstSessionClock,
                 frameTimeMicroseconds: UInt32,
@@ -308,43 +344,59 @@ public final class NvstVideoPipeline: @unchecked Sendable {
     public func submit(_ unit: NvstAccessUnit) {
         let enqueued = DispatchTime.now().uptimeNanoseconds
         lock.lock()
-        pendingFrames += 1
-        if unit.isKeyframe { latestSubmittedKeyframeIndex = unit.frameIndex }
+        guard !isStopped else { lock.unlock(); return }
+        let events = inbox.offer(unit, isKeyframe: unit.isKeyframe, now: enqueued)
+        updateInboxCounters(events)
+        let schedule = !workerScheduled && inbox.count > 0
+        if schedule { workerScheduled = true }
         lock.unlock()
-        queue.async { [weak self] in self?.process(unit, enqueuedAt: enqueued) }
+        reportInboxEvents(events)
+        if schedule { queue.async { [weak self] in self?.drainInbox() } }
     }
 
     public func stop() {
         lock.lock()
         isStopped = true
+        inbox.removeAll()
+        counters.queuedFrames = 0
         pendingCompletions = NvstDecodeCompletionLedger()
         lock.unlock()
     }
 
-    private func process(_ unit: NvstAccessUnit, enqueuedAt: UInt64) {
-        let gate = evaluateLatencyGate()
-        guard !gate.stopped else { return }
-
-        if gate.skipping {
-            if unit.isKeyframe {
-                lock.lock()
-                isAwaitingKeyframe = false
-                awaitingKeyframeSince = nil
-                lock.unlock()
-                logger?("NVST decode resynchronised on a keyframe")
-            } else {
-                // Waiting for the keyframe used to mean dropping every frame until it came: a frozen
-                // picture for as long as the seat took — 169 frames, 1.4 s, on a 1440p launcher
-                // transition (2026-09-05). Now the backlog keeps decoding, late but moving, and only
-                // frames the queue already holds a newer keyframe behind are dropped: those can never
-                // be shown, the keyframe supersedes them. The freeze becomes a latency jump.
-                lock.lock()
-                let stale = Self.dropsStaleFrame(frameIndex: unit.frameIndex, latestSubmittedKeyframeIndex: latestSubmittedKeyframeIndex)
-                if stale { counters.framesSkippedForLatency += 1 }
-                lock.unlock()
-                if stale { return }
-            }
+    private func drainInbox() {
+        while true {
+            lock.lock()
+            guard !isStopped else { workerScheduled = false; lock.unlock(); return }
+            let next = inbox.take(now: DispatchTime.now().uptimeNanoseconds)
+            updateInboxCounters(next.events)
+            if next.entry == nil { workerScheduled = false }
+            lock.unlock()
+            reportInboxEvents(next.events)
+            guard let entry = next.entry else { return }
+            process(entry.value, enqueuedAt: entry.enqueuedAt)
         }
+    }
+
+    /// Called only under lock. The queue never retains more than its fixed capacity.
+    private func updateInboxCounters(_ events: NvstDecodeFrameInbox<NvstAccessUnit>.Events) {
+        counters.framesSkippedForLatency += events.discarded
+        if events.resynchronised { counters.latencyResyncs += 1 }
+        counters.queuedFrames = inbox.count
+        counters.peakQueuedFrames = max(counters.peakQueuedFrames, inbox.count)
+    }
+
+    private func reportInboxEvents(_ events: NvstDecodeFrameInbox<NvstAccessUnit>.Events) {
+        if events.resynchronised {
+            logger?("NVST decoder queue exceeded its age/capacity budget; discarded \(events.discarded) queued frames and waiting for a fresh keyframe")
+        }
+        if events.requestKeyframe { onKeyframeNeeded() }
+    }
+
+    private func process(_ unit: NvstAccessUnit, enqueuedAt: UInt64) {
+        lock.lock()
+        let stopped = isStopped
+        lock.unlock()
+        guard !stopped else { return }
 
         // VideoToolbox rejects a frame with a broken reference chain in its asynchronous output
         // handler, not by throwing out of `decode` — the live -12909 bursts never touched the
@@ -375,7 +427,7 @@ public final class NvstVideoPipeline: @unchecked Sendable {
             consecutiveDecodeFailures = 0
             // Decode is asynchronous from here — VideoToolbox has only accepted the submission.
             // `handleDecodeCompleted` fires the ack once the frame is actually decoded (or
-            // failed), in the same order these are pushed.
+            // failed), matched by frame ID even when callbacks arrive out of order.
             if !accepted { discardDecodeCompletion(frameIndex: unit.frameIndex) }
         } catch NvstVideoToolboxDecoder.DecoderError.missingParameterSets {
             discardDecodeCompletion(frameIndex: unit.frameIndex)
@@ -411,56 +463,6 @@ public final class NvstVideoPipeline: @unchecked Sendable {
             }
             return
         }
-    }
-
-    /// Whether this frame should be decoded at all.
-    ///
-    /// A backlog never drains on its own: the queue is served at best as fast as frames arrive, so
-    /// whatever latency it accumulates is permanent, and a 736 ms mean with an 8.5 s peak was
-    /// measured on a saturated 5K120 session. Skipping to the next keyframe trades a brief glitch
-    /// for bounded latency — and since skipped frames break the decoder's reference chain anyway,
-    /// resuming anywhere else would show corruption instead.
-    private func evaluateLatencyGate() -> (stopped: Bool, skipping: Bool) {
-        lock.lock()
-        let stopped = isStopped
-        pendingFrames -= 1
-        let backlog = pendingFrames
-        var skipping = isAwaitingKeyframe
-        let now = DispatchTime.now().uptimeNanoseconds
-        // A burst is not a backlog: only count frames that arrive with the queue already deep, and
-        // reset the streak the moment it drains.
-        backlogStreak = backlog > Self.maximumPendingFrames ? backlogStreak + 1 : 0
-        var retryKeyframe = false
-        if skipping, Self.seconds(from: awaitingKeyframeSince ?? now, to: now) > Self.maximumKeyframeWait {
-            // The keyframe never came. Decode what we have rather than keep the picture frozen —
-            // every frame will be rejected until one arrives, so this is the lesser evil, not a
-            // good outcome.
-            skipping = false
-            isAwaitingKeyframe = false
-            awaitingKeyframeSince = nil
-            counters.abandonedResyncs += 1
-        } else if skipping, Self.seconds(from: lastKeyframeRequestAt ?? now, to: now) >= Self.keyframeRetryInterval {
-            lastKeyframeRequestAt = now
-            retryKeyframe = true
-        }
-        let sinceLastResync = lastResyncAt.map { Self.seconds(from: $0, to: now) } ?? .infinity
-        if !skipping, backlogStreak >= Self.sustainedBacklogFrames, sinceLastResync >= Self.minimumResyncInterval {
-            skipping = true
-            isAwaitingKeyframe = true
-            awaitingKeyframeSince = now
-            lastKeyframeRequestAt = now
-            lastResyncAt = now
-            backlogStreak = 0
-            counters.latencyResyncs += 1
-            lock.unlock()
-            logger?("NVST decode has been \(backlog) frames behind for \(Self.sustainedBacklogFrames) frames; skipping to the next keyframe")
-            onKeyframeNeeded()
-            lock.lock()
-        }
-        lock.unlock()
-        // Outside the lock: the retry reaches back into the transport.
-        if retryKeyframe { onKeyframeNeeded() }
-        return (stopped, skipping)
     }
 
     private func discardDecodeCompletion(frameIndex: UInt32) {

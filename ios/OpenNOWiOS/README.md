@@ -1,8 +1,8 @@
-# Joe's OpenNOW iOS build 129
+# Joe's OpenNOW iOS build 130
 
-This branch contains the source for **OpenNOW 1.1.129**, based on the upstream iOS branch at `95c0f58d42eeed176edd677f604b193c85169d9e`. It includes the earlier local iOS changes needed by the current native receiver, hardware AV1/HDR rendering, catalog and launch features.
+This branch contains the source for **OpenNOW 1.1.130**, based on the upstream iOS branch at `95c0f58d42eeed176edd677f604b193c85169d9e`. It includes the earlier local iOS changes needed by the current native receiver, hardware AV1/HDR rendering, catalog and launch features.
 
-[Unsigned IPA and build notes](https://github.com/joemossjr16/ios-apps/releases/tag/opennow-129) · [KravaSigner feed](https://raw.githubusercontent.com/joemossjr16/ios-apps/main/repo.json)
+[Unsigned IPA and build notes](https://github.com/joemossjr16/ios-apps/releases/tag/opennow-130) · [KravaSigner feed](https://raw.githubusercontent.com/joemossjr16/ios-apps/main/repo.json)
 
 ## Experimental 10-bit 4:4:4 HDR
 
@@ -10,7 +10,17 @@ Enable **Settings → Stream → Connection → Native NVST Receiver (Experiment
 
 The receiver checks the incoming HEVC bitstream for exactly 10-bit 4:4:4, requires hardware decoding, requests only matching full/video-range 4:4:4 surfaces, and checks actual output chroma-plane dimensions. Unsupported hardware or a downgraded host stream stops with a clear error rather than silently converting to 4:2:0 or 8-bit. The HDR Metal path handles full-resolution chroma without an intermediate copy.
 
-The **Color** status reports actual decoded output and transfer metadata. Look for **10-bit 4:4:4 HDR PQ** for a PQ HDR stream. Host SDR output remains labeled SDR. Hardware decoding of this specific profile on iPhone/iPad and live host delivery are still unverified; the experimental setting does not promise device support. Choose **10-bit 4:2:0** if the host or device cannot support it. AV1 remains available for 4:2:0.
+The **Color** status reports actual decoded output and transfer metadata. Look for **10-bit 4:4:4 HDR PQ** for a PQ HDR stream. Host SDR output remains labeled SDR. Build 129 live logs confirmed hardware-decoded 10-bit 4:4:4 HDR PQ on both an iPhone 18 Pro Max and M5 iPad Pro. The iPhone could not sustain the tested 4K/120 workload; successful format support does not establish real-time throughput. Choose **10-bit 4:2:0** if the host or device cannot support it. AV1 remains available for 4:2:0.
+
+## Build 130 iPhone decode test
+
+With the same requested 4K/120 H265 10-bit 4:4:4 HDR settings, build 129 samples showed roughly 120 received FPS but only 88–90 decoded FPS and about 50ms completion latency on iPhone. Queued work grew past 20 seconds of delay. An iPad working segment showed roughly 120 decoded FPS and 7.7ms completion latency. iPhone display GPU time was about 2.5ms.
+
+Build 130 offers VideoToolbox both compatible full/video-range 10-bit 4:4:4 surfaces, allowing it to choose an output rather than requiring full range. Single-format fallback follows the source range. Actual decoded chroma/depth are still checked and the renderer handles either range. This tests whether forced range conversion contributed to the iPhone cost; that cause remains unconfirmed.
+
+A single drain worker now consumes a compressed-frame inbox capped at 32 frames with a 250ms queued-age budget. Overflow/expiration discards stale queued work and waits for a fresh keyframe, retrying requests while waiting. It preserves healthy bursts and prevents indefinite queued-frame accumulation without decoding dependent frames from a deliberately broken chain. It cannot make overloaded hardware sustain 120 FPS or guarantee the host's keyframe response time.
+
+Local numeric logs now distinguish preparation/build/submission time, completion latency, actual output format/resolution, decoder rebuilds/failures, queue recovery/drop counts, thermal state and low-power status. Build 130 hardware speed still needs comparison after installation. Resolution, FPS, HDR and color settings are not automatically downgraded.
 
 ## Retained fixes
 
@@ -47,7 +57,7 @@ The unsigned device app is in `DerivedData/Build/Products/Debug-iphoneos/OpenNOW
 
 Enable **Settings → Stream → Connection → Native NVST Receiver (Experimental)** and start or resume a session. The standard WebRTC receiver remains the default. Native NVST requires iOS 17 or later, an advertised RTSPS endpoint, and hardware decoding. A 10-bit stream cannot silently use an 8-bit output surface. Existing quality settings and device identity are preserved.
 
-Build 129 passed an unsigned arm64 device build and **166 targeted simulator tests**. New tests verify strict 10-bit/4:4:4 bitstream validation, full/video-range surfaces, actual-output HDR labels, settings persistence, separate CloudMatch and RTSP chroma enums, and GPU readback of alternating one-pixel chroma detail through the HDR Metal renderer. Existing tests cover pointer preference and teardown, capture release policy, independent PiP conversion from 10-bit HDR, PiP clock/size bounds, early/reordered/rejected completion bookkeeping, encrypted DTLS/SCTP control and input, SRTP/FEC, RTSP, AV1/HDR metadata and settings migration. Simulator rendering tests do not establish physical hardware support for HEVC 10-bit 4:4:4.
+Build 130 passed an unsigned arm64 device build and **170 targeted simulator tests**. Tests additionally verify healthy queue bursts/FIFO order, bounded overflow and keyframe retry over thousands of arrivals, stale-work expiration, and that compatible range requests never allow chroma/depth downgrade. Existing tests verify strict 10-bit/4:4:4 bitstream validation, full/video-range surfaces, actual-output HDR labels, settings persistence, separate CloudMatch and RTSP chroma enums, and GPU readback of alternating one-pixel chroma detail through the HDR Metal renderer. Existing tests cover pointer preference and teardown, capture release policy, independent PiP conversion from 10-bit HDR, PiP clock/size bounds, early/reordered/rejected completion bookkeeping, encrypted DTLS/SCTP control and input, SRTP/FEC, RTSP, AV1/HDR metadata and settings migration. Simulator rendering tests do not establish physical hardware support for HEVC 10-bit 4:4:4.
 
 Physical iPad mouse capture, PiP/background behavior and the updated decode timing still need testing after installation. Simulator results do not establish physical-device performance. Build 127 live samples showed roughly 120 received/decoded FPS on iPhone and on iPad after a restart; the earlier recurring iPad arrival gaps were absent in the post-restart sample, with their cause still unconfirmed.
 

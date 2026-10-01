@@ -351,7 +351,7 @@ actor NativeStreamNVST: NativeStreamNVSTTransport {
         if ping < 0, let rtsp { ping = await rtsp.controlRoundTripMilliseconds() }
         guard !stopped else { return }
         let state = pipeline.snapshot
-        let detail = "native NVST hardware=\(decoder.isHardwareAccelerated) buffer=\(receiver.receiveBufferBytes) ack=\(state.frameAcksSent) pacing=\(state.pacingReportsSent) fec=\(stats.recoveredPackets) auth=\(stats.authenticatedPackets) \(state.timingSummary)"
+        let detail = "native NVST hardware=\(decoder.isHardwareAccelerated) thermal=\(ProcessInfo.processInfo.thermalState.rawValue) lowPower=\(ProcessInfo.processInfo.isLowPowerModeEnabled) resolution=\(decoder.decodedResolution ?? "pending") output=\(decoder.outputPixelFormatName) sessions=\(decoder.sessionCreationCount) failed=\(decoder.failedFrameCount) errors=\(decoder.failureStatusSummary) decoderStages=\(decoder.stageTimingSummary) buffer=\(receiver.receiveBufferBytes) ack=\(state.frameAcksSent) pacing=\(state.pacingReportsSent) fec=\(stats.recoveredPackets) auth=\(stats.authenticatedPackets) \(state.timingSummary)"
         onSample(NativeStreamNVSTSample(received: counters.framesEmitted, decoded: decoded, bytes: counters.bytesReceived,
             lost: stats.finalizedLossPackets, packets: stats.authenticatedPackets, resolution: decoder.decodedResolution,
             decodeMilliseconds: state.decodeP50Milliseconds, pingMilliseconds: ping >= 0 ? ping : nil,

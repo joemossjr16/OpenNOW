@@ -129,7 +129,7 @@ public final class NvstVideoToolboxDecoder: @unchecked Sendable {
         return currentBitstreamFormat
     }
     var currentBitstreamFormat: BitstreamFormat?
-    /// Four-character name of the `CVPixelBuffer` format the session was created to emit.
+    /// Four-character name of the actual decoded surface, or the requested format before output.
     public var outputPixelFormatName: String {
         statsLock.lock()
         defer { statsLock.unlock() }
@@ -342,6 +342,7 @@ public final class NvstVideoToolboxDecoder: @unchecked Sendable {
         // ignores the requested geometry is otherwise invisible here.
         decodedWidth = CVPixelBufferGetWidth(imageBuffer)
         decodedHeight = CVPixelBufferGetHeight(imageBuffer)
+        outputPixelFormat = CVPixelBufferGetPixelFormatType(imageBuffer)
         let handler = onPixelBuffer
         let shouldReportAccepted = loggedAccepted < Self.maxLoggedAccepted
         if shouldReportAccepted { loggedAccepted += 1 }
@@ -410,18 +411,8 @@ public final class NvstVideoToolboxDecoder: @unchecked Sendable {
     // MARK: - Session
 
     private func makeSession(formatDescription: CMVideoFormatDescription) throws -> VTDecompressionSession {
-        // Ask for a full-range bi-planar surface backed by an IOSurface so the Metal renderer can
-        // bind it without a copy. The depth and chroma layout follow the bitstream: this used to
-        // hardcode 8-bit 4:2:0, so every 10-bit-negotiated frame (`color=10bit_420`, confirmed in
-        // `OPNSessionManager` logs) was truncated by VideoToolbox before the renderer saw it and
-        // the 10-bit tier bought nothing but banding-free encode. (A 2026-08-28 attempt at 10-bit
-        // output was reverted for lack of a decode-time win; decode cost was never the point —
-        // the renderer draws P010 through its own path and the layer can present 10 bits.)
-        //
-        // Tried a pixel-buffer-pool-depth hint (`kCVPixelBufferPoolMinimumBufferCountKey`, 6
-        // buffers) on 2026-08-28 to rule out decode completion stalling on a buffer the renderer
-        // was still holding — measured decode mean unchanged (7.72ms, identical to no hint), so
-        // pool starvation isn't the cost either. Reverted.
+        // Preserve bit depth and chroma in IOSurface-backed bi-planar output. Strict
+        // 4:4:4 offers both compatible ranges so the hardware may use its native surface.
         statsLock.lock()
         let bitstream = currentBitstreamFormat ?? BitstreamFormat()
         statsLock.unlock()
@@ -435,9 +426,17 @@ public final class NvstVideoToolboxDecoder: @unchecked Sendable {
         var created: VTDecompressionSession?
         var status: OSStatus = noErr
         var chosenFormat: OSType = 0
-        for candidate in Self.preferredOutputPixelFormats(for: bitstream, requiresTenBit444: requiresTenBit444) {
+        let fullRange = (CMFormatDescriptionGetExtension(formatDescription,
+            extensionKey: kCMFormatDescriptionExtension_FullRangeVideo) as? NSNumber)?.boolValue ?? false
+        let requests = Self.outputPixelFormatRequests(for: bitstream, requiresTenBit444: requiresTenBit444,
+            sourceIsFullRange: fullRange)
+        var selectedRequest: [OSType] = []
+        for candidate in requests {
+            let pixelFormats: Any
+            if candidate.count == 1 { pixelFormats = NSNumber(value: candidate[0]) }
+            else { pixelFormats = candidate.map { NSNumber(value: $0) } as NSArray }
             let attributes: [CFString: Any] = [
-                kCVPixelBufferPixelFormatTypeKey: NSNumber(value: candidate),
+                kCVPixelBufferPixelFormatTypeKey: pixelFormats,
                 kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
                 kCVPixelBufferMetalCompatibilityKey: true,
             ]
@@ -452,10 +451,11 @@ public final class NvstVideoToolboxDecoder: @unchecked Sendable {
             )
             if status == noErr, let attempt {
                 created = attempt
-                chosenFormat = candidate
+                selectedRequest = candidate
+                chosenFormat = candidate.count == 1 ? candidate[0] : 0
                 break
             }
-            onDecodeFailure?(0, "NVST decoder declined output \(Self.pixelFormatName(candidate)) for \(bitstream.summary) (OSStatus \(status)); trying the next format")
+            onDecodeFailure?(0, "NVST decoder declined output \(candidate.map(Self.pixelFormatName).joined(separator: ",")) for \(bitstream.summary) (OSStatus \(status)); trying the next format")
         }
         guard status == noErr, let created else {
             if requiresTenBit444 { throw DecoderError.unsupported444Hardware(status) }
@@ -479,7 +479,12 @@ public final class NvstVideoToolboxDecoder: @unchecked Sendable {
         statsLock.lock()
         usesHardwareDecoder = isHardware
         statsLock.unlock()
-        onDecodeFailure?(0, "NVST decoder session created codec=\(codec.rawValue) hardware=\(isHardware) bitstream=\(bitstream.summary) output=\(Self.pixelFormatName(chosenFormat))")
+        var performanceFormats: Unmanaged<CFTypeRef>?
+        VTSessionCopyProperty(created, key: kVTDecompressionPropertyKey_SupportedPixelFormatsOrderedByPerformance,
+            allocator: kCFAllocatorDefault, valueOut: &performanceFormats)
+        let performance = (performanceFormats?.takeRetainedValue() as? [NSNumber])?
+            .prefix(8).map { Self.pixelFormatName($0.uint32Value) }.joined(separator: ",") ?? "unavailable"
+        onDecodeFailure?(0, "NVST decoder session created codec=\(codec.rawValue) hardware=\(isHardware) bitstream=\(bitstream.summary) sourceRange=\(fullRange ? "full" : "video") requested=\(selectedRequest.map(Self.pixelFormatName).joined(separator: ",")) nativeFastest=\(performance)")
         // Creating a hardware decompression session costs hundreds of milliseconds, and it happens
         // on the frame path — so a rebuild storm reads as random latency spikes. Counted so a spike
         // can be attributed to it instead of guessed at.

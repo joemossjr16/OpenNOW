@@ -8,6 +8,85 @@ import Metal
 @testable import OpenNOWiOS
 
 final class OpenNOWiOSParityTests: XCTestCase {
+    func testDecodeInboxPreservesHealthyBurstsAndFIFO() {
+        var inbox = NvstDecodeFrameInbox<Int>()
+        for frame in 0..<12 {
+            let events = inbox.offer(frame, isKeyframe: frame == 0, now: 1)
+            XCTAssertEqual(events.discarded, 0)
+            XCTAssertFalse(events.requestKeyframe)
+        }
+        for frame in 0..<12 {
+            let next = inbox.take(now: 80_000_000)
+            XCTAssertEqual(next.entry?.value, frame)
+            XCTAssertFalse(next.events.resynchronised)
+        }
+        XCTAssertNil(inbox.take(now: 80_000_000).entry)
+    }
+
+    func testDecodeInboxOverflowDropsBrokenChainUntilFreshKeyframe() {
+        var inbox = NvstDecodeFrameInbox<Int>(capacity: 4)
+        for frame in 0..<4 { _ = inbox.offer(frame, isKeyframe: frame == 0, now: 1) }
+        let overflow = inbox.offer(4, isKeyframe: false, now: 2)
+        XCTAssertEqual(overflow.discarded, 5)
+        XCTAssertTrue(overflow.resynchronised)
+        XCTAssertTrue(overflow.requestKeyframe)
+        XCTAssertTrue(inbox.awaitingKeyframe)
+        XCTAssertEqual(inbox.count, 0)
+        for frame in 5..<10_000 {
+            let rejected = inbox.offer(frame, isKeyframe: false, now: 3)
+            XCTAssertEqual(rejected.discarded, 1)
+            XCTAssertFalse(rejected.requestKeyframe)
+            XCTAssertEqual(inbox.count, 0)
+        }
+        XCTAssertTrue(inbox.offer(10_000, isKeyframe: false, now: 400_000_002).requestKeyframe)
+        XCTAssertFalse(inbox.offer(10_001, isKeyframe: true, now: 400_000_003).requestKeyframe)
+        _ = inbox.offer(10_002, isKeyframe: false, now: 400_000_004)
+        XCTAssertEqual(inbox.take(now: 400_000_005).entry?.value, 10_001)
+        XCTAssertEqual(inbox.take(now: 400_000_005).entry?.value, 10_002)
+        XCTAssertFalse(inbox.awaitingKeyframe)
+    }
+
+    func testDecodeInboxExpiresQueuedWorkAndKeepsFreshRecoveryKeyframe() {
+        var inbox = NvstDecodeFrameInbox<Int>(capacity: 2)
+        _ = inbox.offer(0, isKeyframe: true, now: 0)
+        _ = inbox.offer(1, isKeyframe: false, now: 1)
+        let expired = inbox.take(now: 250_000_002)
+        XCTAssertNil(expired.entry)
+        XCTAssertEqual(expired.events.discarded, 2)
+        XCTAssertTrue(expired.events.requestKeyframe)
+        _ = inbox.offer(2, isKeyframe: true, now: 250_000_003)
+        _ = inbox.offer(3, isKeyframe: false, now: 250_000_004)
+        let recovery = inbox.offer(4, isKeyframe: true, now: 250_000_005)
+        XCTAssertEqual(recovery.discarded, 2)
+        XCTAssertFalse(recovery.requestKeyframe)
+        XCTAssertEqual(inbox.take(now: 250_000_006).entry?.value, 4)
+        inbox.removeAll()
+        XCTAssertEqual(inbox.count, 0)
+        XCTAssertFalse(inbox.awaitingKeyframe)
+    }
+
+    @available(iOS 17.0, *)
+    func test444DecoderOffersCompatibleRangesWithoutAllowingDepthOrChromaDowngrade() {
+        var format = NvstVideoToolboxDecoder.BitstreamFormat()
+        format.bitDepth = 10; format.chroma = .yuv444
+        for fullRange in [false, true] {
+            let requests = NvstVideoToolboxDecoder.outputPixelFormatRequests(for: format,
+                requiresTenBit444: true, sourceIsFullRange: fullRange)
+            XCTAssertEqual(requests.count, 3)
+            XCTAssertEqual(Set(requests[0]), Set([kCVPixelFormatType_444YpCbCr10BiPlanarFullRange,
+                kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange]))
+            XCTAssertEqual(requests[1], [fullRange ? kCVPixelFormatType_444YpCbCr10BiPlanarFullRange
+                : kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange])
+            for request in requests {
+                XCTAssertTrue(request.allSatisfy { NativeStreamTenBitSurface.chroma($0) == "4:4:4" })
+            }
+        }
+        format.chroma = .yuv420
+        XCTAssertEqual(NvstVideoToolboxDecoder.outputPixelFormatRequests(for: format,
+            requiresTenBit444: false, sourceIsFullRange: false),
+            [[kCVPixelFormatType_420YpCbCr10BiPlanarFullRange]])
+    }
+
     func testDirect444HDRMetalPreservesAlternatingFullResolutionChroma() throws {
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let queue = try XCTUnwrap(device.makeCommandQueue())

@@ -85,12 +85,8 @@ extension NvstVideoToolboxDecoder {
         return format
     }
 
-    /// The `CVPixelBuffer` formats to ask VideoToolbox for, best first. Every entry is full range
-    /// and bi-planar: the Metal path samples luma and interleaved chroma as two textures with the
-    /// same normalised coordinates, so 4:2:2 and 4:4:4 chroma planes of any size bind unchanged,
-    /// and full range is what the YCbCr shaders assume. A 10-bit stream asks for the matching
-    /// 10-bit surface so the decoder no longer truncates every frame to 8 bits before the renderer
-    /// sees it. Strict 4:4:4 offers only full/video-range 10-bit 4:4:4 surfaces.
+    /// Strict 4:4:4 accepts only matching 10-bit bi-planar surfaces. Full/video range
+    /// are both understood by the renderer; neither changes chroma resolution or depth.
     static func validate444Bitstream(_ format: BitstreamFormat) throws {
         guard format.bitDepth == 10, format.chroma == .yuv444 else {
             throw DecoderError.requested444NotDelivered(format.summary)
@@ -112,6 +108,19 @@ extension NvstVideoToolboxDecoder {
         default: preferred = []
         }
         return format.isTenBit ? preferred : preferred + [fallback]
+    }
+
+    /// Offer both compatible 4:4:4 ranges together so VideoToolbox can choose its
+    /// preferred output, rather than forcing a range conversion. Single-format requests
+    /// remain a fallback for decoders that decline a Core Video format array.
+    static func outputPixelFormatRequests(for format: BitstreamFormat, requiresTenBit444: Bool,
+                                         sourceIsFullRange: Bool) -> [[OSType]] {
+        var candidates = preferredOutputPixelFormats(for: format, requiresTenBit444: requiresTenBit444)
+        if requiresTenBit444 {
+            if !sourceIsFullRange { candidates.reverse() }
+            return [candidates] + candidates.map { [$0] }
+        }
+        return candidates.map { [$0] }
     }
 
     static func pixelFormatName(_ format: OSType) -> String {
