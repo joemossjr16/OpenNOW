@@ -46,7 +46,7 @@ CHECK = r"""
   let formats:[OSType] = [kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
     kCVPixelFormatType_422YpCbCr10BiPlanarFullRange,kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange,
     kCVPixelFormatType_444YpCbCr10BiPlanarFullRange,kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange]
-  for format in formats { for transfer in [1,2] { for upscale in [false,true] {
+  for format in formats { for transfer in [1,2] { for upscale in [false,true] { for native in (transfer == 1 ? [false,true] : [false]) {
    let input = fixture(format: format,transfer: transfer == 1 ? kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ : kCVImageBufferTransferFunction_ITU_R_2100_HLG)
    let image = CIImage(cvPixelBuffer:input)
    let output = target(), reference = { () -> any MTLTexture in
@@ -72,9 +72,12 @@ CHECK = r"""
    for _ in 0..<500 {
     let producer=queue.makeCommandBuffer()!
     let pair=AsyncStream<Bool>.makeStream()
-    success=renderer.submit(image:image,destination:destination,transfer:transfer,upscale:upscale,context:context,producer:producer,target:output) { _,error in
+    let finished: @Sendable (Double,NSError?) -> Void = { _,error in
      if let error { print(error) }; pair.continuation.yield(error == nil); pair.continuation.finish()
     }
+    success = native
+      ? renderer.submit(buffer:input,destination:destination,upscale:upscale,target:output,completion:finished)
+      : renderer.submit(image:image,destination:destination,transfer:transfer,upscale:upscale,context:context,producer:producer,target:output,completion:finished)
     if success { for await ok in pair.stream { precondition(ok) }; break }
     producer.commit(); await producer.completed(); try await Task.sleep(nanoseconds:10_000_000)
    }
@@ -96,11 +99,68 @@ CHECK = r"""
    for y in Int(destination.minY+4)..<Int(destination.maxY-4) { for x in Int(destination.minX+4)..<Int(destination.maxX-4) { for shift in [0,10,20] {
     maximum=max(maximum,abs(Int((actual[y*128+x]>>shift)&1023)-Int((expected[y*128+x]>>shift)&1023)))
    } } }
-   print("compare",String(format:"%08x",format),transfer,upscale,"maximum",maximum,"top",actual[16*128+40]&1023,expected[16*128+40]&1023,"bottom",actual[48*128+40]&1023,expected[48*128+40]&1023)
+   print("compare",native ? "native PQ" : "CI",String(format:"%08x",format),transfer,upscale,"maximum",maximum,"top",actual[16*128+40]&1023,expected[16*128+40]&1023,"bottom",actual[48*128+40]&1023,expected[48*128+40]&1023)
    precondition(maximum<=4,"Metal 4 effects transfer/orientation differs")
    precondition(actual[0]&0x3fffffff==0,"Fit border not black")
-   print("PASS: Metal 4 effects",format,transfer,upscale)
-  } } }
+   print(native ? "PASS: Metal 4 native PQ effects" : "PASS: Metal 4 effects",format,transfer,upscale)
+  } } } }
+
+  let nativeDestination = CGRect(x:16,y:8,width:96,height:48)
+  let timeline = NativeStreamMetalFrameTimeline(device:device)!
+  func renderSwitch(_ input:CVPixelBuffer,_ output:any MTLTexture,native:Bool,
+                    ticket:NativeStreamMetalFrameTimeline.Ticket? = nil) async throws {
+   for _ in 0..<500 {
+    let producer=queue.makeCommandBuffer()!
+    if let ticket, ticket.previous > 0 { producer.encodeWaitForEvent(ticket.event,value:ticket.previous) }
+    let pair=AsyncStream<Bool>.makeStream()
+    let done: @Sendable (Double,NSError?) -> Void = { _,error in
+     if let error { print(error) }; pair.continuation.yield(error == nil);pair.continuation.finish()
+    }
+    let accepted = native
+      ? renderer.submit(buffer:input,destination:nativeDestination,upscale:true,target:output,ticket:ticket,completion:done)
+      : renderer.submit(image:CIImage(cvPixelBuffer:input),destination:nativeDestination,transfer:1,upscale:true,
+          context:context,producer:producer,target:output,ticket:ticket,completion:done)
+    if accepted { for await success in pair.stream { precondition(success) }; return }
+    try await Task.sleep(nanoseconds:10_000_000)
+   }
+   fatalError("Effects setup unavailable: \(renderer.status)")
+  }
+  let warm=fixture(format:kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange,transfer:kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ)
+  let switched=target(),switchReference=target()
+  try await renderSwitch(warm,switched,native:true)
+  for phase in 0..<40 {
+   let input=fixture(format:kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange,
+     transfer:kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ,phase:phase)
+   let ticket=timeline.next()
+   try await renderSwitch(input,switched,native:phase.isMultiple(of:2),ticket:ticket)
+   timeline.accept(ticket)
+   try await renderSwitch(input,switchReference,native:false)
+   let actual=pixels(switched),reference=pixels(switchReference)
+   for i in actual.indices { for shift in [0,10,20] {
+    precondition(abs(Int((actual[i]>>shift)&1023)-Int((reference[i]>>shift)&1023))<=4,
+      "Native/CI switching lost HDR chroma, synchronization or orientation")
+   } }
+  }
+  print("PASS: 40 native PQ ↔ CI MetalFX switches retain pixels and shared timeline")
+  let gate=device.makeSharedEvent()!, pending=AsyncStream<Bool>.makeStream()
+  let done: @Sendable (Double,NSError?) -> Void = { _,error in pending.continuation.yield(error == nil) }
+  precondition(renderer.submit(buffer:warm,destination:nativeDestination,upscale:true,target:switched,
+    ticket:NativeStreamMetalFrameTimeline.Ticket(event:gate,previous:1,value:2),completion:done))
+  precondition(renderer.submit(buffer:warm,destination:nativeDestination,upscale:true,target:switched,
+    ticket:NativeStreamMetalFrameTimeline.Ticket(event:gate,previous:2,value:3),completion:done))
+  precondition(!renderer.submit(buffer:warm,destination:nativeDestination,upscale:true,target:switched,completion:done),
+    "Native effects exceeded two slots")
+  gate.signaledValue=1;var finished=0
+  for await success in pending.stream { precondition(success);finished+=1;if finished==2 { break } }
+  pending.continuation.finish()
+  print("PASS: native PQ effects bound GPU work to two retained slots")
+  for transfer in [kCVImageBufferTransferFunction_ITU_R_2100_HLG,kCVImageBufferTransferFunction_ITU_R_709_2] {
+   let invalid=fixture(format:kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange,transfer:transfer)
+   precondition(!renderer.submit(buffer:invalid,destination:nativeDestination,upscale:true,target:switched) { _,_ in fatalError("Invalid transfer submitted") })
+  }
+  CVBufferSetAttachment(warm,kCVImageBufferColorPrimariesKey,kCVImageBufferColorPrimaries_ITU_R_709_2,.shouldPropagate)
+  precondition(!renderer.submit(buffer:warm,destination:nativeDestination,upscale:true,target:switched) { _,_ in fatalError("Invalid gamut submitted") })
+  print("PASS: non-PQ or non-BT.2020 inputs retain the supported fallback")
 
   for upscale in [false,true] { for sharpen in [false,true] {
    let space = CGColorSpace(name:CGColorSpace.sRGB)!

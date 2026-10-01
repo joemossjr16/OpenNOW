@@ -6603,6 +6603,46 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                 NativeStreamVideoPerformanceLog.record("renderer direct-metal \(NativeStreamTenBitSurface.chroma(CVPixelBufferGetPixelFormatType(pixelBuffer)) ?? "unknown") BT2020 HDR")
             }
         } else {
+            #if !targetEnvironment(simulator)
+            let admission = gpuAdmission
+            let encodeSeconds = CACurrentMediaTime() - effectsStarted
+            let generatedFrame = generated
+            let presentedMetal4: @Sendable (Double) -> Void = { time in
+                rendererTelemetry.recordPresentation(at: time, receivedAt: receivedAt, generated: generatedFrame)
+            }
+            let completeMetal4: @Sendable (Double, NSError?) -> Void = { [weak self, pixelBuffer] duration, error in
+                _ = pixelBuffer
+                admission.signal()
+                if ownsMailboxSlot { mailbox.complete() }
+                rendererTelemetry.recordGPU(duration)
+                let completionTime = max(CACurrentMediaTime() - effectsStarted, duration)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.effectsGeneration == effectsToken else { return }
+                    if error != nil { self.metal4Disabled = true }
+                    if self.frameGenerationEnabled || self.upscalingEnabled {
+                        self.finishEffects(failed: error != nil, generated: generatedFrame,
+                            completionTime: completionTime, encodeSeconds: encodeSeconds,
+                            duration: duration, displayHz: displayHz)
+                    }
+                }
+            }
+            if #available(iOS 26.0, *), !metal4Disabled, hdrTransfer == .pq,
+               effectImage == nil, sharpeningAmount <= 0.001,
+               let effects = metal4EffectsStorage as? NativeStreamMetal4EffectsRenderer,
+               effects.submit(buffer: pixelBuffer, destination: destination, upscale: shouldUpscale,
+                    target: drawable.texture, drawable: drawable, ticket: ticket,
+                    presented: presentedMetal4, completion: completeMetal4) {
+                if let ticket { submissionTimeline?.accept(ticket) }
+                rendererBackend = "Metal 4 · native PQ conversion"
+                metal4UpscalingStatus = shouldUpscale ? effects.status : nil
+                if videoEffectsStatus != lastEffectsStatus {
+                    lastEffectsStatus = videoEffectsStatus
+                    NativeStreamVideoPerformanceLog.record("video-effects " + videoEffectsStatus)
+                }
+                submitted = true
+                return
+            }
+            #endif
             if let descriptor = view.currentRenderPassDescriptor,
                let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) {
                 encoder.endEncoding()
@@ -6630,31 +6670,11 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
             #if !targetEnvironment(simulator)
             if #available(iOS 26.0, *), !metal4Disabled,
                let effects = metal4EffectsStorage as? NativeStreamMetal4EffectsRenderer {
-                let admission = gpuAdmission
-                let encodeSeconds = CACurrentMediaTime() - effectsStarted
-                let generatedFrame = generated
                 if effects.submit(image: filteredImage, destination: destination,
                     transfer: hdrTransfer == .pq ? 1 : hdrTransfer == .hlg ? 2 : 0,
                     upscale: shouldUpscale, context: ciContext, producer: commandBuffer,
                     target: drawable.texture, drawable: drawable, ticket: ticket,
-                    presented: { time in
-                        rendererTelemetry.recordPresentation(at: time, receivedAt: receivedAt, generated: generatedFrame)
-                    }, completion: { [weak self, pixelBuffer] duration, error in
-                        _ = pixelBuffer
-                        admission.signal()
-                        if ownsMailboxSlot { mailbox.complete() }
-                        rendererTelemetry.recordGPU(duration)
-                        let completionTime = max(CACurrentMediaTime() - effectsStarted, duration)
-                        DispatchQueue.main.async { [weak self] in
-                            guard let self, self.effectsGeneration == effectsToken else { return }
-                            if error != nil { self.metal4Disabled = true }
-                            if self.frameGenerationEnabled || self.upscalingEnabled {
-                                self.finishEffects(failed: error != nil, generated: generatedFrame,
-                                    completionTime: completionTime, encodeSeconds: encodeSeconds,
-                                    duration: duration, displayHz: displayHz)
-                            }
-                        }
-                    }) {
+                    presented: presentedMetal4, completion: completeMetal4) {
                     if let ticket { submissionTimeline?.accept(ticket) }
                     rendererBackend = generated ? "Metal 4 · interpolated presentation" : "Metal 4 · effects presentation"
                     if shouldUpscale { metal4UpscalingStatus = effects.status } else { metal4UpscalingStatus = nil }

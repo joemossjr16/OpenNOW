@@ -24,6 +24,19 @@ enum NativeStreamTenBitSurface {
             && CVPixelBufferGetWidthOfPlane(buffer, 0) == CVPixelBufferGetWidthOfPlane(buffer, 1)
             && CVPixelBufferGetHeightOfPlane(buffer, 0) == CVPixelBufferGetHeightOfPlane(buffer, 1)
     }
+
+    static func hasValidPlanes(_ buffer: CVPixelBuffer) -> Bool {
+        guard let chroma = chroma(CVPixelBufferGetPixelFormatType(buffer)),
+              CVPixelBufferGetPlaneCount(buffer) == 2 else { return false }
+        let width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer)
+        let horizontal = chroma == "4:4:4" ? 1 : 2
+        let vertical = chroma == "4:2:0" ? 2 : 1
+        return width > 0 && height > 0
+            && CVPixelBufferGetWidthOfPlane(buffer, 0) == width
+            && CVPixelBufferGetHeightOfPlane(buffer, 0) == height
+            && CVPixelBufferGetWidthOfPlane(buffer, 1) == (width + horizontal - 1) / horizontal
+            && CVPixelBufferGetHeightOfPlane(buffer, 1) == (height + vertical - 1) / vertical
+    }
 }
 
 /// One owner for source validation, range/matrix math and orientation in both APIs.
@@ -40,8 +53,7 @@ enum NativeStreamHDRMetalProgram {
         let uniforms: Uniforms
         init?(buffer: CVPixelBuffer, cache: CVMetalTextureCache, target: any MTLTexture, destination: CGRect) {
             let format = CVPixelBufferGetPixelFormatType(buffer)
-            guard NativeStreamTenBitSurface.chroma(format) != nil,
-                  CVPixelBufferGetPlaneCount(buffer) == 2,
+            guard NativeStreamTenBitSurface.hasValidPlanes(buffer),
                   destination.width > 0, destination.height > 0,
                   target.pixelFormat == .bgr10a2Unorm,
                   CVBufferCopyAttachment(buffer,kCVImageBufferYCbCrMatrixKey,nil) as? String
@@ -74,15 +86,18 @@ enum NativeStreamHDRMetalProgram {
         const float2 uv[] = {float2(0,0), float2(0,1), float2(1,0), float2(1,1)};
         return {float4(positions[id],0,1), uv[id]};
     }
+    float3 hdrEncodedRGB(texture2d<float> y, texture2d<float> uv, float2 coordinate, constant Uniforms &u) {
+        constexpr sampler sample(filter::linear, address::clamp_to_edge);
+        float luma = (y.sample(sample,coordinate).r * u.coefficients.x - u.range.x) / u.range.y;
+        float2 chroma = (uv.sample(sample,coordinate).rg * u.coefficients.x - u.range.z) / u.range.w;
+        return float3(luma + u.coefficients.y * chroma.y,
+                      luma + dot(u.green.xy,chroma),
+                      luma + u.coefficients.z * chroma.x);
+    }
     fragment float4 hdrFragment(Vertex v [[stage_in]],
         texture2d<float> y [[texture(0)]], texture2d<float> uv [[texture(1)]],
         constant Uniforms &u [[buffer(0)]]) {
-        constexpr sampler sample(filter::linear, address::clamp_to_edge);
-        float luma = (y.sample(sample,v.uv).r * u.coefficients.x - u.range.x) / u.range.y;
-        float2 chroma = (uv.sample(sample,v.uv).rg * u.coefficients.x - u.range.z) / u.range.w;
-        return float4(luma + u.coefficients.y * chroma.y,
-                      luma + dot(u.green.xy,chroma),
-                      luma + u.coefficients.z * chroma.x, 1);
+        return float4(hdrEncodedRGB(y, uv, v.uv, u), 1);
     }
     """
 }

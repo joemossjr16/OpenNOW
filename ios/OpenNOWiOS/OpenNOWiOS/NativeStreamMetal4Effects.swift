@@ -8,8 +8,8 @@ import MetalFX
 
 #if !targetEnvironment(simulator)
 /// Metal 4 presentation and spatial upscaling for decoded and interpolated images.
-/// Core Image and VTFrameProcessor currently accept only legacy command buffers.
-/// Their producer signals an event; the Metal 4 consumer never waits on the CPU.
+/// Native PQ planes convert directly on this queue. Core Image and VTFrameProcessor
+/// producers for other inputs signal a GPU event without blocking CPU waits.
 @available(iOS 26.0, macOS 26.0, *)
 final class NativeStreamMetal4EffectsRenderer {
     private struct Key: Hashable {
@@ -21,6 +21,7 @@ final class NativeStreamMetal4EffectsRenderer {
         let allocator: any MTL4CommandAllocator
         let command: any MTL4CommandBuffer
         let arguments: any MTL4ArgumentTable
+        let conversionArguments: any MTL4ArgumentTable
         let residency: any MTLResidencySet
         let uniforms: any MTLBuffer
         let input, output: any MTLTexture
@@ -37,7 +38,8 @@ final class NativeStreamMetal4EffectsRenderer {
     private let device: any MTLDevice
     private let queue: any MTL4CommandQueue
     private let compiler: any MTL4Compiler
-    private let sdrPipeline, hdrPipeline: any MTLRenderPipelineState
+    private let sdrPipeline, hdrPipeline, pqConversionPipeline: any MTLRenderPipelineState
+    private let textureCache: CVMetalTextureCache
     private let producerEvent: any MTLSharedEvent
     private var producerValue: UInt64 = 0
     private let setupQueue = DispatchQueue(label: "OpenNOW.Metal4FX.setup", qos: .userInitiated)
@@ -49,18 +51,25 @@ final class NativeStreamMetal4EffectsRenderer {
     init?(device: any MTLDevice) {
         guard NativeStreamMetal4HDRRenderer.isSupported(device: device),
               let queue = device.makeMTL4CommandQueue(), let event = device.makeSharedEvent() else { return nil }
+        var cache: CVMetalTextureCache?
+        guard CVMetalTextureCacheCreate(nil, nil, device, nil, &cache) == kCVReturnSuccess,
+              let cache else { return nil }
         do {
             let compiler = try device.makeCompiler(descriptor: MTL4CompilerDescriptor())
-            let library = try device.makeLibrary(source: Self.shader, options: nil)
-            func pipeline(_ format: MTLPixelFormat) throws -> any MTLRenderPipelineState {
+            let compileOptions = MTLCompileOptions()
+            compileOptions.mathMode = .safe
+            let library = try device.makeLibrary(source: NativeStreamHDRMetalProgram.shader + "\n" + Self.shader, options: compileOptions)
+            func pipeline(_ format: MTLPixelFormat, fragmentName: String = "effectsFragment") throws -> any MTLRenderPipelineState {
                 let descriptor = MTL4RenderPipelineDescriptor()
                 let vertex = MTL4LibraryFunctionDescriptor(); vertex.library = library; vertex.name = "effectsVertex"
-                let fragment = MTL4LibraryFunctionDescriptor(); fragment.library = library; fragment.name = "effectsFragment"
+                let fragment = MTL4LibraryFunctionDescriptor(); fragment.library = library; fragment.name = fragmentName
                 descriptor.vertexFunctionDescriptor = vertex; descriptor.fragmentFunctionDescriptor = fragment
                 descriptor.colorAttachments[0].pixelFormat = format
                 return try compiler.makeRenderPipelineState(descriptor: descriptor)
             }
             sdrPipeline = try pipeline(.bgra8Unorm); hdrPipeline = try pipeline(.bgr10a2Unorm)
+            pqConversionPipeline = try pipeline(.rgba16Float, fragmentName: "pqLinearFragment")
+            textureCache = cache
             self.device = device; self.queue = queue; self.compiler = compiler; producerEvent = event
         } catch { return nil }
     }
@@ -70,8 +79,36 @@ final class NativeStreamMetal4EffectsRenderer {
                 drawable: (any MTLDrawable)? = nil, ticket: NativeStreamMetalFrameTimeline.Ticket? = nil,
                 presented: (@Sendable (Double) -> Void)? = nil,
                 completion: @escaping @Sendable (Double, NSError?) -> Void) -> Bool {
-        let size = image.extent.size
+        submit(image: image, native: nil, destination: destination, transfer: transfer, upscale: upscale,
+               context: context, producer: producer, target: target, drawable: drawable, ticket: ticket,
+               presented: presented, completion: completion)
+    }
+    /// Zero-copy PQ 10-bit 4:2:0/4:2:2/4:4:4 -> linear HDR -> MetalFX -> PQ.
+    /// False submits nothing; unsupported metadata or warm-up keeps the CI fallback.
+    func submit(buffer: CVPixelBuffer, destination: CGRect, upscale: Bool, target: any MTLTexture,
+                drawable: (any MTLDrawable)? = nil, ticket: NativeStreamMetalFrameTimeline.Ticket? = nil,
+                presented: (@Sendable (Double) -> Void)? = nil,
+                completion: @escaping @Sendable (Double, NSError?) -> Void) -> Bool {
+        guard CVBufferCopyAttachment(buffer, kCVImageBufferTransferFunctionKey, nil) as? String
+                == kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String,
+              CVBufferCopyAttachment(buffer, kCVImageBufferColorPrimariesKey, nil) as? String
+                == kCVImageBufferColorPrimaries_ITU_R_2020 as String,
+              let input = NativeStreamHDRMetalProgram.Input(buffer: buffer, cache: textureCache,
+                  target: target, destination: destination) else { return false }
+        return submit(image: nil, native: input, destination: destination, transfer: 1, upscale: upscale,
+                      context: nil, producer: nil, target: target, drawable: drawable, ticket: ticket,
+                      presented: presented, completion: completion)
+    }
+    private func submit(image: CIImage?, native: NativeStreamHDRMetalProgram.Input?,
+                destination: CGRect, transfer: Int, upscale: Bool,
+                context: CIContext?, producer: (any MTLCommandBuffer)?, target: any MTLTexture,
+                drawable: (any MTLDrawable)?, ticket: NativeStreamMetalFrameTimeline.Ticket?,
+                presented: (@Sendable (Double) -> Void)?,
+                completion: @escaping @Sendable (Double, NSError?) -> Void) -> Bool {
+        let size = native.map { CGSize(width: $0.y.width, height: $0.y.height) } ?? image?.extent.size ?? .zero
         guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0,
+              native != nil || (image != nil && context != nil && producer != nil),
+              destination.width.isFinite, destination.height.isFinite, destination.width > 0, destination.height > 0,
               transfer >= 0, transfer <= 2,
               target.pixelFormat == (transfer == 0 ? .bgra8Unorm : .bgr10a2Unorm) else { return false }
         let outputSize = upscale ? NativeStreamVideoEffectsPolicy.upscaleSize(source: size, destination: destination.size) : nil
@@ -84,20 +121,45 @@ final class NativeStreamMetal4EffectsRenderer {
         }
         guard let index = resource.take() else { return false }
         let slot = resource.slots[index]
-        let space = NativeStreamVideoEffectsPolicy.workingColorSpace(hdr: transfer != 0)
-        let source = key.upscale ? NativeStreamVideoEffectsPolicy.spatialInput(image: image, hdr: transfer != 0) : image
-        context.render(source.transformed(by: CGAffineTransform(translationX: -image.extent.minX, y: -image.extent.minY)),
-            to: slot.input, commandBuffer: producer,
-            bounds: CGRect(x: 0, y: 0, width: key.width, height: key.height), colorSpace: space)
-        producer.addCompletedHandler { [resource] _ in _ = resource }
+        if let image, let context, let producer {
+            let space = NativeStreamVideoEffectsPolicy.workingColorSpace(hdr: transfer != 0)
+            let source = key.upscale ? NativeStreamVideoEffectsPolicy.spatialInput(image: image, hdr: transfer != 0) : image
+            context.render(source.transformed(by: CGAffineTransform(translationX: -image.extent.minX, y: -image.extent.minY)),
+                to: slot.input, commandBuffer: producer,
+                bounds: CGRect(x: 0, y: 0, width: key.width, height: key.height), colorSpace: space)
+            producer.addCompletedHandler { [resource] _ in _ = resource }
+        }
         slot.allocator.reset(); slot.residency.removeAllAllocations()
         for texture in [slot.input, slot.output, target] { slot.residency.addAllocation(texture) }
+        if let native { slot.residency.addAllocation(native.y); slot.residency.addAllocation(native.uv) }
         slot.residency.addAllocation(slot.uniforms); slot.residency.commit()
         var uniforms = SIMD4<Float>(Float(transfer), 0, 0, 0)
         withUnsafeBytes(of: &uniforms) { slot.uniforms.contents().copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
         slot.arguments.setAddress(slot.uniforms.gpuAddress, index: 0)
         slot.arguments.setTexture(slot.output.gpuResourceID, index: 0)
         slot.command.beginCommandBuffer(allocator: slot.allocator); slot.command.useResidencySet(slot.residency)
+        if let native {
+            var conversion = native.uniforms
+            let offset = MemoryLayout<SIMD4<Float>>.stride
+            withUnsafeBytes(of: &conversion) { slot.uniforms.contents().advanced(by: offset).copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
+            slot.conversionArguments.setAddress(slot.uniforms.gpuAddress + UInt64(offset), index: 0)
+            slot.conversionArguments.setTexture(native.y.gpuResourceID, index: 0)
+            slot.conversionArguments.setTexture(native.uv.gpuResourceID, index: 1)
+            let conversionPass = MTL4RenderPassDescriptor()
+            conversionPass.colorAttachments[0].texture = slot.input
+            conversionPass.colorAttachments[0].loadAction = .dontCare
+            conversionPass.colorAttachments[0].storeAction = .store
+            guard let encoder = slot.command.makeRenderCommandEncoder(descriptor: conversionPass) else {
+                slot.command.endCommandBuffer(); resource.release(index); return false
+            }
+            encoder.setRenderPipelineState(pqConversionPipeline)
+            encoder.setViewport(MTLViewport(originX: 0, originY: 0, width: Double(key.width), height: Double(key.height), znear: 0, zfar: 1))
+            encoder.setArgumentTable(slot.conversionArguments, stages: .fragment)
+            encoder.drawPrimitives(primitiveType: .triangleStrip, vertexStart: 0, vertexCount: 4)
+            // Conversion's fragment writes must be visible to MetalFX's passes.
+            encoder.barrier(afterStages: [.fragment, .tile], beforeQueueStages: .all, visibilityOptions: .device)
+            encoder.endEncoding()
+        }
         if let scaler = slot.scaler {
             scaler.colorTexture = slot.input; scaler.outputTexture = slot.output
             scaler.inputContentWidth = key.width; scaler.inputContentHeight = key.height
@@ -110,43 +172,48 @@ final class NativeStreamMetal4EffectsRenderer {
             slot.command.endCommandBuffer(); resource.release(index); return false
         }
         // Metal 4 does not infer dependencies between the scaler and fragment read.
-        encoder.barrier(afterQueueStages: [.dispatch, .fragment, .vertex, .blit], beforeStages: .fragment, visibilityOptions: .device)
+        encoder.barrier(afterQueueStages: .all, beforeStages: .fragment, visibilityOptions: .device)
         encoder.setRenderPipelineState(transfer == 0 ? sdrPipeline : hdrPipeline)
         encoder.setViewport(MTLViewport(originX: destination.minX, originY: destination.minY,
             width: destination.width, height: destination.height, znear: 0, zfar: 1))
         encoder.setArgumentTable(slot.arguments, stages: .fragment)
         encoder.drawPrimitives(primitiveType: .triangleStrip, vertexStart: 0, vertexCount: 4)
         encoder.endEncoding(); slot.command.endCommandBuffer()
-        producerValue += 1
-        let value = producerValue, event = producerEvent
-        producer.encodeSignalEvent(event, value: value)
         // A failed producer can skip its GPU signal. Only unblock after completion;
         // report the error to the consumer completion as well as recovering the event.
         let producerFailure = ProducerFailure()
-        producer.addCompletedHandler { command in
-            if command.status == .error {
-                producerFailure.set(command.error as NSError?)
-                event.signaledValue = max(event.signaledValue, value)
+        if let producer {
+            producerValue += 1
+            let value = producerValue, event = producerEvent
+            producer.encodeSignalEvent(event, value: value)
+            producer.addCompletedHandler { command in
+                if command.status == .error {
+                    producerFailure.set(command.error as NSError?)
+                    event.signaledValue = max(event.signaledValue, value)
+                }
             }
         }
         let options = MTL4CommitOptions()
-        options.addFeedbackHandler { [resource, slot, target, drawable, producer] feedback in
-            _ = (slot, target, drawable)
+        options.addFeedbackHandler { [resource, slot, target, drawable, producer, native] feedback in
+            _ = (slot, target, drawable, native)
             let error = producerFailure.error ?? feedback.error as NSError?
             if error != nil { ticket?.recoverAfterGPUFailure() }
             resource.release(index)
-            completion(max(feedback.gpuEndTime - feedback.gpuStartTime, 0) + max(producer.gpuEndTime - producer.gpuStartTime, 0), error)
+            let producerDuration = producer.map { max($0.gpuEndTime - $0.gpuStartTime, 0) } ?? 0
+            completion(max(feedback.gpuEndTime - feedback.gpuStartTime, 0) + producerDuration, error)
         }
         if let drawable, let presented { drawable.addPresentedHandler { value in
             if value.presentedTime > 0 { presented(value.presentedTime) }
         } }
-        producer.commit()
-        queue.waitForEvent(event, value: value)
+        if let producer {
+            producer.commit(); queue.waitForEvent(producerEvent, value: producerValue)
+        } else if let ticket, ticket.previous > 0 { queue.waitForEvent(ticket.event, value: ticket.previous) }
         if let drawable { queue.waitForDrawable(drawable) }
         queue.commit([slot.command], options: options)
         if let ticket { queue.signalEvent(ticket.event, value: ticket.value) }
         if let drawable { queue.signalDrawable(drawable); drawable.present() }
-        status = key.upscale ? "Metal 4 · \(key.width)×\(key.height) → \(key.outputWidth)×\(key.outputHeight)" : "Metal 4 · presentation"
+        status = key.upscale ? "Metal 4 · \(key.width)×\(key.height) → \(key.outputWidth)×\(key.outputHeight)"
+            : upscale ? "No upscale: \(key.width)×\(key.height) → \(Int(destination.width))×\(Int(destination.height))" : "Metal 4 · presentation"
         return true
     }
     private final class ProducerFailure: @unchecked Sendable {
@@ -180,11 +247,13 @@ final class NativeStreamMetal4EffectsRenderer {
                     guard let input = texture(key.width, key.height, scaler?.colorTextureUsage ?? []),
                           let output = key.upscale ? texture(key.outputWidth, key.outputHeight, scaler?.outputTextureUsage ?? []) : input,
                           let allocator = device.makeCommandAllocator(), let command = device.makeCommandBuffer(),
-                          let uniforms = device.makeBuffer(length: MemoryLayout<SIMD4<Float>>.stride, options: .storageModeShared)
+                          let uniforms = device.makeBuffer(length: MemoryLayout<SIMD4<Float>>.stride + MemoryLayout<NativeStreamHDRMetalProgram.Uniforms>.stride, options: .storageModeShared)
                         else { throw NSError(domain: "OpenNOW.Metal4FX", code: 2) }
                     let table = MTL4ArgumentTableDescriptor(); table.maxTextureBindCount = 1; table.maxBufferBindCount = 1
-                    let residency = MTLResidencySetDescriptor(); residency.initialCapacity = 4
+                    let conversionTable = MTL4ArgumentTableDescriptor(); conversionTable.maxTextureBindCount = 2; conversionTable.maxBufferBindCount = 1
+                    let residency = MTLResidencySetDescriptor(); residency.initialCapacity = 6
                     slots.append(Slot(allocator: allocator, command: command, arguments: try device.makeArgumentTable(descriptor: table),
+                        conversionArguments: try device.makeArgumentTable(descriptor: conversionTable),
                         residency: try device.makeResidencySet(descriptor: residency), uniforms: uniforms, input: input, output: output, scaler: scaler))
                 }
             } catch { slots.removeAll() }
@@ -209,6 +278,16 @@ final class NativeStreamMetal4EffectsRenderer {
         const float2 p[] = {float2(-1,1),float2(-1,-1),float2(1,1),float2(1,-1)};
         const float2 uv[] = {float2(0,1),float2(0,0),float2(1,1),float2(1,0)};
         return {float4(p[id],0,1),uv[id]};
+    }
+    fragment float4 pqLinearFragment(V v [[stage_in]], texture2d<float> y [[texture(0)]],
+        texture2d<float> uv [[texture(1)]], constant Uniforms &u [[buffer(0)]]) {
+        // ST.2084 EOTF, in CI's linear BT.2020 units (203 nit white).
+        // Use the shared range/matrix conversion; keep full-resolution 4:4:4.
+        float3 encoded = clamp(hdrEncodedRGB(y, uv, v.uv, u), 0.0f, 1.0f);
+        float3 p = pow(encoded, float3(32.0f/2523.0f));
+        float3 linear = pow(max(p - 3424.0f/4096.0f, 0.0f) /
+            max(2413.0f/128.0f - (2392.0f/128.0f)*p, 1e-6f), float3(16384.0f/2610.0f)) / 0.0203f;
+        return float4(linear, 1);
     }
     fragment float4 effectsFragment(V v [[stage_in]], texture2d<float> image [[texture(0)]], constant float4 &u [[buffer(0)]]) {
         constexpr sampler s(filter::linear,address::clamp_to_edge);

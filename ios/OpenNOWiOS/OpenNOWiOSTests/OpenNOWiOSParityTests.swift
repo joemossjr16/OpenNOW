@@ -451,6 +451,25 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(realOnly.generatedFPS,0); XCTAssertEqual(realOnly.displayedFPS,60,accuracy:0.01)
     }
 
+    func testSpatialInputClampsInScalerGamutAndRetainsHDRHighlights() throws {
+        let context = CIContext(options: [.workingColorSpace: NativeStreamVideoEffectsPolicy.workingColorSpace(hdr: false),
+                                          .workingFormat: CIFormat.RGBAf])
+        for (hdr, source, expected) in [(true, [Float(4), 0, 0, 1], [Float(4), 0, 0, 1]),
+                                       (false, [Float(-0.5), 2, 0.5, 1], [Float(0), 1, 0.5, 1])] {
+            let space = NativeStreamVideoEffectsPolicy.workingColorSpace(hdr: hdr)
+            let image = source.withUnsafeBytes { CIImage(bitmapData: Data($0), bytesPerRow: 16,
+                size: CGSize(width: 1, height: 1), format: .RGBAf, colorSpace: space) }
+            let clamped = NativeStreamVideoEffectsPolicy.spatialInput(image: image, hdr: hdr)
+            var values = [Float](repeating: 0, count: 4)
+            values.withUnsafeMutableBytes { context.render(clamped, toBitmap: $0.baseAddress!, rowBytes: 16,
+                bounds: image.extent, format: .RGBAf, colorSpace: space) }
+            for component in 0..<4 {
+                XCTAssertEqual(values[component], expected[component], accuracy: 0.005,
+                    "Clamping must retain saturated BT.2020 HDR and bound SDR overshoot")
+            }
+        }
+    }
+
     func testHDRMetalProgramRejectsUnsupportedFormatMatrixAndTransfer() throws {
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         var cache: CVMetalTextureCache?
@@ -464,6 +483,8 @@ final class OpenNOWiOSParityTests: XCTestCase {
             XCTAssertEqual(CVPixelBufferCreate(nil,16,8,format,
                 [kCVPixelBufferIOSurfacePropertiesKey:[:],kCVPixelBufferMetalCompatibilityKey:true] as CFDictionary,&allocation),kCVReturnSuccess)
             let buffer = try XCTUnwrap(allocation)
+            XCTAssertEqual(NativeStreamTenBitSurface.hasValidPlanes(buffer),
+                format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange)
             func input() -> NativeStreamHDRMetalProgram.Input? {
                 NativeStreamHDRMetalProgram.Input(buffer:buffer,cache:cache!,target:target,destination:destination)
             }

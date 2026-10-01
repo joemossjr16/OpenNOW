@@ -130,10 +130,15 @@ enum NativeStreamVideoEffectsPolicy {
     /// input is defined only in [0,1]; invalid values can produce NaN output.
     /// HDR retains its half-float range and highlights rather than clipping to SDR.
     static func spatialInput(image: CIImage, hdr: Bool) -> CIImage {
-        image.applyingFilter("CIColorClamp", parameters: [
+        // Clamp in the scaler's RGB space. Clamping HDR in CI's default sRGB
+        // working space clips valid saturated BT.2020 colors before upscaling.
+        let space = workingColorSpace(hdr: hdr)
+        let linear = image.matchedFromWorkingSpace(to: space) ?? image
+        let clamped = linear.applyingFilter("CIColorClamp", parameters: [
             "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
             "inputMaxComponents": CIVector(x: hdr ? 65504 : 1, y: hdr ? 65504 : 1, z: hdr ? 65504 : 1, w: 1)
         ]).cropped(to: image.extent)
+        return clamped.matchedToWorkingSpace(from: space) ?? clamped
     }
 
     static func workingColorSpace(hdr: Bool) -> CGColorSpace {
