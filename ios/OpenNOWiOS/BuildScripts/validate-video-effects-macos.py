@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""Validate the shared video-effects implementations on a physical Mac GPU.
+
+MetalFX is absent from the iOS simulator SDK. These synthetic checks exercise
+real MetalFX HDR upscaling/readback and native video interpolation separately.
+They do not establish iPhone/iPad capabilities or real-time performance.
+Run from the repository root on an Apple Silicon Mac with Xcode 26+.
+"""
+from pathlib import Path
+import platform
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parents[3]
+source = (root / 'ios/OpenNOWiOS/OpenNOWiOS/NativeStreamVideoEffects.swift').read_text()
+if platform.system() != 'Darwin' or platform.machine() != 'arm64':
+    raise SystemExit('These checks require an Apple Silicon Mac.')
+
+METALFX = r"""
+@main struct MetalFXCheck {
+ @MainActor static func main() async throws {
+  setbuf(stdout, nil)
+  guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else { fatalError("No Metal device") }
+  precondition(MTLFXSpatialScalerDescriptor.supportsDevice(device), "MetalFX spatial unsupported")
+  let context = CIContext(mtlDevice: device, options: [.cacheIntermediates: false])
+  let space = NativeStreamVideoEffectsPolicy.workingColorSpace(hdr: true)
+  let scaler = NativeStreamSpatialUpscaler(device: device)
+  var pixels = [Float](repeating: 0, count: 64 * 32 * 4)
+  for y in 0..<32 { for x in 0..<64 {
+   let i = (y * 64 + x) * 4
+   pixels[i] = x < 32 ? 4 : 0.1
+   pixels[i+1] = y < 16 ? 0.1 : 2
+   pixels[i+2] = 0.25; pixels[i+3] = 1
+  } }
+  let image = pixels.withUnsafeBytes { CIImage(bitmapData: Data($0), bytesPerRow: 64 * 16,
+   size: CGSize(width: 64, height: 32), format: .RGBAf, colorSpace: space) }
+  var result: CIImage?
+  for _ in 0..<500 {
+   let command = queue.makeCommandBuffer()!
+   result = scaler.encode(image: image, sourceSize: image.extent.size, destinationSize: CGSize(width: 128, height: 64),
+    hdr: true, context: context, commandBuffer: command)
+   command.commit(); await command.completed()
+   precondition(command.status == .completed, "GPU command failed")
+   if result != nil { break }
+   try await Task.sleep(nanoseconds: 10_000_000)
+  }
+  guard let output = result else { fatalError(scaler.status) }
+  let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: 128, height: 64, mipmapped: false)
+  td.storageMode = .shared; td.usage = [.renderTarget, .shaderRead, .shaderWrite]
+  let texture = device.makeTexture(descriptor: td)!, command = queue.makeCommandBuffer()!
+  context.render(output, to: texture, commandBuffer: command, bounds: output.extent, colorSpace: space)
+  command.commit(); await command.completed()
+  precondition(command.status == .completed)
+  var values = [Float](repeating: 0, count: 128 * 64 * 4)
+  values.withUnsafeMutableBytes { texture.getBytes($0.baseAddress!, bytesPerRow: 128*16,
+   from: MTLRegionMake2D(0,0,128,64), mipmapLevel: 0) }
+  let reds = [values[4128], values[4576]]
+  let greens = [values[4129], values[28705]]
+  print("MetalFX HDR output", output.extent.size, "red", reds, "green", greens)
+  precondition(reds[0] > 3 && reds[1] < 0.5 && greens[0] < 0.5 && greens[1] > 1.5,
+   "HDR highlight or orientation regression")
+  print("PASS: real MetalFX spatial GPU encode, HDR highlights >1, correct image orientation")
+  if VTLowLatencyFrameInterpolationConfiguration.isSupported,
+   let config = VTLowLatencyFrameInterpolationConfiguration(frameWidth: 1920, frameHeight: 1080, numberOfInterpolatedFrames: 1) {
+   print("Mac interpolation formats:", config.supportedPixelFormats.map { String(format: "%08x", $0) })
+  }
+ }
+}
+"""
+
+FRAME_GENERATION = r"""
+enum NativeStreamHDRTransfer { case sdr, pq; static func detect(in buffer: CVPixelBuffer) -> Self { CVBufferCopyAttachment(buffer, kCVImageBufferTransferFunctionKey, nil) as? String == kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String ? .pq : .sdr } }
+enum NativeStreamVideoPerformanceLog { static func record(_ text: String) { print(text) } }
+@main struct InterpolationCheck {
+ @MainActor static func main() async throws {
+  setbuf(stdout, nil)
+  let device = MTLCreateSystemDefaultDevice()!, queue = device.makeCommandQueue()!
+  let context = CIContext(mtlDevice: device, options: [.cacheIntermediates: false])
+  let generator = NativeStreamFrameGenerator()
+  func source(offset: Int) -> CVPixelBuffer {
+   var allocation: CVPixelBuffer?
+   precondition(CVPixelBufferCreate(nil, 1920, 1080, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+    [kCVPixelBufferIOSurfacePropertiesKey: [:], kCVPixelBufferMetalCompatibilityKey: true] as CFDictionary, &allocation) == kCVReturnSuccess)
+   let value = allocation!
+   CVPixelBufferLockBaseAddress(value, [])
+   memset(CVPixelBufferGetBaseAddressOfPlane(value, 0)!, 32, CVPixelBufferGetBytesPerRowOfPlane(value, 0)*1080)
+   memset(CVPixelBufferGetBaseAddressOfPlane(value, 1)!, 128, CVPixelBufferGetBytesPerRowOfPlane(value, 1)*540)
+   let base = CVPixelBufferGetBaseAddressOfPlane(value, 0)!.assumingMemoryBound(to: UInt8.self)
+   let stride = CVPixelBufferGetBytesPerRowOfPlane(value, 0)
+   for y in 300..<700 { for x in (600+offset)..<(900+offset) { base[y*stride+x] = 220 } }
+   CVPixelBufferUnlockBaseAddress(value, [])
+   CVBufferSetAttachment(value, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
+   CVBufferSetAttachment(value, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
+   CVBufferSetAttachment(value, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
+   return value
+  }
+  let first = source(offset: 0), second = source(offset: 12)
+  var result: CIImage?
+  for i in 0..<500 {
+   let command = queue.makeCommandBuffer()!
+   let timestamp = Int64(1_000_000_000) + Int64(i)*16_666_667
+   result = generator.encode(buffer: i.isMultiple(of: 2) ? first : second, timestamp: timestamp,
+    device: device, context: context, commandBuffer: command)
+   command.commit(); await command.completed()
+   precondition(command.status == .completed, "Interpolation GPU error")
+   if result != nil {
+    print("Native interpolation status:", generator.status, "GPU ms:", (command.gpuEndTime-command.gpuStartTime)*1000)
+    break
+   }
+   try await Task.sleep(nanoseconds: 10_000_000)
+  }
+  precondition(result != nil, generator.status)
+  precondition(result!.extent.size == CGSize(width: 1920, height: 1080))
+  var bitmap = [UInt8](repeating: 0, count: 1920 * 1080 * 4)
+  bitmap.withUnsafeMutableBytes { raw in
+   context.render(result!, toBitmap: raw.baseAddress!, rowBytes: 1920*4,
+    bounds: result!.extent, format: .RGBA8, colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)
+  }
+  var brightCount = 0, sumX = 0
+  for y in 0..<1080 { for x in 0..<1920 {
+   if bitmap[(y*1920+x)*4] > 180 { brightCount += 1; sumX += x }
+  } }
+  let centroid = Double(sumX) / Double(max(1, brightCount))
+  print("Generated-frame bright pixels:", brightCount, "motion midpoint centroid:", centroid)
+  precondition(brightCount > 100_000 && abs(centroid-755.5) < 4, "Generated motion midpoint image missing or incorrect")
+  generator.reset()
+  print("PASS: real Apple low-latency interpolation, exact SDR format, generated image, GPU completion, session reset")
+ }
+}
+"""
+
+with tempfile.TemporaryDirectory(prefix='opennow-video-effects-') as temporary:
+    for name, body in [('MetalFX', METALFX), ('FrameGeneration', FRAME_GENERATION)]:
+        text = source.split('/// Apple video interpolation')[0] if name == 'MetalFX' else source
+        swift = Path(temporary) / (name + '.swift')
+        executable = Path(temporary) / name
+        swift.write_text(text + body)
+        subprocess.run(['xcrun', 'swiftc', '-module-name', 'OpenNOWVideoEffectsCheck', '-parse-as-library', '-target',
+                        'arm64-apple-macos26.0', str(swift), '-o', str(executable)], check=True)
+        subprocess.run([str(executable)], check=True, timeout=60)

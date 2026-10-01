@@ -5,9 +5,107 @@ import CoreVideo
 import CoreMedia
 import SwiftUI
 import Metal
+
+#if canImport(MetalFX)
+import MetalFX
+#endif
+import CoreImage
 @testable import OpenNOWiOS
 
 final class OpenNOWiOSParityTests: XCTestCase {
+    func testVideoEffectsSettingsMigrateOffAndRoundTripWithoutChangingStream() throws {
+        let old = try JSONDecoder().decode(AppSettings.self, from: Data("{}".utf8))
+        XCTAssertFalse(old.metalFXUpscalingEnabled)
+        XCTAssertFalse(old.frameGenerationEnabled)
+        var settings = AppSettings.default
+        settings.preferredColorQuality = StreamColorQuality.tenBit444.rawValue
+        settings.hdrEnabled = true
+        settings.experimentalNativeNVSTEnabled = true
+        settings.preferredCodec = "H265"
+        settings.normalizeStreamDefaults()
+        settings.metalFXUpscalingEnabled = true
+        settings.frameGenerationEnabled = true
+        let decoded = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings))
+        XCTAssertEqual(decoded, settings)
+        XCTAssertEqual(decoded.preferredColorQuality, StreamColorQuality.tenBit444.rawValue)
+        XCTAssertTrue(decoded.hdrEnabled)
+    }
+
+    func testVideoEffectsAvoidDownscalingAndRejectUnsustainableFrameGeneration() {
+        let source = CGSize(width: 1920, height: 1080)
+        XCTAssertEqual(NativeStreamVideoEffectsPolicy.upscaleSize(source: source,
+            destination: CGSize(width: 2560, height: 1440)), CGSize(width: 2560, height: 1440))
+        XCTAssertNil(NativeStreamVideoEffectsPolicy.upscaleSize(source: source, destination: source))
+        XCTAssertNil(NativeStreamVideoEffectsPolicy.upscaleSize(source: source,
+            destination: CGSize(width: 1280, height: 720)))
+        XCTAssertTrue(NativeStreamVideoEffectsPolicy.frameGenerationAllowed(sourceFPS: 60, displayHz: 120, lowPower: false, thermal: 0))
+        for (fps, hz, lowPower, thermal) in [(120, 120, false, 0), (60, 60, false, 0), (60, 120, true, 0), (60, 120, false, 2)] {
+            XCTAssertFalse(NativeStreamVideoEffectsPolicy.frameGenerationAllowed(sourceFPS: fps, displayHz: hz, lowPower: lowPower, thermal: thermal))
+        }
+        XCTAssertTrue(NativeStreamVideoEffectsPolicy.continuousPair(previous: 1_000_000_000, current: 1_016_666_667))
+        for next in [Int64(1_000_000_000), 999_999_999, 1_033_333_333, 1_008_333_333, Int64.max] {
+            XCTAssertFalse(NativeStreamVideoEffectsPolicy.continuousPair(previous: 1_000_000_000, current: next))
+        }
+    }
+
+    func testFrameGenerationNeverSubsamples444OrTruncatesHDRToMatchProcessor() {
+        let source = kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange
+        XCTAssertEqual(NativeStreamVideoEffectsPolicy.interpolationFormat(source: source, supported: [source]), source)
+        XCTAssertEqual(NativeStreamVideoEffectsPolicy.interpolationFormat(source: source,
+            supported: [kCVPixelFormatType_64RGBAHalf, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange]), kCVPixelFormatType_64RGBAHalf)
+        XCTAssertNil(NativeStreamVideoEffectsPolicy.interpolationFormat(source: source,
+            supported: [kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, kCVPixelFormatType_32BGRA]))
+    }
+
+    @MainActor
+    func testMetalFXSpatialHDRRetainsHighlightsAndImageOrientation() async throws {
+        #if canImport(MetalFX)
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        guard MTLFXSpatialScalerDescriptor.supportsDevice(device) else { throw XCTSkip("MetalFX unavailable on this simulator GPU") }
+        let queue = try XCTUnwrap(device.makeCommandQueue())
+        let context = CIContext(mtlDevice: device, options: [.cacheIntermediates: false])
+        let scaler = NativeStreamSpatialUpscaler(device: device)
+        let space = NativeStreamVideoEffectsPolicy.workingColorSpace(hdr: true)
+        var data = [Float](repeating: 0, count: 64 * 32 * 4)
+        for y in 0..<32 { for x in 0..<64 {
+            let i = (y * 64 + x) * 4
+            data[i] = x < 32 ? 4 : 0.1
+            data[i + 1] = y < 16 ? 0.1 : 2
+            data[i + 2] = 0.25; data[i + 3] = 1
+        } }
+        let image = data.withUnsafeBytes { CIImage(bitmapData: Data($0), bytesPerRow: 64 * 16,
+            size: CGSize(width: 64, height: 32), format: .RGBAf, colorSpace: space) }
+        var result: CIImage?
+        for _ in 0..<200 {
+            let command = try XCTUnwrap(queue.makeCommandBuffer())
+            result = scaler.encode(image: image, sourceSize: image.extent.size,
+                destinationSize: CGSize(width: 128, height: 64), hdr: true, context: context, commandBuffer: command)
+            command.commit(); command.waitUntilCompleted()
+            XCTAssertEqual(command.status, .completed)
+            if result != nil { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let output = try XCTUnwrap(result, scaler.status)
+        XCTAssertEqual(output.extent.size, CGSize(width: 128, height: 64))
+        let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: 128, height: 64, mipmapped: false)
+        td.storageMode = .shared; td.usage = [.renderTarget, .shaderRead, .shaderWrite]
+        let texture = try XCTUnwrap(device.makeTexture(descriptor: td))
+        let command = try XCTUnwrap(queue.makeCommandBuffer())
+        context.render(output, to: texture, commandBuffer: command, bounds: output.extent, colorSpace: space)
+        command.commit(); command.waitUntilCompleted()
+        XCTAssertEqual(command.status, .completed)
+        var values = [Float](repeating: 0, count: 128 * 64 * 4)
+        values.withUnsafeMutableBytes { texture.getBytes($0.baseAddress!, bytesPerRow: 128 * 16,
+            from: MTLRegionMake2D(0, 0, 128, 64), mipmapLevel: 0) }
+        XCTAssertGreaterThan(values[(8 * 128 + 8) * 4], 3, "HDR highlights must not clamp to SDR")
+        XCTAssertLessThan(values[(8 * 128 + 120) * 4], 0.5, "Horizontal orientation must be preserved")
+        XCTAssertLessThan(values[(8 * 128 + 8) * 4 + 1], 0.5)
+        XCTAssertGreaterThan(values[(56 * 128 + 8) * 4 + 1], 1.5, "Vertical orientation must be preserved")
+        #else
+        throw XCTSkip("Apple does not ship MetalFX in the iOS simulator SDK; device path is tested separately on macOS Metal")
+        #endif
+    }
+
     func testNativeKeyframeRecoverySendsExplicitControlCommandWithoutFeedbackChannel() throws {
         var sent: NvstControlCommand?
         var udpRequests = 0

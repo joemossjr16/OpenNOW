@@ -60,7 +60,7 @@ private enum SettingsCategory: String, CaseIterable, Hashable, Identifiable {
         case .general:
             return ["general", "privacy", "analytics", "telemetry", "usage", "cache", "reset", "data", "tutorial", "updates"]
         case .stream:
-            return ["stream", "preset", "recommended", "resolution", "aspect ratio", "fps", "frame rate", "bitrate", "data", "codec", "color", "hdr", "sharpening", "sharpness", "region", "server", "session proxy", "proxy", "native decoder", "hud", "gpu", "performance overlay", "metal", "stretch"]
+            return ["stream", "preset", "recommended", "resolution", "aspect ratio", "fps", "frame rate", "bitrate", "data", "codec", "color", "hdr", "sharpening", "sharpness", "region", "server", "session proxy", "proxy", "native decoder", "hud", "gpu", "performance overlay", "metal", "metalfx", "upscaling", "frame generation", "interpolation", "stretch"]
         case .input:
             return ["input", "mouse", "sensitivity", "acceleration", "scroll", "pointer", "keyboard", "layout", "language", "clipboard", "paste", "touch", "native touch", "joystick", "stick", "dead zone", "aim", "controller", "rumble", "haptics", "tutorial", "guide", "replay"]
         case .interface:
@@ -607,6 +607,13 @@ struct SettingsView: View {
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
+
+            Toggle("MetalFX Upscaling", isOn: $store.settings.metalFXUpscalingEnabled)
+            Text("Upscales a lower-resolution stream to the display. HDR stays in a high-precision color path. Has no effect when the stream already fills the display at native resolution.")
+                .font(.footnote).foregroundStyle(.secondary)
+            Toggle("Frame Generation (Experimental)", isOn: $store.settings.frameGenerationEnabled)
+            Text("Generates an intermediate frame for a 60 FPS stream on a 120 Hz display. Requires iOS 26 or later and a supported device, resolution and color format. Adds display delay and may show motion artifacts. Pauses if the GPU falls behind, Low Power Mode is on or the device gets hot. Stream FPS stays unchanged; select 60 FPS to try it.")
+                .font(.footnote).foregroundStyle(.secondary)
 
             Toggle("Stream Sharpening", isOn: $store.settings.streamSharpeningEnabled)
 

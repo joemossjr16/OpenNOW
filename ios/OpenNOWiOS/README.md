@@ -1,8 +1,30 @@
-# Joe's OpenNOW iOS build 131
+# Joe's OpenNOW iOS build 132
 
-This branch contains the source for **OpenNOW 1.1.131**, based on the upstream iOS branch at `95c0f58d42eeed176edd677f604b193c85169d9e`. It includes the earlier local iOS changes needed by the current native receiver, hardware AV1/HDR rendering, catalog and launch features.
+This branch contains the source for **OpenNOW 1.1.132**, based on the upstream iOS branch at `95c0f58d42eeed176edd677f604b193c85169d9e`. It includes the earlier local iOS changes needed by the current native receiver, hardware AV1/HDR rendering, catalog and launch features.
 
-[Unsigned IPA and build notes](https://github.com/joemossjr16/ios-apps/releases/tag/opennow-131) · [KravaSigner feed](https://raw.githubusercontent.com/joemossjr16/ios-apps/main/repo.json)
+[Unsigned IPA and build notes](https://github.com/joemossjr16/ios-apps/releases/tag/opennow-132) · [KravaSigner feed](https://raw.githubusercontent.com/joemossjr16/ios-apps/main/repo.json)
+
+## Build 132: MetalFX upscaling and experimental video interpolation
+
+Both effects default **off**. Enable **Settings → Stream → Video → MetalFX Upscaling**, or toggle it in the in-stream **Picture** panel. This is Apple's **MTLFXSpatialScaler**, applied to a lower-resolution received image and the actual visible drawable size. It skips equal-resolution/downscale cases. HDR uses RGBA half-float extended linear BT.2020, MetalFX HDR processing and the original PQ/HLG 10-bit EDR display output. Initialization stays off the display thread; bounded reusable textures share the renderer's serial GPU queue. A real Mac MetalFX readback test verified HDR values above SDR white and correct horizontal/vertical orientation.
+
+**Frame Generation (Experimental)** uses Apple's video-oriented `VTLowLatencyFrameInterpolationConfiguration`, generating one midpoint between consecutive 60 FPS decoded frames on a 120 Hz display. It then presents the corresponding real frame on the next display tick. Host quality/FPS requests remain unchanged. It adds display delay and can show artifacts; existing FPS/decode stats continue reporting decoded stream frames. The effects HUD reports actual preparation, active or unavailable state; local diagnostics count generated presentations separately.
+
+Frame interpolation requires iOS 26+ and runtime support for the received size and color format. It uses exact-format buffers, or full-resolution half-float RGB only if advertised as supported. It **never converts 4:4:4 HDR into 8-bit SDR or subsampled 4:2:0** to enable interpolation. On this Mac, Apple's interpolation configuration advertises only `420v` (8-bit 4:2:0), so HDR/4:4:4 interpolation remains unavailable here. iPhone/iPad support must be queried on-device. Low Power Mode, serious heat, processing errors and sustained missed 120 Hz deadlines suspend frame generation. ML initialization stays off the UI thread. One pending real frame, bounded pools and two GPU submissions limit backlog; stale/out-of-order frames discard history.
+
+Validation: unsigned arm64 iOS build passed; 176 targeted simulator tests passed, with one explicit MetalFX skip because Apple does not ship it in the simulator SDK. Separate macOS harnesses ran the same scaler and interpolation implementations on real Apple GPU/API paths. MetalFX preserved a 4.0 linear HDR highlight at approximately 3.96 with correct image orientation. Native video interpolation produced a moving-bar midpoint at x=755.50, expected x=755.5, and completed its GPU command. These checks do not establish physical iPhone/iPad performance, format support or visual quality. Reproduce the GPU checks on an Apple Silicon Mac with `python3 ios/OpenNOWiOS/BuildScripts/validate-video-effects-macos.py`.
+
+### 4:4:4 decode audit
+
+The decoder already requires and verifies hardware, preserves full-resolution 10-bit IOSurfaces, permits compatible full/video ranges, uses single-pass compressed-frame preparation and avoids temporal/B-frame reorder buffering. No documented property found in this review promises additional 4K/120 4:4:4 throughput. Apple's `1xRealTimePlayback` decode flag is a power-saving hint, and output-pool minimum count controls memory retention rather than decoder concurrency. Previous measured iPhone 4K/120 throughput and queue recovery remain documented below. The user now reports about **7ms at a smaller iPhone-oriented resolution and 120 FPS**; those exact dimensions/current throughput were not independently captured. Lower received resolution plus local MetalFX upscaling is the practical next comparison, without lowering chroma depth or HDR.
+
+### Later Metal 4 / MetalFX integration
+
+A Metal 4 render backend can reuse decoded IOSurfaces and migrate command/resource management in stages, with device capability checks, explicit barriers and a tested Metal 3 fallback. Benchmark GPU time, completion latency, power/thermal state and presentation pacing before enabling it by default. VideoToolbox hardware decoding remains separate; changing the graphics API does not itself make the media decoder faster.
+
+MetalFX temporal upscaling and game-frame interpolation need game depth/motion textures. MetalFX denoised upscaling additionally needs normals, diffuse/specular albedo and roughness. The present GFN video protocol supplies finished encoded images, not those renderer buffers. An estimated-motion/depth experiment would require additional inference and validation and is not equivalent to native game-renderer integration. True game-data integration would need a host/game path that exports those buffers alongside the stream. Image-domain video interpolation is the supported client-side alternative implemented above; a video noise filter would be a separate feature rather than MetalFX ray-tracing denoising.
+
+Apple references: [MetalFX overview](https://developer.apple.com/documentation/MetalFX), [Metal 4 overview](https://developer.apple.com/videos/play/wwdc2025/205/), [game interpolation and denoising requirements](https://developer.apple.com/videos/play/wwdc2025/211/), [video interpolation](https://developer.apple.com/documentation/videotoolbox/vtlowlatencyframeinterpolationconfiguration).
 
 ## Experimental 10-bit 4:4:4 HDR
 
