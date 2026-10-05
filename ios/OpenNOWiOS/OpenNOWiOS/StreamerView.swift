@@ -1903,8 +1903,12 @@ private struct NativeStreamControlsPanel: View {
                         set: { coordinator.setPhysicalControllerPassthrough($0) }
                     )
                 )
+                NativeStreamSliderRow(title: "Controller rumble strength",
+                    value: Binding(get: { coordinator.liveSettings.controllerRumbleStrength },
+                        set: { value in coordinator.updateLiveSettings { $0.controllerRumbleStrength = value } }),
+                    range: 1...8, step: 0.5, format: { String(format: "%.1f×", $0) })
                 NativeStreamToggleRow(
-                    title: "Rumble",
+                    title: "Phone vibration fallback",
                     value: coordinator.phoneRumbleFallbackEnabled ? "On" : "Off",
                     isOn: Binding(
                         get: { coordinator.phoneRumbleFallbackEnabled },
@@ -2310,17 +2314,20 @@ private struct NativeStreamSliderRow: View {
     @Binding var value: Double
     let range: ClosedRange<Double>
     let step: Double
+    let format: ((Double) -> String)?
 
     init(
         title: String,
         value: Binding<Double>,
         range: ClosedRange<Double>,
-        step: Double = 0.05
+        step: Double = 0.05,
+        format: ((Double) -> String)? = nil
     ) {
         self.title = title
         self._value = value
         self.range = range
         self.step = step
+        self.format = format
     }
 
     var body: some View {
@@ -2342,7 +2349,7 @@ private struct NativeStreamSliderRow: View {
     }
 
     private var percentText: String {
-        "\(Int((value * 100).rounded()))%"
+        format?(value) ?? "\(Int((value * 100).rounded()))%"
     }
 }
 
@@ -2719,7 +2726,8 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             phoneRumbleFallback: settings.phoneRumbleFallback,
             physicalControllerPassthrough: settings.streamerPreferences.physicalControllerPassthrough,
             controllerMouseEmulation: settings.controllerMouseEmulation,
-            mouseScrollSensitivity: settings.mouseScrollSensitivity
+            mouseScrollSensitivity: settings.mouseScrollSensitivity,
+            controllerRumbleStrength: settings.controllerRumbleStrength
         )
         inputBridge.onPhysicalControllerAvailabilityChanged = { [weak self] connected in
             Task { @MainActor in
@@ -3138,7 +3146,8 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             phoneRumbleFallback: phoneRumbleFallbackEnabled,
             physicalControllerPassthrough: streamerPreferences.physicalControllerPassthrough,
             controllerMouseEmulation: next.controllerMouseEmulation,
-            mouseScrollSensitivity: next.mouseScrollSensitivity
+            mouseScrollSensitivity: next.mouseScrollSensitivity,
+            controllerRumbleStrength: next.controllerRumbleStrength
         )
         onSettingsChange(next)
     }

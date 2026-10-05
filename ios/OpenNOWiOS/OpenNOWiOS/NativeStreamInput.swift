@@ -13,6 +13,16 @@ import CoreHaptics
 import UIKit
 #endif
 
+enum NativeStreamControllerRumbleGain {
+    static func normalize(_ multiplier: Double) -> Double {
+        multiplier.isFinite ? min(max(multiplier, 1), 8) : 1
+    }
+    static func apply(_ intensity: Float, multiplier: Double) -> Float {
+        guard intensity.isFinite else { return 0 }
+        return min(max(intensity, 0) * Float(normalize(multiplier)), 1)
+    }
+}
+
 /// Bounded, account-free status snapshot for isolating controller rumble failures.
 final class NativeStreamRumbleDiagnostics {
     static let shared = NativeStreamRumbleDiagnostics()
@@ -677,6 +687,7 @@ final class NativeStreamInputBridge {
     private var mouseScrollSensitivity: CGFloat = 30
     private var mouseAccelerationLevel = 1
     private var phoneRumbleFallbackEnabled = true
+    private var controllerRumbleStrength: Double = 1
     private var physicalControllerPassthroughEnabled = true
     private var virtualControllerEnabled = false
     private var virtualButtons: UInt16 = 0
@@ -709,8 +720,10 @@ final class NativeStreamInputBridge {
         phoneRumbleFallback: Bool,
         physicalControllerPassthrough: Bool,
         controllerMouseEmulation: Bool = false,
-        mouseScrollSensitivity: Int = 30
+        mouseScrollSensitivity: Int = 30,
+        controllerRumbleStrength: Double = 1
     ) {
+        setControllerRumbleStrength(controllerRumbleStrength)
         self.mouseSensitivity = CGFloat(min(max(mouseSensitivity, 0.25), 3))
         mouseAccelerationLevel = min(max(mouseAcceleration, 0), 2)
         self.mouseScrollSensitivity = CGFloat(min(max(mouseScrollSensitivity, 10), 100))
@@ -721,6 +734,20 @@ final class NativeStreamInputBridge {
         phoneRumbleFallbackEnabled = phoneRumbleFallback
         setPhysicalControllerPassthrough(physicalControllerPassthrough)
         advertiseHaptics(force: true)
+    }
+
+    private func setControllerRumbleStrength(_ multiplier: Double) {
+        let next = NativeStreamControllerRumbleGain.normalize(multiplier)
+        guard controllerRumbleStrength != next else { return }
+        controllerRumbleStrength = next
+        #if canImport(CoreHaptics)
+        for playback in controllerHapticsBySlot.values {
+            guard playback.isPlaying, let profile = playback.lastProfile else { continue }
+            playback.lastUpdateAt = 0
+            do { try updateHapticPlayback(playback, profile: profile) }
+            catch { logHapticsFailure("Controller strength update failed: \(error.localizedDescription)") }
+        }
+        #endif
     }
 
     func setPhysicalControllerPassthrough(_ enabled: Bool) {
@@ -1470,6 +1497,9 @@ final class NativeStreamInputBridge {
                 installControllerHapticCallbacks(playback, slot: slot)
                 controllerHapticsBySlot[slot] = playback
             }
+            NativeStreamRumbleDiagnostics.shared.record("controllerGainApplied", details: [
+                "controllerMultiplier": String(controllerRumbleStrength),
+                "controllerOutputIntensity": String(NativeStreamControllerRumbleGain.apply(profile.intensity, multiplier: controllerRumbleStrength))])
             try updateHapticPlayback(playback, profile: profile)
             phoneHapticsRetryAfter = 0
             return true
@@ -1521,7 +1551,8 @@ final class NativeStreamInputBridge {
         let parameters = [
             CHHapticDynamicParameter(
                 parameterID: .hapticIntensityControl,
-                value: profile.intensity,
+                value: playback.controllerIdentifier == nil ? profile.intensity
+                    : NativeStreamControllerRumbleGain.apply(profile.intensity, multiplier: controllerRumbleStrength),
                 relativeTime: 0
             ),
             CHHapticDynamicParameter(
@@ -1645,7 +1676,7 @@ final class NativeStreamInputBridge {
     var onPhysicalControllerAvailabilityChanged: ((Bool) -> Void)?
     var onPhysicalKeyboardMouseAvailabilityChanged: ((Bool) -> Void)?
     func configure(protocolVersion: Int, partiallyReliableGamepadMask: Int) {}
-    func configureUserPreferences(mouseSensitivity: Double, mouseAcceleration: Int, phoneRumbleFallback: Bool, physicalControllerPassthrough: Bool, controllerMouseEmulation: Bool = false, mouseScrollSensitivity: Int = 30) {}
+    func configureUserPreferences(mouseSensitivity: Double, mouseAcceleration: Int, phoneRumbleFallback: Bool, physicalControllerPassthrough: Bool, controllerMouseEmulation: Bool = false, mouseScrollSensitivity: Int = 30, controllerRumbleStrength: Double = 1) {}
     func setControllerMouseEmulation(_ enabled: Bool) {}
     var isControllerMouseEmulationEnabled: Bool { false }
     func setPhysicalControllerPassthrough(_ enabled: Bool) {}

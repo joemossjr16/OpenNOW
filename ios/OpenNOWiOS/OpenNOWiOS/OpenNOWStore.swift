@@ -897,6 +897,7 @@ struct AppSettings: Codable, Equatable {
     var mouseAcceleration: Int = 1
     var fingerMouseEnabled: Bool = true
     var phoneRumbleFallback: Bool = true
+    var controllerRumbleStrength: Double = 1
     var launchPage: AppLaunchPage = .store
     var posterSizeScale: Double = 1
     var compactGameCards: Bool = true
@@ -1009,6 +1010,7 @@ struct AppSettings: Codable, Equatable {
         case mouseAcceleration
         case fingerMouseEnabled
         case phoneRumbleFallback
+        case controllerRumbleStrength
         case launchPage
         case posterSizeScale
         case compactGameCards
@@ -1133,6 +1135,7 @@ struct AppSettings: Codable, Equatable {
         mouseAcceleration = try container.decodeIfPresent(Int.self, forKey: .mouseAcceleration) ?? 1
         fingerMouseEnabled = try container.decodeIfPresent(Bool.self, forKey: .fingerMouseEnabled) ?? true
         phoneRumbleFallback = try container.decodeIfPresent(Bool.self, forKey: .phoneRumbleFallback) ?? true
+        controllerRumbleStrength = try container.decodeIfPresent(Double.self, forKey: .controllerRumbleStrength) ?? 1
         launchPage = try container.decodeIfPresent(AppLaunchPage.self, forKey: .launchPage) ?? .store
         posterSizeScale = try container.decodeIfPresent(Double.self, forKey: .posterSizeScale) ?? 1
         compactGameCards = try container.decodeIfPresent(Bool.self, forKey: .compactGameCards) ?? true
@@ -1237,6 +1240,7 @@ struct AppSettings: Codable, Equatable {
     }
 
     mutating func normalizeStreamDefaults() {
+        controllerRumbleStrength = NativeStreamControllerRumbleGain.normalize(controllerRumbleStrength)
         if sessionReportDefaultVersion < appSettingsSessionReportDefaultVersion {
             showSessionReportAfterStream = false
         }
@@ -7829,6 +7833,7 @@ final class OpenNOWStore: ObservableObject {
     func applyStreamerSettings(_ updated: AppSettings) {
         var next = settings
         next.streamStatsMetrics = updated.streamStatsMetrics
+        next.controllerRumbleStrength = updated.controllerRumbleStrength
         next.metal4Enabled = updated.metal4Enabled
         next.metalFXUpscalingEnabled = updated.metalFXUpscalingEnabled
         next.touch = updated.touch

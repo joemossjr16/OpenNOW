@@ -111,6 +111,7 @@ final class OpenNOWiOSParityTests: XCTestCase {
         }
         let store = OpenNOWStore()
         var live = AppSettings.default
+        live.controllerRumbleStrength = 4
         live.metal4Enabled = false
         store.settings.metal4Enabled = true
         live.metalFXUpscalingEnabled = false
@@ -128,12 +129,15 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(store.settings.hdrEnabled, before.hdrEnabled)
         XCTAssertEqual(store.settings.enableCloudGsync, before.enableCloudGsync)
         let saved = try JSONDecoder().decode(AppSettings.self, from: XCTUnwrap(defaults.data(forKey: key)))
+        XCTAssertEqual(saved.controllerRumbleStrength, 4)
         XCTAssertFalse(saved.metal4Enabled)
         XCTAssertFalse(saved.metalFXUpscalingEnabled)
+        live.controllerRumbleStrength = 8
         live.metal4Enabled = true
         live.metalFXUpscalingEnabled = true
         store.applyStreamerSettings(live)
         let savedOn = try JSONDecoder().decode(AppSettings.self, from: XCTUnwrap(defaults.data(forKey: key)))
+        XCTAssertEqual(savedOn.controllerRumbleStrength, 8)
         XCTAssertTrue(savedOn.metal4Enabled)
         XCTAssertTrue(savedOn.metalFXUpscalingEnabled)
     }
@@ -219,6 +223,27 @@ final class OpenNOWiOSParityTests: XCTestCase {
             XCTAssertTrue(titles().contains("OpenNOW") && !titles().contains(where: settingsTitles.contains),
                           "Home navigation must replace the settings stack: \(titles())")
         }
+    }
+
+    func testControllerRumbleGainPreservesZeroAndCapsAmplifiedOutput() {
+        XCTAssertEqual(NativeStreamControllerRumbleGain.apply(0, multiplier: 8), 0)
+        XCTAssertEqual(NativeStreamControllerRumbleGain.apply(0.066, multiplier: 8), 0.528, accuracy: 0.00001)
+        XCTAssertEqual(NativeStreamControllerRumbleGain.apply(0.8, multiplier: 8), 1)
+        XCTAssertEqual(NativeStreamControllerRumbleGain.apply(0.25, multiplier: 1), 0.25)
+        XCTAssertEqual(NativeStreamControllerRumbleGain.normalize(.infinity), 1)
+        XCTAssertEqual(NativeStreamControllerRumbleGain.normalize(-1), 1)
+        XCTAssertEqual(NativeStreamControllerRumbleGain.normalize(99), 8)
+    }
+
+    func testControllerRumbleGainMigratesAndPersistsWithoutChangingPhoneFallback() throws {
+        let legacy = try JSONDecoder().decode(AppSettings.self, from: Data("{}".utf8))
+        XCTAssertEqual(legacy.controllerRumbleStrength, 1)
+        var settings = AppSettings.default
+        settings.controllerRumbleStrength = 8
+        settings.phoneRumbleFallback = false
+        let restored = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings))
+        XCTAssertEqual(restored.controllerRumbleStrength, 8)
+        XCTAssertFalse(restored.phoneRumbleFallback)
     }
 
     func testMetal4RenderingIsOptInAndPersistsIndependentlyOfHDRAndMetalFX() throws {
