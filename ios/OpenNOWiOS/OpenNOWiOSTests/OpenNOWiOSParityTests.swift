@@ -132,12 +132,12 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(saved.controllerRumbleStrength, 4)
         XCTAssertFalse(saved.metal4Enabled)
         XCTAssertFalse(saved.metalFXUpscalingEnabled)
-        live.controllerRumbleStrength = 8
+        live.controllerRumbleStrength = 24
         live.metal4Enabled = true
         live.metalFXUpscalingEnabled = true
         store.applyStreamerSettings(live)
         let savedOn = try JSONDecoder().decode(AppSettings.self, from: XCTUnwrap(defaults.data(forKey: key)))
-        XCTAssertEqual(savedOn.controllerRumbleStrength, 8)
+        XCTAssertEqual(savedOn.controllerRumbleStrength, 24)
         XCTAssertTrue(savedOn.metal4Enabled)
         XCTAssertTrue(savedOn.metalFXUpscalingEnabled)
     }
@@ -229,10 +229,13 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(NativeStreamControllerRumbleGain.apply(0, multiplier: 8), 0)
         XCTAssertEqual(NativeStreamControllerRumbleGain.apply(0.066, multiplier: 8), 0.528, accuracy: 0.00001)
         XCTAssertEqual(NativeStreamControllerRumbleGain.apply(0.8, multiplier: 8), 1)
+        XCTAssertEqual(NativeStreamControllerRumbleGain.apply(0, multiplier: 32), 0)
+        XCTAssertEqual(NativeStreamControllerRumbleGain.apply(0.0030469215, multiplier: 32), 0.09750149, accuracy: 0.00001)
+        XCTAssertEqual(NativeStreamControllerRumbleGain.apply(0.066, multiplier: 16), 1)
         XCTAssertEqual(NativeStreamControllerRumbleGain.apply(0.25, multiplier: 1), 0.25)
         XCTAssertEqual(NativeStreamControllerRumbleGain.normalize(.infinity), 1)
         XCTAssertEqual(NativeStreamControllerRumbleGain.normalize(-1), 1)
-        XCTAssertEqual(NativeStreamControllerRumbleGain.normalize(99), 8)
+        XCTAssertEqual(NativeStreamControllerRumbleGain.normalize(99), 32)
     }
 
     func testControllerRumbleGainMigratesAndPersistsWithoutChangingPhoneFallback() throws {
@@ -244,6 +247,10 @@ final class OpenNOWiOSParityTests: XCTestCase {
         let restored = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings))
         XCTAssertEqual(restored.controllerRumbleStrength, 8)
         XCTAssertFalse(restored.phoneRumbleFallback)
+        settings.controllerRumbleStrength = 32
+        let strongest = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings))
+        XCTAssertEqual(strongest.controllerRumbleStrength, 32)
+        XCTAssertFalse(strongest.phoneRumbleFallback)
     }
 
     func testMetal4RenderingIsOptInAndPersistsIndependentlyOfHDRAndMetalFX() throws {

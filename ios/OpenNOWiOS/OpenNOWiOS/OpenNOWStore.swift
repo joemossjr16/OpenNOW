@@ -7841,6 +7841,10 @@ final class OpenNOWStore: ObservableObject {
         next.mouseScrollSensitivity = updated.mouseScrollSensitivity
         next.controllerMouseEmulation = updated.controllerMouseEmulation
         next.streamKeyboardClearConfirmationDisabled = updated.streamKeyboardClearConfirmationDisabled
+        if let active = activeStreamSettings, active.controllerRumbleStrength != next.controllerRumbleStrength {
+            activeStreamSettings?.controllerRumbleStrength = next.controllerRumbleStrength
+            syncTrackedSessionSurface()
+        }
         guard next != settings else { return }
         settings = next
         persistSettings()

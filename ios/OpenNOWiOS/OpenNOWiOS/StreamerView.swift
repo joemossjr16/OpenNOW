@@ -1719,6 +1719,16 @@ private struct NativeStreamControlsPanel: View {
                 }
             }
 
+            NativeStreamPanelSection(title: "Controller") {
+                NativeStreamSliderRow(title: "Controller rumble strength",
+                    value: Binding(get: { coordinator.liveSettings.controllerRumbleStrength },
+                        set: { value in coordinator.updateLiveSettings { $0.controllerRumbleStrength = value } }),
+                    range: NativeStreamControllerRumbleGain.range, step: 0.5, format: { String(format: "%.1f×", $0) })
+                Text("Applies immediately and saves for your next stream. Try 16×–24× for faint controller vibration.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
             NativeStreamPanelSection(title: "More") {
                 NativeStreamActionRow(title: "Stats & HUD", value: "\(coordinator.statsMetrics.enabledCount) metrics", actionLabel: "Open") {
                     page = .statsHUD
@@ -1903,10 +1913,6 @@ private struct NativeStreamControlsPanel: View {
                         set: { coordinator.setPhysicalControllerPassthrough($0) }
                     )
                 )
-                NativeStreamSliderRow(title: "Controller rumble strength",
-                    value: Binding(get: { coordinator.liveSettings.controllerRumbleStrength },
-                        set: { value in coordinator.updateLiveSettings { $0.controllerRumbleStrength = value } }),
-                    range: 1...8, step: 0.5, format: { String(format: "%.1f×", $0) })
                 NativeStreamToggleRow(
                     title: "Phone vibration fallback",
                     value: coordinator.phoneRumbleFallbackEnabled ? "On" : "Off",
