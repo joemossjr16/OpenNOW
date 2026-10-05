@@ -1865,6 +1865,23 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(cappedProfile.fps, 120)
     }
 
+    func testStreamerViewEffectiveProfileHonorsMembershipTierAndProMotionFPS() {
+        let game = Self.makeGame(title: "Cyberpunk 2077", controls: [])
+        let session = Self.makeActiveSession(game: game, status: 3)
+        var settings = AppSettings.default
+        settings.preferredFPS = 120
+        settings.preferredResolution = "2560x1080"
+        settings.preferredAspectRatio = "21:9"
+
+        let ultimateProfile = NativeStreamCoordinator.effectiveProfile(for: session, settings: settings, membershipTier: "ULTIMATE")
+        XCTAssertEqual(ultimateProfile.fps, 120)
+        XCTAssertEqual(ultimateProfile.width, 2560)
+        XCTAssertEqual(ultimateProfile.height, 1080)
+
+        let freeProfile = NativeStreamCoordinator.effectiveProfile(for: session, settings: settings, membershipTier: "FREE")
+        XCTAssertEqual(freeProfile.fps, 60)
+    }
+
     func testTwentyByNineResolutionCatalogIncludesEveryAndroidChoice() {
         let choices = StreamSettingsResolver.choices(forAspectRatio: "20:9")
         XCTAssertEqual(

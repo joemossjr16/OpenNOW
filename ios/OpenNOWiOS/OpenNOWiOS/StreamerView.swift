@@ -2789,7 +2789,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         self.liveSettings = settings
         self.onClose = onClose
         self.onRetry = onRetry
-        self.streamProfile = Self.effectiveProfile(for: session, settings: settings)
+        self.streamProfile = Self.effectiveProfile(for: session, settings: settings, membershipTier: membershipTier)
         self.requestedProfile = StreamSettingsResolver.profile(for: settings, membershipTier: membershipTier)
         self.showStatsOverlay = settings.showStatsOverlay
         self.statsDisplayStyle = settings.streamerPreferences.statsStyle
@@ -2925,8 +2925,12 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     private func startNativeNVST() {
         updateStatus("Connecting native NVST", detail: "Negotiating the dedicated video connection")
         let sink = videoSink
+        let maxDisplayFPS = max(
+            streamProfile.fps,
+            max(renderer?.window?.screen.maximumFramesPerSecond ?? 0, UIScreen.main.maximumFramesPerSecond)
+        )
         let transport = NativeStreamNVST(allocation: session, settings: settings, profile: streamProfile,
-            codec: selectedCodec, displayFPS: renderer?.window?.screen.maximumFramesPerSecond ?? UIScreen.main.maximumFramesPerSecond,
+            codec: selectedCodec, displayFPS: maxDisplayFPS,
             onFrame: { frame in sink.renderFrame(frame) },
             onSample: { [weak self] sample in Task { @MainActor in
                 guard let self, !self.stopped else { return }
@@ -5131,8 +5135,8 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             || ProcessInfo.processInfo.environment["OPENNOW_ALLOW_UNSAFE_CODECS"] == "1"
     }
 
-    private static func effectiveProfile(for session: ActiveSession, settings: AppSettings) -> StreamVideoProfile {
-        var profile = StreamSettingsResolver.profile(for: settings)
+    nonisolated static func effectiveProfile(for session: ActiveSession, settings: AppSettings, membershipTier: String? = nil) -> StreamVideoProfile {
+        var profile = StreamSettingsResolver.profile(for: settings, membershipTier: membershipTier)
         if let resolution = session.negotiatedStreamProfile?.resolution,
            let parsed = parseResolution(resolution) {
             profile = StreamVideoProfile(
@@ -5145,7 +5149,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         return profile
     }
 
-    private static func parseResolution(_ value: String) -> (width: Int, height: Int)? {
+    private nonisolated static func parseResolution(_ value: String) -> (width: Int, height: Int)? {
         let parts = value.split(separator: "x", maxSplits: 1).map(String.init)
         guard parts.count == 2,
               let width = Int(parts[0]),
@@ -6325,9 +6329,13 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         // an intermediate refresh rate during otherwise static game scenes.
         mtkView.isPaused = true
         guard let window else { return }
-        let refresh = Float(window.screen.maximumFramesPerSecond)
+        let screenMax = Float(max(window.screen.maximumFramesPerSecond, UIScreen.main.maximumFramesPerSecond))
         let link = CADisplayLink(target: displayClock, selector: #selector(DisplayClock.tick(_:)))
-        link.preferredFrameRateRange = CAFrameRateRange(minimum: refresh, maximum: refresh, preferred: refresh)
+        if screenMax > 60.0 {
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: 60.0, maximum: screenMax, preferred: screenMax)
+        } else {
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: 30.0, maximum: 60.0, preferred: 60.0)
+        }
         link.add(to: .main, forMode: .common)
         displayLink = link
     }
