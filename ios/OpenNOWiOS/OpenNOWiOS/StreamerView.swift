@@ -1723,8 +1723,8 @@ private struct NativeStreamControlsPanel: View {
                 NativeStreamSliderRow(title: "Controller rumble strength",
                     value: Binding(get: { coordinator.liveSettings.controllerRumbleStrength },
                         set: { value in coordinator.updateLiveSettings { $0.controllerRumbleStrength = value } }),
-                    range: NativeStreamControllerRumbleGain.range, step: 0.5, format: { String(format: "%.1f×", $0) })
-                Text("Applies immediately and saves for your next stream. Try 16×–24× for faint controller vibration.")
+                    range: NativeStreamControllerRumbleGain.range, step: 0.48, format: NativeStreamControllerRumbleGain.label)
+                Text("Applies immediately and saves. 0% is Off; 50% applies 24× gain and 100% applies 48× gain.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }

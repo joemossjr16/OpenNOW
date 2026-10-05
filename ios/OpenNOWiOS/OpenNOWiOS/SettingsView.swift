@@ -905,8 +905,8 @@ struct SettingsView: View {
             LabeledContent("Physical Controller", value: "Detected automatically")
             #if os(iOS)
             settingsSlider("Controller Rumble Strength", value: $store.settings.controllerRumbleStrength,
-                range: NativeStreamControllerRumbleGain.range, step: 0.5, format: { String(format: "%.1f×", $0) })
-            Text("Amplifies controller vibration only. 1× preserves the game signal; try 16×–24× for faint rumble. Output is capped at the controller maximum.")
+                range: NativeStreamControllerRumbleGain.range, step: 0.48, format: NativeStreamControllerRumbleGain.label)
+            Text("Controller vibration only. 0% is Off; 50% applies 24× gain and 100% applies 48× gain. Output is capped at the controller maximum.")
                 .font(.footnote).foregroundStyle(.secondary)
             ControllerRumbleDiagnosticsView()
             #endif

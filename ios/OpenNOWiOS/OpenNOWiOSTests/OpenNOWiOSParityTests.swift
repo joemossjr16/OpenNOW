@@ -233,9 +233,19 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(NativeStreamControllerRumbleGain.apply(0.0030469215, multiplier: 32), 0.09750149, accuracy: 0.00001)
         XCTAssertEqual(NativeStreamControllerRumbleGain.apply(0.066, multiplier: 16), 1)
         XCTAssertEqual(NativeStreamControllerRumbleGain.apply(0.25, multiplier: 1), 0.25)
+        XCTAssertEqual(NativeStreamControllerRumbleGain.apply(0.8, multiplier: 0), 0)
+        XCTAssertEqual(NativeStreamControllerRumbleGain.apply(0, multiplier: 48), 0)
+        XCTAssertEqual(NativeStreamControllerRumbleGain.apply(0.0030469215, multiplier: 48), 0.14625223, accuracy: 0.00001)
         XCTAssertEqual(NativeStreamControllerRumbleGain.normalize(.infinity), 1)
-        XCTAssertEqual(NativeStreamControllerRumbleGain.normalize(-1), 1)
-        XCTAssertEqual(NativeStreamControllerRumbleGain.normalize(99), 32)
+        XCTAssertEqual(NativeStreamControllerRumbleGain.normalize(-1), 0)
+        XCTAssertEqual(NativeStreamControllerRumbleGain.normalize(99), 48)
+    }
+
+    func testControllerRumblePercentLabelsMatchQuarterSteps() {
+        for (gain, label) in [(0.0, "Off"), (12.0, "25%"), (24.0, "50%"), (36.0, "75%"), (48.0, "100%")] {
+            XCTAssertEqual(NativeStreamControllerRumbleGain.label(gain), label)
+        }
+        XCTAssertEqual(NativeStreamControllerRumbleGain.label(32), "67%")
     }
 
     func testControllerRumbleGainMigratesAndPersistsWithoutChangingPhoneFallback() throws {
@@ -251,6 +261,12 @@ final class OpenNOWiOSParityTests: XCTestCase {
         let strongest = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings))
         XCTAssertEqual(strongest.controllerRumbleStrength, 32)
         XCTAssertFalse(strongest.phoneRumbleFallback)
+        for gain in [0.0, 48.0] {
+            settings.controllerRumbleStrength = gain
+            let saved = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings))
+            XCTAssertEqual(saved.controllerRumbleStrength, gain)
+            XCTAssertFalse(saved.phoneRumbleFallback)
+        }
     }
 
     func testMetal4RenderingIsOptInAndPersistsIndependentlyOfHDRAndMetalFX() throws {

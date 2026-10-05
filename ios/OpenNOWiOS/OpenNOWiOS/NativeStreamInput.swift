@@ -14,9 +14,14 @@ import UIKit
 #endif
 
 enum NativeStreamControllerRumbleGain {
-    static let range: ClosedRange<Double> = 1...32
+    static let range: ClosedRange<Double> = 0...48
     static func normalize(_ multiplier: Double) -> Double {
         multiplier.isFinite ? min(max(multiplier, range.lowerBound), range.upperBound) : 1
+    }
+    static func label(_ multiplier: Double) -> String {
+        let gain = normalize(multiplier)
+        guard gain > 0 else { return "Off" }
+        return String(format: "%.0f%%", gain / range.upperBound * 100)
     }
     static func apply(_ intensity: Float, multiplier: Double) -> Float {
         guard intensity.isFinite else { return 0 }
