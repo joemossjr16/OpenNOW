@@ -1805,11 +1805,11 @@ private struct NativeStreamControlsPanel: View {
                     value: coordinator.liveSettings.enableCloudGsync ? "On" : "Off",
                     isOn: Binding(get: { coordinator.liveSettings.enableCloudGsync },
                         set: { value in coordinator.updateLiveSettings { $0.enableCloudGsync = value } }))
-                NativeStreamToggleRow(title: "Metal Performance HUD",
-                    value: coordinator.metalPerformanceHUDEnabled ? "On" : "Off",
-                    isOn: Binding(get: { coordinator.metalPerformanceHUDEnabled },
-                        set: { coordinator.setMetalPerformanceHUDEnabled($0) }))
-                Text("Shows Metal's display refresh range, presented FPS, frame intervals, and GPU time.")
+                NativeStreamToggleRow(title: "Client display timing",
+                    value: coordinator.clientDisplayTimingEnabled ? "On" : "Off",
+                    isOn: Binding(get: { coordinator.clientDisplayTimingEnabled },
+                        set: { coordinator.setClientDisplayTimingEnabled($0) }))
+                Text("Shows the display-link cadence and OpenNOW's actual drawable presentation rate.")
                     .font(.caption).foregroundStyle(.secondary)
                 if let rates = coordinator.statsSnapshot.presentationRates {
                     Text(rates.label).font(.footnote.monospacedDigit()).foregroundStyle(.secondary)
@@ -2581,7 +2581,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     /// A live copy of app settings the panel can edit mid-session. Persisted through
     /// `onSettingsChange` so a change made in-game survives the session ending.
     @Published fileprivate var liveSettings: AppSettings
-    @Published fileprivate var metalPerformanceHUDEnabled = false
+    @Published fileprivate var clientDisplayTimingEnabled = false
     @Published var streamerPreferences: StreamerPreferences
     @Published fileprivate var streamSharpeningEnabled: Bool
     @Published fileprivate var streamSharpeningAmount: Double
@@ -3268,9 +3268,9 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         onSettingsChange(next)
     }
 
-    func setMetalPerformanceHUDEnabled(_ enabled: Bool) {
-        metalPerformanceHUDEnabled = enabled
-        renderer?.setMetalPerformanceHUDEnabled(enabled)
+    func setClientDisplayTimingEnabled(_ enabled: Bool) {
+        clientDisplayTimingEnabled = enabled
+        renderer?.setClientDisplayTimingEnabled(enabled)
     }
 
     func setStretchStreamToFill(_ enabled: Bool) {
@@ -3647,7 +3647,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         renderer.setStreamSharpening(enabled: streamSharpeningEnabled, amount: streamSharpeningAmount)
         renderer.setViewportTransform(scale: streamZoomScale, offset: streamZoomOffset)
         renderer.setVideoEffects(upscaling: liveSettings.metalFXUpscalingEnabled, metal4: liveSettings.metal4Enabled, cloudGsync: liveSettings.enableCloudGsync)
-        renderer.setMetalPerformanceHUDEnabled(metalPerformanceHUDEnabled)
+        renderer.setClientDisplayTimingEnabled(clientDisplayTimingEnabled)
         attachCurrentVideoSinkIfNeeded()
     }
 
@@ -5916,7 +5916,7 @@ private final class NativeStreamRenderView: UIView {
     private var metal4Enabled = false
     private var upscalingEnabled = false
     private var cloudGsyncEnabled = false
-    private var metalPerformanceHUDEnabled = false
+    private var clientDisplayTimingEnabled = false
     var videoEffectsStatus: String { filteredMetalView?.videoEffectsStatus ?? "" }
     var presentationRates: NativeStreamPresentationRates? {
         filteredRendererActive ? filteredMetalView?.presentationRates : nil
@@ -5931,9 +5931,9 @@ private final class NativeStreamRenderView: UIView {
         updateRendererVisibility()
     }
 
-    func setMetalPerformanceHUDEnabled(_ enabled: Bool) {
-        metalPerformanceHUDEnabled = enabled
-        filteredMetalView?.setMetalPerformanceHUDEnabled(enabled)
+    func setClientDisplayTimingEnabled(_ enabled: Bool) {
+        clientDisplayTimingEnabled = enabled
+        filteredMetalView?.setClientDisplayTimingEnabled(enabled)
     }
     private var viewportTransformScale: CGFloat = 1
     private var viewportTransformOffset: CGSize = .zero
@@ -6084,7 +6084,7 @@ private final class NativeStreamRenderView: UIView {
         filtered.stretchToFill = stretchStreamToFill
         filtered.sharpeningAmount = streamSharpeningEnabled ? streamSharpeningAmount : 0
         filtered.setVideoEffects(upscaling: upscalingEnabled, metal4: metal4Enabled, cloudGsync: cloudGsyncEnabled)
-        filtered.setMetalPerformanceHUDEnabled(metalPerformanceHUDEnabled)
+        filtered.setClientDisplayTimingEnabled(clientDisplayTimingEnabled)
         filtered.isHidden = true
         videoContainerView.addSubview(filtered)
         rendererStateLock.lock()
@@ -6249,7 +6249,9 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     private var metal4Enabled = false
     private var upscalingEnabled = false
     private var cloudGsyncEnabled = false
-    private var metalPerformanceHUDEnabled = false
+    private var clientDisplayTimingEnabled = false
+    private var displayLinkIntervals: [(time: CFTimeInterval, interval: CFTimeInterval)] = []
+    private var lastDisplayLinkTimestamp: CFTimeInterval?
     private var suspendUpscalingUntil: CFTimeInterval = 0
     private var effectsGeneration: UInt64 = 0
     var presentationRates: NativeStreamPresentationRates? {
@@ -6272,6 +6274,15 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         if upscalingEnabled {
             parts.append("MetalFX: " + (CACurrentMediaTime() < suspendUpscalingUntil
                 ? "Paused: processing error" : (metal4UpscalingStatus ?? spatialUpscaler.status)))
+        }
+        if clientDisplayTimingEnabled {
+            let screenMax = max(mtkView.window?.screen.maximumFramesPerSecond ?? 0,
+                                UIScreen.main.maximumFramesPerSecond)
+            let requestedRange = cloudGsyncEnabled ? "48–\(screenMax)Hz requested" : "\(screenMax)Hz fixed requested"
+            let cadence = displayLinkCadenceLabel ?? "callbacks measuring…"
+            let presented = presentationRates.map { String(format: "presented %.0f FPS", $0.displayedFPS) }
+                ?? "presentations measuring…"
+            parts.append("Client timing: screen max \(screenMax)Hz · \(requestedRange) · \(cadence) · \(presented)")
         }
         return parts.joined(separator: " · ")
     }
@@ -6296,14 +6307,21 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         effectsGeneration &+= 1
     }
 
-    func setMetalPerformanceHUDEnabled(_ enabled: Bool) {
-        metalPerformanceHUDEnabled = enabled
-        guard #available(iOS 16.0, *), let layer = mtkView.layer as? CAMetalLayer else { return }
-        layer.developerHUDProperties = [
-            "mode": enabled ? "main" : "disabled",
-            "logging": enabled ? "default" : "disabled"
-        ]
-        NSLog("[OpenNOW] Metal Performance HUD %@", enabled ? "enabled" : "disabled")
+    func setClientDisplayTimingEnabled(_ enabled: Bool) {
+        clientDisplayTimingEnabled = enabled
+        displayLinkIntervals.removeAll(keepingCapacity: true)
+        lastDisplayLinkTimestamp = nil
+    }
+
+    private var displayLinkCadenceLabel: String? {
+        guard displayLinkIntervals.count >= 3 else { return nil }
+        let intervals = displayLinkIntervals.map(\.interval)
+        let average = intervals.reduce(0, +) / Double(intervals.count)
+        guard average > 0 else { return nil }
+        let minMilliseconds = (intervals.min() ?? average) * 1_000
+        let maxMilliseconds = (intervals.max() ?? average) * 1_000
+        return String(format: "DisplayLink callbacks %.0fHz (%.1f–%.1fms)",
+                      1 / average, minMilliseconds, maxMilliseconds)
     }
     private let sharpeningFilter = CIFilter(name: "CISharpenLuminance")
     private var colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
@@ -6442,6 +6460,17 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     }
 
     private func displayTick(_ link: CADisplayLink) {
+        if clientDisplayTimingEnabled {
+            let now = CACurrentMediaTime()
+            if let previous = lastDisplayLinkTimestamp {
+                let interval = link.timestamp - previous
+                if interval.isFinite, (0.001...0.1).contains(interval) {
+                    displayLinkIntervals.append((time: now, interval: interval))
+                }
+            }
+            lastDisplayLinkTimestamp = link.timestamp
+            displayLinkIntervals.removeAll { now - $0.time > 2.0 }
+        }
         displayTargetTimestamp = link.targetTimestamp
         mtkView.draw()
     }
