@@ -234,6 +234,7 @@ final class NativeStreamMetal4HDRRenderer {
     /// can use the unchanged legacy renderer and the same timeline ticket.
     func submit(buffer: CVPixelBuffer, target: any MTLTexture, destination: CGRect,
                 drawable: (any MTLDrawable)? = nil, ticket: NativeStreamMetalFrameTimeline.Ticket? = nil,
+                presentAt: CFTimeInterval? = nil,
                 presented: (@Sendable (Double) -> Void)? = nil,
                 completion: @escaping @Sendable (Double,NSError?) -> Void) -> Bool {
         guard let input = NativeStreamHDRMetalProgram.Input(buffer:buffer,cache:cache,target:target,destination:destination)
@@ -292,7 +293,10 @@ final class NativeStreamMetal4HDRRenderer {
         }
         queue.commit([slot.command],options:options)
         if let ticket { queue.signalEvent(ticket.event,value:ticket.value) }
-        if let drawable { queue.signalDrawable(drawable); drawable.present() }
+        if let drawable {
+            queue.signalDrawable(drawable)
+            if let presentAt { drawable.present(at: presentAt) } else { drawable.present() }
+        }
         return true
     }
     private func release(_ index: Int) { lock.lock(); available.append(index); lock.unlock() }
@@ -308,6 +312,7 @@ final class NativeStreamMetal4HDRRenderer {
     func setDrawableResidency(_ residency: any MTLResidencySet) {}
     func submit(buffer: CVPixelBuffer, target: any MTLTexture, destination: CGRect,
                 drawable: (any MTLDrawable)? = nil, ticket: NativeStreamMetalFrameTimeline.Ticket? = nil,
+                presentAt: CFTimeInterval? = nil,
                 presented: (@Sendable (Double) -> Void)? = nil,
                 completion: @escaping @Sendable (Double,NSError?) -> Void) -> Bool { false }
 }
