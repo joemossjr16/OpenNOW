@@ -693,6 +693,10 @@ final class NativeStreamInputBridge {
     private var mouseScrollSensitivity: CGFloat = 30
     private var mouseAccelerationLevel = 1
     private var phoneRumbleFallbackEnabled = true
+    #if os(iOS)
+    private let gameSirRumbler = NativeStreamGameSirRumbler()
+    private var gameSirLastRumble: (slot: Int, weak: Int, strong: Int)?
+    #endif
     private var controllerRumbleStrength: Double = 1
     private var physicalControllerPassthroughEnabled = true
     private var virtualControllerEnabled = false
@@ -746,6 +750,13 @@ final class NativeStreamInputBridge {
         let next = NativeStreamControllerRumbleGain.normalize(multiplier)
         guard controllerRumbleStrength != next else { return }
         controllerRumbleStrength = next
+        #if os(iOS)
+        if let last = gameSirLastRumble {
+            _ = gameSirRumbler.setLowFrequencyMotor(
+                NativeStreamGameSirMotorPacket.amplitude(last.strong, gain: next),
+                highFrequencyMotor: NativeStreamGameSirMotorPacket.amplitude(last.weak, gain: next))
+        }
+        #endif
         #if canImport(CoreHaptics)
         for playback in controllerHapticsBySlot.values {
             guard playback.isPlaying, let profile = playback.lastProfile else { continue }
@@ -904,7 +915,12 @@ final class NativeStreamInputBridge {
         now: TimeInterval = ProcessInfo.processInfo.systemUptime
     ) {
         guard force || now - lastHapticsAdvertisementAt >= 5 else { return }
-        let controllerAvailable = physicalControllerPassthroughEnabled && controllersBySlot.values.contains { $0.haptics != nil }
+        let controllerAvailable = physicalControllerPassthroughEnabled && controllersBySlot.values.contains {
+            #if os(iOS)
+            if NativeStreamGameSirRumbler.isTargetController($0) { return gameSirRumbler.canHandleController($0) }
+            #endif
+            return $0.haptics != nil
+        }
         #if canImport(CoreHaptics)
         let phoneAvailable = phoneRumbleFallbackEnabled && Self.phoneHapticsSupported
         #else
@@ -985,6 +1001,29 @@ final class NativeStreamInputBridge {
             stopPhoneRumble(shutdown: false)
             return
         }
+
+        #if os(iOS)
+        if physicalControllerPassthroughEnabled,
+           let controller = controllersBySlot[controllerId],
+           NativeStreamGameSirRumbler.isTargetController(controller) {
+            gameSirLastRumble = (controllerId, weakMagnitude, strongMagnitude)
+            let low = NativeStreamGameSirMotorPacket.amplitude(strongMagnitude, gain: controllerRumbleStrength)
+            let high = NativeStreamGameSirMotorPacket.amplitude(weakMagnitude, gain: controllerRumbleStrength)
+            if gameSirRumbler.canHandleController(controller),
+               gameSirRumbler.setLowFrequencyMotor(low, highFrequencyMotor: high) {
+                NativeStreamRumbleDiagnostics.shared.record("gameSirRumbleQueued", details: [
+                    "controllerTransport": "external-accessory", "controllerMultiplier": String(controllerRumbleStrength),
+                    "gameSirRequestedLow": String(low), "gameSirRequestedHigh": String(high)])
+                stopPhoneRumble(shutdown: true)
+                return
+            }
+            // This model's Core Haptics outputs were observed to vibrate the phone.
+            // Use only the explicit accessory transport or the user's phone fallback.
+            if phoneRumbleFallbackEnabled, playPhoneRumble(profile) { return }
+            logHapticsFailure("GameSir motor accessory session unavailable; phone fallback is off.")
+            return
+        }
+        #endif
 
         if physicalControllerPassthroughEnabled,
            let controller = controllersBySlot[controllerId],
@@ -1614,6 +1653,13 @@ final class NativeStreamInputBridge {
     #endif
 
     private func stopControllerRumble(slot: Int, shutdown: Bool) {
+        #if os(iOS)
+        if gameSirLastRumble?.slot == slot {
+            gameSirLastRumble = nil
+            if shutdown { gameSirRumbler.stopAndClose() }
+            else { _ = gameSirRumbler.setLowFrequencyMotor(0, highFrequencyMotor: 0) }
+        }
+        #endif
         #if canImport(CoreHaptics)
         guard let playback = controllerHapticsBySlot[slot] else { return }
         if shutdown {
@@ -1626,6 +1672,10 @@ final class NativeStreamInputBridge {
     }
 
     private func stopAllControllerRumble(shutdown: Bool) {
+        #if os(iOS)
+        gameSirLastRumble = nil
+        gameSirRumbler.stopAndClose()
+        #endif
         #if canImport(CoreHaptics)
         if shutdown {
             let playbacks = Array(controllerHapticsBySlot.values)

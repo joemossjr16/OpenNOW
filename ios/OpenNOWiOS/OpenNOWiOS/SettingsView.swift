@@ -2013,6 +2013,7 @@ private final class ControllerRumbleDiagnostics: ObservableObject {
     @Published private(set) var isTesting = false
     private var engine: CHHapticEngine?
     private var player: CHHapticPatternPlayer?
+    private let gameSirRumbler = NativeStreamGameSirRumbler()
     private var completion: Task<Void, Never>?
 
     func refresh() {
@@ -2028,6 +2029,29 @@ private final class ControllerRumbleDiagnostics: ObservableObject {
         stop()
         guard GCController.controllers().contains(where: { $0 === controller }) else {
             status = "Controller disconnected. Reconnect it and try again."
+            return
+        }
+        if NativeStreamGameSirRumbler.isTargetController(controller) {
+            let level: UInt16 = 29_490
+            let low: UInt16 = locality == .rightHandle ? 0 : level
+            let high: UInt16 = locality == .leftHandle ? 0 : level
+            guard gameSirRumbler.canHandleController(controller),
+                  gameSirRumbler.setLowFrequencyMotor(low, highFrequencyMotor: high) else {
+                status = "GameSir accessory session unavailable. No phone vibration was requested."
+                return
+            }
+            isTesting = true
+            NativeStreamRumbleDiagnostics.shared.record("gameSirDirectTestQueued", details: [
+                "testController": controller.vendorName ?? "Controller", "testOutput": locality.rawValue,
+                "controllerTransport": "external-accessory"])
+            status = "Sending a short GameSir motor command…"
+            completion = Task { [weak self] in
+                do { try await Task.sleep(nanoseconds: 400_000_000) }
+                catch { return }
+                guard let self else { return }
+                self.stop()
+                self.status = "GameSir command sent. Did its physical motor vibrate?"
+            }
             return
         }
         guard let haptics = controller.haptics else {
@@ -2070,6 +2094,7 @@ private final class ControllerRumbleDiagnostics: ObservableObject {
     }
 
     func stop() {
+        gameSirRumbler.stopAndClose()
         completion?.cancel()
         completion = nil
         try? player?.stop(atTime: CHHapticTimeImmediate)
@@ -2091,7 +2116,14 @@ private struct ControllerRumbleDiagnosticsView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(controller.vendorName ?? "Controller").font(.subheadline.bold())
                     Text(controller.productCategory).font(.caption).foregroundStyle(.secondary)
-                    if let haptics = controller.haptics {
+                    if NativeStreamGameSirRumbler.isTargetController(controller) {
+                        Text("GameSir accessory motor output")
+                        Text("Uses the controller's accessory protocol. Core Haptics is bypassed for this model.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Button("Test Controller Rumble") { diagnostics.test(controller, locality: .default) }
+                        Button("Test Left Motor") { diagnostics.test(controller, locality: .leftHandle) }
+                        Button("Test Right Motor") { diagnostics.test(controller, locality: .rightHandle) }
+                    } else if let haptics = controller.haptics {
                         Text("iOS controller haptics: Available")
                         Text("Outputs: " + haptics.supportedLocalities.map { $0.rawValue }.sorted().joined(separator: ", "))
                             .font(.caption).foregroundStyle(.secondary)
@@ -2111,7 +2143,7 @@ private struct ControllerRumbleDiagnosticsView: View {
                 .disabled(diagnostics.isTesting)
             }
             Text(diagnostics.status).font(.footnote).foregroundStyle(.secondary)
-            Text("Tests only the controller's motors. Phone vibration fallback is not used. No stream is required.")
+            Text("GameSir tests send accessory motor commands. Other controllers use iOS haptic outputs. No phone fallback is requested; confirm which device vibrates. No stream is required.")
                 .font(.caption).foregroundStyle(.secondary)
             if diagnostics.isTesting {
                 Button("Stop Test") { diagnostics.stop() }

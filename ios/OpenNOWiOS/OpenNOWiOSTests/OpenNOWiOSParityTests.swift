@@ -241,6 +241,24 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(NativeStreamControllerRumbleGain.normalize(99), 48)
     }
 
+    func testGameSirMotorCommandsPreserveFramingAndIndependentMotors() {
+        XCTAssertEqual(Array(NativeStreamGameSirMotorPacket.packet(low: 0, high: 0)), [4, 0, 1, 0, 1, 0, 0, 0, 0])
+        XCTAssertEqual(Array(NativeStreamGameSirMotorPacket.packet(low: 65535, high: 0)), [4, 255, 1, 0, 1, 0, 0, 0, 0])
+        XCTAssertEqual(Array(NativeStreamGameSirMotorPacket.packet(low: 0, high: 65535)), [4, 0, 1, 255, 1, 0, 0, 0, 0])
+        XCTAssertEqual(NativeStreamGameSirMotorPacket.amplitude(512, gain: 48), 24576)
+        XCTAssertEqual(NativeStreamGameSirMotorPacket.amplitude(512, gain: 0), 0)
+        XCTAssertEqual(NativeStreamGameSirMotorPacket.amplitude(65535, gain: 48), 65535)
+        XCTAssertEqual(NativeStreamGameSirMotorPacket.amplitude(-1, gain: 48), 0)
+    }
+
+    func testGameSirAccessoryRoutingMatchesOnlyG8MFi() {
+        XCTAssertTrue(NativeStreamGameSirMotorPacket.isTarget(vendorName: "GameSir-G8+ MFi"))
+        XCTAssertTrue(NativeStreamGameSirMotorPacket.isTarget(vendorName: "gamesir g8+ mfi"))
+        XCTAssertFalse(NativeStreamGameSirMotorPacket.isTarget(vendorName: "GameSir G8 Plus Bluetooth"))
+        XCTAssertFalse(NativeStreamGameSirMotorPacket.isTarget(vendorName: "Xbox Wireless Controller"))
+        XCTAssertFalse(NativeStreamGameSirMotorPacket.isTarget(vendorName: nil))
+    }
+
     func testControllerRumblePercentLabelsMatchQuarterSteps() {
         for (gain, label) in [(0.0, "Off"), (12.0, "25%"), (24.0, "50%"), (36.0, "75%"), (48.0, "100%")] {
             XCTAssertEqual(NativeStreamControllerRumbleGain.label(gain), label)
