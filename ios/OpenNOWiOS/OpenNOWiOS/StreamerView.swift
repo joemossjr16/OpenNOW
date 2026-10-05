@@ -1906,6 +1906,25 @@ private struct NativeStreamControlsPanel: View {
                     )
                 )
                 NativeStreamActionRow(
+                    title: "Control layout",
+                    value: coordinator.liveSettings.touch.controlMode.label,
+                    actionLabel: "Change"
+                ) {
+                    coordinator.updateLiveSettings {
+                        $0.touch.controlMode = $0.touch.controlMode == .virtualSticks ? .splitTouchpad : .virtualSticks
+                    }
+                }
+                if coordinator.liveSettings.touch.controlMode == .splitTouchpad {
+                    NativeStreamSliderRow(
+                        title: "Touchpad sensitivity",
+                        value: Binding(
+                            get: { coordinator.liveSettings.touch.touchpadSensitivity },
+                            set: { value in coordinator.updateLiveSettings { $0.touch.touchpadSensitivity = value } }
+                        ),
+                        range: 0.5...2
+                    )
+                }
+                NativeStreamActionRow(
                     title: "Style",
                     value: coordinator.liveSettings.touch.style.label,
                     actionLabel: "Change"
@@ -6574,6 +6593,16 @@ private struct NativeStreamVirtualControllerOverlay: View {
             let stickSize = (compact ? 68.0 : 84.0) * layout.stickScale
 
             ZStack {
+                if touchSettings.controlMode == .splitTouchpad, !editing {
+                    NativeStreamSplitTouchpadSurface(
+                        inputBridge: inputBridge,
+                        sensitivity: touchSettings.touchpadSensitivity,
+                        deadZone: touchSettings.joystickDeadZone
+                    )
+                    .ignoresSafeArea()
+                    .accessibilityLabel("Split touchpad: left side moves, right side looks")
+                }
+
                 controlGroup(
                     .topLeft,
                     point: layout.topLeft,
@@ -6643,15 +6672,24 @@ private struct NativeStreamVirtualControllerOverlay: View {
                     safeAreaInsets: proxy.safeAreaInsets
                 ) {
                     HStack(alignment: .bottom, spacing: compact ? 5 : 10) {
-                        NativeStreamVirtualStickView(
-                            label: "L",
-                            size: stickSize,
-                            deadZone: touchSettings.joystickDeadZone,
-                            followsFinger: touchSettings.joystickMode == .dynamic,
-                            outlineStyle: touchSettings.style == .outline,
-                            changed: { x, y in inputBridge.setVirtualStick(.left, x: x, y: y) },
-                            pressed: { inputBridge.setVirtualButton(.leftStick, pressed: $0) }
-                        )
+                        if touchSettings.controlMode == .virtualSticks {
+                            NativeStreamVirtualStickView(
+                                label: "L",
+                                size: stickSize,
+                                deadZone: touchSettings.joystickDeadZone,
+                                followsFinger: touchSettings.joystickMode == .dynamic,
+                                outlineStyle: touchSettings.style == .outline,
+                                changed: { x, y in inputBridge.setVirtualStick(.left, x: x, y: y) },
+                                pressed: { inputBridge.setVirtualButton(.leftStick, pressed: $0) }
+                            )
+                        } else {
+                            Text("MOVE")
+                                .font(.caption2.bold())
+                                .padding(.horizontal, 8).padding(.vertical, 5)
+                                .background(.black.opacity(0.35), in: Capsule())
+                                .foregroundStyle(.white.opacity(0.75))
+                                .allowsHitTesting(false)
+                        }
                         NativeStreamVirtualDPad(size: buttonSize * 0.72, inputBridge: inputBridge)
                     }
                 }
@@ -6663,15 +6701,24 @@ private struct NativeStreamVirtualControllerOverlay: View {
                     safeAreaInsets: proxy.safeAreaInsets
                 ) {
                     HStack(alignment: .bottom, spacing: compact ? 5 : 10) {
-                        NativeStreamVirtualStickView(
-                            label: "R",
-                            size: stickSize,
-                            deadZone: touchSettings.joystickDeadZone,
-                            followsFinger: touchSettings.joystickMode == .dynamic,
-                            outlineStyle: touchSettings.style == .outline,
-                            changed: { x, y in inputBridge.setVirtualStick(.right, x: x, y: y) },
-                            pressed: { inputBridge.setVirtualButton(.rightStick, pressed: $0) }
-                        )
+                        if touchSettings.controlMode == .virtualSticks {
+                            NativeStreamVirtualStickView(
+                                label: "R",
+                                size: stickSize,
+                                deadZone: touchSettings.joystickDeadZone,
+                                followsFinger: touchSettings.joystickMode == .dynamic,
+                                outlineStyle: touchSettings.style == .outline,
+                                changed: { x, y in inputBridge.setVirtualStick(.right, x: x, y: y) },
+                                pressed: { inputBridge.setVirtualButton(.rightStick, pressed: $0) }
+                            )
+                        } else {
+                            Text("LOOK")
+                                .font(.caption2.bold())
+                                .padding(.horizontal, 8).padding(.vertical, 5)
+                                .background(.black.opacity(0.35), in: Capsule())
+                                .foregroundStyle(.white.opacity(0.75))
+                                .allowsHitTesting(false)
+                        }
                         NativeStreamVirtualFaceButtons(size: buttonSize, inputBridge: inputBridge)
                     }
                 }
@@ -7136,6 +7183,101 @@ private struct NativeStreamVirtualButtonTouchSurface: UIViewRepresentable {
 
     static func dismantleUIView(_ control: NativeStreamVirtualButtonTouchControl, coordinator: ()) {
         control.cancelPress()
+    }
+}
+
+private struct NativeStreamSplitTouchpadSurface: UIViewRepresentable {
+    let inputBridge: NativeStreamInputBridge
+    let sensitivity: Double
+    let deadZone: Double
+
+    func makeUIView(context: Context) -> NativeStreamSplitTouchpadView {
+        let view = NativeStreamSplitTouchpadView(frame: .zero)
+        view.inputBridge = inputBridge
+        view.sensitivity = sensitivity
+        view.deadZone = deadZone
+        return view
+    }
+
+    func updateUIView(_ view: NativeStreamSplitTouchpadView, context: Context) {
+        view.inputBridge = inputBridge
+        view.sensitivity = sensitivity
+        view.deadZone = deadZone
+    }
+
+    static func dismantleUIView(_ view: NativeStreamSplitTouchpadView, coordinator: ()) {
+        view.cancelTouches()
+    }
+}
+
+/// Independent per-finger left/right zones allow movement and camera look at the same time.
+/// Touches begin wherever the thumb lands, so users do not need to find a small stick graphic.
+private final class NativeStreamSplitTouchpadView: UIView {
+    weak var inputBridge: NativeStreamInputBridge?
+    var sensitivity = 1.0
+    var deadZone = 0.0
+    private var activeTouches: [ObjectIdentifier: (stick: NativeStreamVirtualGamepadStick, origin: CGPoint)] = [:]
+    private var occupiedSticks: Set<NativeStreamVirtualGamepadStick> = []
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isMultipleTouchEnabled = true
+        backgroundColor = .clear
+        isOpaque = false
+        isAccessibilityElement = false
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        for touch in touches {
+            let point = touch.location(in: self)
+            let stick: NativeStreamVirtualGamepadStick = point.x < bounds.midX ? .left : .right
+            guard !occupiedSticks.contains(stick) else { continue }
+            let id = ObjectIdentifier(touch)
+            activeTouches[id] = (stick, point)
+            occupiedSticks.insert(stick)
+            inputBridge?.setVirtualStick(stick, x: 0, y: 0)
+        }
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        for touch in touches {
+            guard let active = activeTouches[ObjectIdentifier(touch)] else { continue }
+            let point = touch.location(in: self)
+            let vector = TouchpadStickMath.vector(
+                dx: point.x - active.origin.x,
+                dy: point.y - active.origin.y,
+                travel: min(max(bounds.width * 0.085, 54), 96),
+                sensitivity: sensitivity,
+                deadZone: deadZone
+            )
+            inputBridge?.setVirtualStick(active.stick, x: vector.0, y: vector.1)
+        }
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) { finish(touches) }
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) { finish(touches) }
+
+    func cancelTouches() {
+        for active in activeTouches.values {
+            inputBridge?.setVirtualStick(active.stick, x: 0, y: 0)
+        }
+        activeTouches.removeAll()
+        occupiedSticks.removeAll()
+    }
+
+    private func finish(_ touches: Set<UITouch>) {
+        for touch in touches {
+            guard let active = activeTouches.removeValue(forKey: ObjectIdentifier(touch)) else { continue }
+            occupiedSticks.remove(active.stick)
+            inputBridge?.setVirtualStick(active.stick, x: 0, y: 0)
+        }
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil { cancelTouches() }
     }
 }
 

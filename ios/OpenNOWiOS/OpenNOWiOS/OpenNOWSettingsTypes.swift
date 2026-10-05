@@ -99,6 +99,14 @@ enum TouchJoystickMode: String, Codable, CaseIterable, Identifiable {
     var label: String { self == .fixed ? "Fixed" : "Follow finger" }
 }
 
+enum TouchControlMode: String, Codable, CaseIterable, Identifiable {
+    case virtualSticks
+    case splitTouchpad
+
+    var id: String { rawValue }
+    var label: String { self == .virtualSticks ? "Virtual sticks" : "Split touchpad" }
+}
+
 enum TouchAimMode: String, Codable, CaseIterable, Identifiable {
     case lockJoystick
     case lockZone
@@ -221,8 +229,10 @@ struct TouchSettings: Codable, Equatable {
     var nativeTouchJitterThreshold: Double = 8
 
     var joystickMode: TouchJoystickMode = .fixed
+    var controlMode: TouchControlMode = .virtualSticks
     var aimMode: TouchAimMode = .lockJoystick
     var joystickDeadZone: Double = 0
+    var touchpadSensitivity: Double = 1
     var style: TouchControllerStyle = .solid
 
     /// Finger-mouse taps click where the finger lands rather than moving a cursor first.
@@ -245,8 +255,10 @@ struct TouchSettings: Codable, Equatable {
         nativeTouchScrollScale = try c.decodeIfPresent(Double.self, forKey: .nativeTouchScrollScale) ?? 1.0
         nativeTouchJitterThreshold = try c.decodeIfPresent(Double.self, forKey: .nativeTouchJitterThreshold) ?? 8
         joystickMode = try c.decodeIfPresent(TouchJoystickMode.self, forKey: .joystickMode) ?? .fixed
+        controlMode = try c.decodeIfPresent(TouchControlMode.self, forKey: .controlMode) ?? .virtualSticks
         aimMode = try c.decodeIfPresent(TouchAimMode.self, forKey: .aimMode) ?? .lockJoystick
         joystickDeadZone = try c.decodeIfPresent(Double.self, forKey: .joystickDeadZone) ?? 0
+        touchpadSensitivity = try c.decodeIfPresent(Double.self, forKey: .touchpadSensitivity) ?? 1
         style = try c.decodeIfPresent(TouchControllerStyle.self, forKey: .style) ?? .solid
         mouseDirectClick = try c.decodeIfPresent(Bool.self, forKey: .mouseDirectClick) ?? false
         edgePadding = try c.decodeIfPresent(Double.self, forKey: .edgePadding) ?? 14
@@ -262,6 +274,7 @@ struct TouchSettings: Codable, Equatable {
         nativeTouchScrollScale = min(max(nativeTouchScrollScale, 0.25), 2.0)
         nativeTouchJitterThreshold = min(max(nativeTouchJitterThreshold, 0), 24)
         joystickDeadZone = min(max(joystickDeadZone, 0), 0.3)
+        touchpadSensitivity = min(max(touchpadSensitivity, 0.5), 2.0)
         edgePadding = min(max(edgePadding, 0), 72)
         bottomPadding = min(max(bottomPadding, 0), 120)
         leftOffsetX = min(max(leftOffsetX, -220), 220)
@@ -300,6 +313,22 @@ enum TouchStickMath {
         let scaled = (magnitude - threshold) / (1 - threshold)
         let factor = scaled / magnitude
         return (x * factor, y * factor)
+    }
+}
+
+enum TouchpadStickMath {
+    /// Converts finger travel from its landing point into an analog stick vector. A fixed travel
+    /// distance keeps the control predictable regardless of where in each half the finger lands.
+    static func vector(dx: CGFloat, dy: CGFloat, travel: CGFloat, sensitivity: Double, deadZone: Double) -> (CGFloat, CGFloat) {
+        let radius = max(travel, 1)
+        let gain = CGFloat(min(max(sensitivity, 0.5), 2.0))
+        let length = hypot(dx, dy)
+        let scale = length > radius ? radius / length : 1
+        return TouchStickMath.applyDeadZone(
+            x: dx * scale / radius * gain,
+            y: -dy * scale / radius * gain,
+            deadZone: deadZone
+        )
     }
 }
 

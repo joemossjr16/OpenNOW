@@ -2952,6 +2952,31 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(result.1, -0.04, accuracy: 0.0001)
     }
 
+    func testSplitTouchpadUsesLandingPointAndClampsAtFullTravel() {
+        var result = TouchpadStickMath.vector(dx: 30, dy: 0, travel: 60, sensitivity: 1, deadZone: 0)
+        XCTAssertEqual(result.0, 0.5, accuracy: 0.0001)
+        XCTAssertEqual(result.1, 0, accuracy: 0.0001)
+
+        // Upward finger travel maps to positive stick Y, and travel beyond the radius clamps.
+        result = TouchpadStickMath.vector(dx: 0, dy: -120, travel: 60, sensitivity: 1, deadZone: 0)
+        XCTAssertEqual(result.0, 0, accuracy: 0.0001)
+        XCTAssertEqual(result.1, 1, accuracy: 0.0001)
+
+        // Sensitivity can reach full deflection earlier, but never exceed the wire range.
+        result = TouchpadStickMath.vector(dx: 30, dy: 0, travel: 60, sensitivity: 2, deadZone: 0)
+        XCTAssertEqual(result.0, 1, accuracy: 0.0001)
+
+        result = TouchpadStickMath.vector(dx: 2, dy: 0, travel: 60, sensitivity: 1, deadZone: 0.1)
+        XCTAssertEqual(result.0, 0, accuracy: 0.0001)
+    }
+
+    func testOlderTouchSettingsDefaultToVirtualSticks() throws {
+        let data = Data("{}".utf8)
+        let settings = try JSONDecoder().decode(TouchSettings.self, from: data)
+        XCTAssertEqual(settings.controlMode, .virtualSticks)
+        XCTAssertEqual(settings.touchpadSensitivity, 1, accuracy: 0.0001)
+    }
+
     func testControllerCursorCurveKeepsPrecisionNearCentre() {
         // A resting stick must produce nothing, or the cursor walks across the screen.
         XCTAssertEqual(NativeStreamInputBridge.curvedStickAxis(0.1, deadZone: 0.12), 0, accuracy: 0.0001)

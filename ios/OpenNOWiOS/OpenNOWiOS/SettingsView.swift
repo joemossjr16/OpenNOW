@@ -826,6 +826,20 @@ struct SettingsView: View {
             Toggle("Touch Controller", isOn: $store.settings.streamerPreferences.touchControllerVisible)
 
             if store.settings.streamerPreferences.touchControllerVisible {
+                Picker("Control layout", selection: $store.settings.touch.controlMode) {
+                    ForEach(TouchControlMode.allCases) { mode in
+                        Text(mode.label).tag(mode)
+                    }
+                }
+                if store.settings.touch.controlMode == .splitTouchpad {
+                    settingsSlider(
+                        "Touchpad Sensitivity",
+                        value: $store.settings.touch.touchpadSensitivity,
+                        range: 0.5...2,
+                        step: 0.05,
+                        format: { String(format: "%.0f%%", $0 * 100) }
+                    )
+                }
                 Picker("Style", selection: $store.settings.touch.style) {
                     ForEach(TouchControllerStyle.allCases) { style in
                         Text(style.label).tag(style)

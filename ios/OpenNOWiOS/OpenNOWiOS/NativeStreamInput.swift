@@ -145,7 +145,7 @@ enum NativeStreamVirtualGamepadButton: UInt16 {
     case y = 0x8000
 }
 
-enum NativeStreamVirtualGamepadStick {
+enum NativeStreamVirtualGamepadStick: Hashable {
     case left
     case right
 }
