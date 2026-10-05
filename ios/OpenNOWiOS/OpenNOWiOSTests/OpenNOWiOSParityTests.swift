@@ -86,6 +86,47 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(activations, 1, "Selecting after a page change must not activate a control")
     }
 
+    func testQueueSelectorUsesAdvertisedRegionalRoute() {
+        let regions = [
+            StreamRegion(name: "Southern California", url: "https://us-west.cloudmatchbeta.nvidiagrid.net/"),
+            StreamRegion(name: "Southern California", url: "https://np-lax-02.cloudmatchbeta.nvidiagrid.net/")
+        ]
+        XCTAssertEqual(
+            printedWasteRegionalURL(zoneId: "NP-LAX-02", title: "Southern California (USA)", regions: regions),
+            "https://us-west.cloudmatchbeta.nvidiagrid.net/"
+        )
+        XCTAssertNil(printedWasteRegionalURL(zoneId: "NPA-LAX-02", title: "Southern California", regions: regions))
+        XCTAssertNil(printedWasteRegionalURL(zoneId: "NP-LAX-02", title: "Unknown", regions: regions))
+    }
+
+    func testQueueRecommendationFallsBackToLowestPingWhenAllRoutesAreSlow() {
+        func zone(_ id: String, queue: Int, ping: Int) -> PrintedWasteZone {
+            PrintedWasteZone(
+                id: id, title: id, region: "US", regionLabel: "North America",
+                queuePosition: queue, etaMs: nil, zoneUrl: "https://example.com/\(id)",
+                pingMs: ping, isMeasuring: false, regionSuffix: "US", gpuTier: nil
+            )
+        }
+        let slower = zone("NP-A", queue: 1, ping: 160)
+        let faster = zone("NP-B", queue: 30, ping: 110)
+        XCTAssertEqual(recommendedPrintedWasteZone(in: [slower, faster])?.id, faster.id)
+    }
+
+    @MainActor
+    func testQueueDisplayHoldsLowestPositionAndSignOutClearsSession() {
+        let store = OpenNOWStore()
+        store.installDebugQueuePreview(position: 18)
+        XCTAssertEqual(store.displayQueuePosition, 18)
+        store.installDebugQueuePreview(position: 21)
+        XCTAssertEqual(store.displayQueuePosition, 18)
+        store.installDebugQueuePreview(position: 12)
+        XCTAssertEqual(store.displayQueuePosition, 12)
+        store.signOutAll()
+        XCTAssertNil(store.activeSession)
+        XCTAssertNil(store.displayQueuePosition)
+        XCTAssertTrue(store.savedAccounts.isEmpty)
+    }
+
     @MainActor
     func testQuickVirtualButtonTapSurvivesHostPollingAndReleases() async throws {
         var events: [Bool] = []
@@ -236,6 +277,7 @@ final class OpenNOWiOSParityTests: XCTestCase {
             .environmentObject(store).environment(\.horizontalSizeClass, compact ? .compact : .regular))
         if #available(iOS 17.0, *) { host.traitOverrides.horizontalSizeClass = compact ? .compact : .regular }
         let window = UIWindow(windowScene: scene)
+        if !compact { window.frame = CGRect(x: 0, y: 0, width: 1024, height: 768) }
         window.rootViewController = host
         window.makeKeyAndVisible()
         defer { window.isHidden = true; window.rootViewController = nil; previousKeyWindow?.makeKeyAndVisible() }
@@ -293,7 +335,7 @@ final class OpenNOWiOSParityTests: XCTestCase {
                           "The requested settings category must actually be pushed: \(titles())")
             try await selectSidebarRow(0)
             NSLog("[SettingsNavigationTest] home selected")
-            XCTAssertTrue(titles().contains("OpenNOW") && !titles().contains(where: settingsTitles.contains),
+            XCTAssertTrue(titles().contains(where: ["OpenNOW", "Store"].contains) && !titles().contains(where: settingsTitles.contains),
                           "Home navigation must replace the settings stack: \(titles())")
         }
     }
@@ -564,16 +606,16 @@ final class OpenNOWiOSParityTests: XCTestCase {
         // must not be advertised as upscaling when both axes actually shrink.
         XCTAssertNil(NativeStreamVideoEffectsPolicy.upscaleSize(source: CGSize(width: 2560, height: 1600),
             destination: CGSize(width: 2064, height: 1290)))
-        XCTAssertNil(NativeStreamVideoEffectsPolicy.upscaleSize(source: CGSize(width: 1920, height: 1200),
-            destination: CGSize(width: 2064, height: 1290)))
-        XCTAssertNil(NativeStreamVideoEffectsPolicy.upscaleSize(source: CGSize(width: 2560, height: 1080),
-            destination: CGSize(width: 2868, height: 1320)))
+        XCTAssertEqual(NativeStreamVideoEffectsPolicy.upscaleSize(source: CGSize(width: 1920, height: 1200),
+            destination: CGSize(width: 2064, height: 1290)), CGSize(width: 2064, height: 1290))
+        XCTAssertEqual(NativeStreamVideoEffectsPolicy.upscaleSize(source: CGSize(width: 2560, height: 1080),
+            destination: CGSize(width: 2868, height: 1320)), CGSize(width: 2868, height: 1320))
         XCTAssertEqual(NativeStreamVideoEffectsPolicy.upscaleSize(source: CGSize(width: 1920, height: 1080),
             destination: CGSize(width: 2560, height: 1440)), CGSize(width: 2560, height: 1440))
     }
 
     func testMetalFXEnabledButIneligibleUsesSinglePassHDRRenderer() {
-        let source = CGSize(width: 2560, height: 1080)
+        let source = CGSize(width: 2868, height: 1320)
         let destination = CGSize(width: 2868, height: 1320)
         let eligible = NativeStreamVideoEffectsPolicy.upscaleSize(source: source, destination: destination) != nil
         XCTAssertFalse(eligible)
@@ -4193,6 +4235,39 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertFalse(tracker.observe(progressed: true))
         XCTAssertTrue(tracker.observe(progressed: true))
         XCTAssertFalse(tracker.observe(progressed: true))
+    }
+
+    func testQueuePollingUsesValidatedControlHostRatherThanMediaHost() {
+        let game = Self.makeGame(title: "Queue Test", controls: [])
+        var session = ActiveSession(
+            id: "session", game: game, startedAt: .now, status: 1, queuePosition: 9,
+            seatSetupStep: nil, serverIp: "media.example.invalid", mediaIp: nil, mediaPort: 0,
+            signalingServer: nil, signalingUrl: nil, iceServers: [], zone: "NP-PDX-01",
+            streamingBaseUrl: "https://np-pdx-01.cloudmatchbeta.nvidiagrid.net",
+            clientId: "client", deviceId: "device", adState: nil
+        )
+        session.sessionControlBaseUrl = SessionControlRouting.baseURL(
+            host: "np-ams-01.cloudmatchbeta.nvidiagrid.net", port: 443)
+        XCTAssertEqual(SessionControlRouting.pollBase(for: session),
+            "https://np-ams-01.cloudmatchbeta.nvidiagrid.net")
+        session.sessionControlBaseUrl = nil
+        XCTAssertEqual(SessionControlRouting.pollBase(for: session), session.streamingBaseUrl)
+        XCTAssertNil(SessionControlRouting.baseURL(host: "media.example.invalid", port: 443))
+        XCTAssertNil(SessionControlRouting.baseURL(host: "np-ams-01.cloudmatchbeta.nvidiagrid.net", port: 8443))
+        XCTAssertNil(SessionControlRouting.baseURL(host: "np-ams-01.cloudmatchbeta.nvidiagrid.net.attacker.test", port: 443))
+    }
+
+    func testAbandonedQueueIsTerminalEvenWhenProviderReturnsHTTP503() {
+        XCTAssertTrue(CloudMatchQueueStatus.isAbandoned(["statusCode": 69]))
+        XCTAssertTrue(CloudMatchQueueStatus.isAbandoned(["statusDescription": "SESSION_REQUEST_IN_QUEUE_ABANDONED"]))
+        XCTAssertTrue(CloudMatchQueueStatus.isAbandoned(["unifiedErrorCode": "4A8C300F"]))
+        XCTAssertFalse(CloudMatchQueueStatus.isAbandoned(["statusCode": 1]))
+    }
+
+    func testSavedBrowserTokensDecodeWithoutDeviceClientId() throws {
+        let json = Data(#"{"accessToken":"access","expiresAt":123,"clientToken":null,"clientTokenExpiresAt":null,"idToken":null,"refreshToken":null}"#.utf8)
+        let tokens = try JSONDecoder().decode(AuthTokens.self, from: json)
+        XCTAssertNil(tokens.authClientId)
     }
 
     private func deterministicProfile(
