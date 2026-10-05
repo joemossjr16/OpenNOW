@@ -6300,7 +6300,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         metalPerformanceHUDEnabled = enabled
         guard #available(iOS 16.0, *), let layer = mtkView.layer as? CAMetalLayer else { return }
         layer.developerHUDProperties = [
-            "mode": enabled ? "default" : "disabled",
+            "mode": enabled ? "main" : "disabled",
             "logging": enabled ? "default" : "disabled"
         ]
         NSLog("[OpenNOW] Metal Performance HUD %@", enabled ? "enabled" : "disabled")
