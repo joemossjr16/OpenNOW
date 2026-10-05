@@ -6252,7 +6252,6 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     private var clientDisplayTimingEnabled = false
     private var displayLinkIntervals: [(time: CFTimeInterval, interval: CFTimeInterval)] = []
     private var lastDisplayLinkTimestamp: CFTimeInterval?
-    private var lastAdaptiveRangeUpdate: CFTimeInterval = 0
     private var lastPreferredDisplayFPS: Float?
     private var suspendUpscalingUntil: CFTimeInterval = 0
     private var effectsGeneration: UInt64 = 0
@@ -6456,13 +6455,11 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         let screenMax = Float(max(window.screen.maximumFramesPerSecond, UIScreen.main.maximumFramesPerSecond))
         if screenMax > 60.0 {
             if cloudGsyncEnabled {
-                // Keep ProMotion's adaptive envelope, but prefer the cadence
-                // the renderer is actually presenting instead of always asking
-                // for the panel maximum. iOS chooses the closest supported rate.
-                let measuredFPS = presentationRates?.displayedFPS
-                let preferred = min(screenMax, max(48.0, Float(measuredFPS ?? Double(screenMax))))
-                lastPreferredDisplayFPS = preferred
-                link.preferredFrameRateRange = CAFrameRateRange(minimum: 48.0, maximum: screenMax, preferred: preferred)
+                // Keep requesting the display maximum while permitting iOS to
+                // vary refresh. Following the measured video FPS here caused
+                // iOS to quantize the CADisplayLink to 60 Hz on ProMotion.
+                lastPreferredDisplayFPS = screenMax
+                link.preferredFrameRateRange = CAFrameRateRange(minimum: 48.0, maximum: screenMax, preferred: screenMax)
             } else {
                 // Fixed VSync mode: Lock to max refresh (120Hz)
                 lastPreferredDisplayFPS = screenMax
@@ -6475,22 +6472,6 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     }
 
     private func displayTick(_ link: CADisplayLink) {
-        if cloudGsyncEnabled {
-            let now = CACurrentMediaTime()
-            if now - lastAdaptiveRangeUpdate >= 1.0,
-               let presentedFPS = presentationRates?.displayedFPS,
-               presentedFPS.isFinite, presentedFPS >= 48 {
-                let screenMax = Float(max(window?.screen.maximumFramesPerSecond ?? 0,
-                                          UIScreen.main.maximumFramesPerSecond))
-                let nextPreferred = min(screenMax, max(48.0, Float(presentedFPS)))
-                if lastPreferredDisplayFPS.map({ abs($0 - nextPreferred) >= 5 }) ?? true {
-                    lastPreferredDisplayFPS = nextPreferred
-                    link.preferredFrameRateRange = CAFrameRateRange(
-                        minimum: 48.0, maximum: screenMax, preferred: nextPreferred)
-                }
-                lastAdaptiveRangeUpdate = now
-            }
-        }
         if clientDisplayTimingEnabled {
             let now = CACurrentMediaTime()
             if let previous = lastDisplayLinkTimestamp {
