@@ -174,14 +174,14 @@ final class NativeStreamMetal4EffectsRenderer {
             }
             // Pooled decoder IOSurfaces can arrive with a different texture view
             // over recycled memory. Explicitly make aliased reads coherent.
-            encoder.barrier(afterQueueStages: .all, beforeStages: .fragment,
+            encoder.barrier(afterQueueStages: .blit, beforeStages: .fragment,
                             visibilityOptions: [.device, .resourceAlias])
             encoder.setRenderPipelineState(conversionPipeline)
             encoder.setViewport(MTLViewport(originX: 0, originY: 0, width: Double(key.width), height: Double(key.height), znear: 0, zfar: 1))
             encoder.setArgumentTable(slot.conversionArguments, stages: .fragment)
             encoder.drawPrimitives(primitiveType: .triangleStrip, vertexStart: 0, vertexCount: 4)
             // Conversion's fragment writes must be visible to MetalFX's passes.
-            encoder.barrier(afterStages: [.fragment, .tile], beforeQueueStages: .all, visibilityOptions: .device)
+            encoder.barrier(afterStages: [.fragment, .tile], beforeQueueStages: [.dispatch, .blit], visibilityOptions: .device)
             encoder.endEncoding()
         }
         let processingInput = slot.sharpened ?? slot.input
@@ -189,7 +189,7 @@ final class NativeStreamMetal4EffectsRenderer {
             guard let encoder = slot.command.makeComputeCommandEncoder() else {
                 slot.command.endCommandBuffer(); resource.release(index); return false
             }
-            encoder.barrier(afterQueueStages: .all, beforeStages: .dispatch, visibilityOptions: .device)
+            encoder.barrier(afterQueueStages: [.fragment, .tile], beforeStages: .dispatch, visibilityOptions: .device)
             slot.sharpeningArguments.setAddress(slot.uniforms.gpuAddress, index: 0)
             slot.sharpeningArguments.setTexture(slot.input.gpuResourceID, index: 0)
             slot.sharpeningArguments.setTexture(sharp.gpuResourceID, index: 1)
@@ -197,7 +197,7 @@ final class NativeStreamMetal4EffectsRenderer {
             encoder.setArgumentTable(slot.sharpeningArguments)
             encoder.dispatchThreads(threadsPerGrid: MTLSize(width:key.width,height:key.height,depth:1),
                 threadsPerThreadgroup:MTLSize(width:8,height:8,depth:1))
-            encoder.barrier(afterStages: .dispatch, beforeQueueStages: .all, visibilityOptions: .device)
+            encoder.barrier(afterStages: .dispatch, beforeQueueStages: [.dispatch, .blit, .fragment, .tile], visibilityOptions: .device)
             encoder.endEncoding()
         }
         slot.arguments.setTexture(slot.output.gpuResourceID, index: 0)
@@ -213,15 +213,12 @@ final class NativeStreamMetal4EffectsRenderer {
             slot.command.endCommandBuffer(); resource.release(index); return false
         }
         // Metal 4 does not infer dependencies between the scaler and fragment read.
-        encoder.barrier(afterQueueStages: .all, beforeStages: .fragment, visibilityOptions: [.device, .resourceAlias])
+        encoder.barrier(afterQueueStages: [.dispatch, .blit], beforeStages: .fragment, visibilityOptions: [.device, .resourceAlias])
         encoder.setRenderPipelineState(transfer == 0 ? sdrPipeline : hdrPipeline)
         encoder.setViewport(MTLViewport(originX: destination.minX, originY: destination.minY,
             width: destination.width, height: destination.height, znear: 0, zfar: 1))
         encoder.setArgumentTable(slot.arguments, stages: .fragment)
         encoder.drawPrimitives(primitiveType: .triangleStrip, vertexStart: 0, vertexCount: 4)
-        // Presentation aliases the drawable allocation outside this queue.
-        encoder.barrier(afterStages: [.fragment, .tile], beforeQueueStages: .all,
-                        visibilityOptions: [.device, .resourceAlias])
         encoder.endEncoding(); slot.command.endCommandBuffer()
         // A failed producer can skip its GPU signal. Only unblock after completion;
         // report the error to the consumer completion as well as recovering the event.
