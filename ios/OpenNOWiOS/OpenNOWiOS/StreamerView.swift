@@ -1805,6 +1805,12 @@ private struct NativeStreamControlsPanel: View {
                     value: coordinator.liveSettings.enableCloudGsync ? "On" : "Off",
                     isOn: Binding(get: { coordinator.liveSettings.enableCloudGsync },
                         set: { value in coordinator.updateLiveSettings { $0.enableCloudGsync = value } }))
+                NativeStreamToggleRow(title: "Metal Performance HUD",
+                    value: coordinator.metalPerformanceHUDEnabled ? "On" : "Off",
+                    isOn: Binding(get: { coordinator.metalPerformanceHUDEnabled },
+                        set: { coordinator.setMetalPerformanceHUDEnabled($0) }))
+                Text("Shows Metal's display refresh range, presented FPS, frame intervals, and GPU time.")
+                    .font(.caption).foregroundStyle(.secondary)
                 if let rates = coordinator.statsSnapshot.presentationRates {
                     Text(rates.label).font(.footnote.monospacedDigit()).foregroundStyle(.secondary)
                 }
@@ -2575,6 +2581,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     /// A live copy of app settings the panel can edit mid-session. Persisted through
     /// `onSettingsChange` so a change made in-game survives the session ending.
     @Published fileprivate var liveSettings: AppSettings
+    @Published fileprivate var metalPerformanceHUDEnabled = false
     @Published var streamerPreferences: StreamerPreferences
     @Published fileprivate var streamSharpeningEnabled: Bool
     @Published fileprivate var streamSharpeningAmount: Double
@@ -3261,6 +3268,11 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         onSettingsChange(next)
     }
 
+    func setMetalPerformanceHUDEnabled(_ enabled: Bool) {
+        metalPerformanceHUDEnabled = enabled
+        renderer?.setMetalPerformanceHUDEnabled(enabled)
+    }
+
     func setStretchStreamToFill(_ enabled: Bool) {
         resetStreamZoom()
         var preferences = streamerPreferences
@@ -3635,6 +3647,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         renderer.setStreamSharpening(enabled: streamSharpeningEnabled, amount: streamSharpeningAmount)
         renderer.setViewportTransform(scale: streamZoomScale, offset: streamZoomOffset)
         renderer.setVideoEffects(upscaling: liveSettings.metalFXUpscalingEnabled, metal4: liveSettings.metal4Enabled, cloudGsync: liveSettings.enableCloudGsync)
+        renderer.setMetalPerformanceHUDEnabled(metalPerformanceHUDEnabled)
         attachCurrentVideoSinkIfNeeded()
     }
 
@@ -5903,6 +5916,7 @@ private final class NativeStreamRenderView: UIView {
     private var metal4Enabled = false
     private var upscalingEnabled = false
     private var cloudGsyncEnabled = false
+    private var metalPerformanceHUDEnabled = false
     var videoEffectsStatus: String { filteredMetalView?.videoEffectsStatus ?? "" }
     var presentationRates: NativeStreamPresentationRates? {
         filteredRendererActive ? filteredMetalView?.presentationRates : nil
@@ -5915,6 +5929,11 @@ private final class NativeStreamRenderView: UIView {
         if upscaling || metal4 || cloudGsync { ensureFilteredMetalView() }
         filteredMetalView?.setVideoEffects(upscaling: upscaling, metal4: metal4, cloudGsync: cloudGsync)
         updateRendererVisibility()
+    }
+
+    func setMetalPerformanceHUDEnabled(_ enabled: Bool) {
+        metalPerformanceHUDEnabled = enabled
+        filteredMetalView?.setMetalPerformanceHUDEnabled(enabled)
     }
     private var viewportTransformScale: CGFloat = 1
     private var viewportTransformOffset: CGSize = .zero
@@ -6065,6 +6084,7 @@ private final class NativeStreamRenderView: UIView {
         filtered.stretchToFill = stretchStreamToFill
         filtered.sharpeningAmount = streamSharpeningEnabled ? streamSharpeningAmount : 0
         filtered.setVideoEffects(upscaling: upscalingEnabled, metal4: metal4Enabled, cloudGsync: cloudGsyncEnabled)
+        filtered.setMetalPerformanceHUDEnabled(metalPerformanceHUDEnabled)
         filtered.isHidden = true
         videoContainerView.addSubview(filtered)
         rendererStateLock.lock()
@@ -6229,6 +6249,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     private var metal4Enabled = false
     private var upscalingEnabled = false
     private var cloudGsyncEnabled = false
+    private var metalPerformanceHUDEnabled = false
     private var suspendUpscalingUntil: CFTimeInterval = 0
     private var effectsGeneration: UInt64 = 0
     var presentationRates: NativeStreamPresentationRates? {
@@ -6273,6 +6294,16 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         if !upscaling { spatialUpscaler.reset() }
         upscalingEnabled = upscaling
         effectsGeneration &+= 1
+    }
+
+    func setMetalPerformanceHUDEnabled(_ enabled: Bool) {
+        metalPerformanceHUDEnabled = enabled
+        guard #available(iOS 16.0, *), let layer = mtkView.layer as? CAMetalLayer else { return }
+        layer.developerHUDProperties = [
+            "mode": enabled ? "default" : "disabled",
+            "logging": enabled ? "default" : "disabled"
+        ]
+        NSLog("[OpenNOW] Metal Performance HUD %@", enabled ? "enabled" : "disabled")
     }
     private let sharpeningFilter = CIFilter(name: "CISharpenLuminance")
     private var colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
