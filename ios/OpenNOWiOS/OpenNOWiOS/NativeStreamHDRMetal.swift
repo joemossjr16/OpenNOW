@@ -261,13 +261,17 @@ final class NativeStreamMetal4HDRRenderer {
         // Decoder pools expose reused IOSurface memory through new texture views.
         // Metal 4 does not infer alias hazards. Invalidate aliased plane reads at
         // the consumer boundary; retention alone does not establish visibility.
-        encoder.barrier(afterQueueStages: .blit, beforeStages: .fragment,
+        encoder.barrier(afterQueueStages: .all, beforeStages: .fragment,
                         visibilityOptions: [.device, .resourceAlias])
         encoder.setRenderPipelineState(pipeline)
         encoder.setViewport(MTLViewport(originX:destination.minX,originY:destination.minY,
             width:destination.width,height:destination.height,znear:0,zfar:1))
         encoder.setArgumentTable(slot.arguments,stages:.fragment)
         encoder.drawPrimitives(primitiveType:.triangleStrip,vertexStart:0,vertexCount:4)
+        // Store tile results before handing this drawable to the compositor,
+        // which consumes another view of the same IOSurface allocation.
+        encoder.barrier(afterStages: [.fragment, .tile], beforeQueueStages: .all,
+                        visibilityOptions: [.device, .resourceAlias])
         encoder.endEncoding(); slot.command.endCommandBuffer()
         let options = MTL4CommitOptions()
         options.addFeedbackHandler { [self,input,slot,target,drawable] feedback in

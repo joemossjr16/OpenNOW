@@ -174,7 +174,7 @@ final class NativeStreamMetal4EffectsRenderer {
             }
             // Pooled decoder IOSurfaces can arrive with a different texture view
             // over recycled memory. Explicitly make aliased reads coherent.
-            encoder.barrier(afterQueueStages: .blit, beforeStages: .fragment,
+            encoder.barrier(afterQueueStages: .all, beforeStages: .fragment,
                             visibilityOptions: [.device, .resourceAlias])
             encoder.setRenderPipelineState(conversionPipeline)
             encoder.setViewport(MTLViewport(originX: 0, originY: 0, width: Double(key.width), height: Double(key.height), znear: 0, zfar: 1))
@@ -222,6 +222,10 @@ final class NativeStreamMetal4EffectsRenderer {
             width: destination.width, height: destination.height, znear: 0, zfar: 1))
         encoder.setArgumentTable(slot.arguments, stages: .fragment)
         encoder.drawPrimitives(primitiveType: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        // Store tile results before handing this drawable to the compositor,
+        // which consumes another view of the same IOSurface allocation.
+        encoder.barrier(afterStages: [.fragment, .tile], beforeQueueStages: .all,
+                        visibilityOptions: [.device, .resourceAlias])
         encoder.endEncoding(); slot.command.endCommandBuffer()
         // A failed producer can skip its GPU signal. Only unblock after completion;
         // report the error to the consumer completion as well as recovering the event.
