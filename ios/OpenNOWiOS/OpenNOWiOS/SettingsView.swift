@@ -6,6 +6,8 @@ import UIKit
 #if os(iOS)
 import PhotosUI
 import UniformTypeIdentifiers
+import GameController
+import CoreHaptics
 #endif
 
 private enum SettingsCategory: String, CaseIterable, Hashable, Identifiable {
@@ -901,6 +903,9 @@ struct SettingsView: View {
             #endif
 
             LabeledContent("Physical Controller", value: "Detected automatically")
+            #if os(iOS)
+            ControllerRumbleDiagnosticsView()
+            #endif
             Button {
                 store.setStreamTutorialCompleted(false)
             } label: {
@@ -1994,3 +1999,125 @@ private extension String {
         return trimmed.isEmpty ? nil : trimmed
     }
 }
+
+#if os(iOS)
+/// Direct controller output test: does not use phone fallback or require a stream.
+@MainActor
+private final class ControllerRumbleDiagnostics: ObservableObject {
+    @Published private(set) var controllers: [GCController] = []
+    @Published private(set) var status = "Connect a controller to check its rumble capability."
+    @Published private(set) var isTesting = false
+    private var engine: CHHapticEngine?
+    private var player: CHHapticPatternPlayer?
+    private var completion: Task<Void, Never>?
+
+    func refresh() {
+        stop()
+        controllers = GCController.controllers()
+        status = controllers.isEmpty ? "No controller connected." : "Choose a controller test below."
+    }
+
+    func test(_ controller: GCController, locality: GCHapticsLocality) {
+        stop()
+        guard GCController.controllers().contains(where: { $0 === controller }) else {
+            status = "Controller disconnected. Reconnect it and try again."
+            return
+        }
+        guard let haptics = controller.haptics else {
+            status = "This controller does not expose haptics to iOS. No controller rumble was sent."
+            return
+        }
+        guard haptics.supportedLocalities.contains(locality),
+              let engine = haptics.createEngine(withLocality: locality) else {
+            status = "iOS could not create a haptic engine for this output."
+            return
+        }
+        self.engine = engine
+        do {
+            engine.playsHapticsOnly = true
+            engine.isAutoShutdownEnabled = false
+            try engine.start()
+            let event = CHHapticEvent(eventType: .hapticContinuous, parameters: [
+                CHHapticEventParameter(parameterID: .hapticIntensity, value: 0.45),
+                CHHapticEventParameter(parameterID: .hapticSharpness, value: 0.5)
+            ], relativeTime: 0, duration: 0.4)
+            let pattern = try CHHapticPattern(events: [event], parameters: [])
+            let player = try engine.makePlayer(with: pattern)
+            self.player = player
+            try player.start(atTime: CHHapticTimeImmediate)
+            isTesting = true
+            status = "Sending a short controller pulse…"
+            completion = Task { [weak self] in
+                do { try await Task.sleep(nanoseconds: 700_000_000) }
+                catch { return }
+                guard let self else { return }
+                self.stop()
+                self.status = "iOS accepted the pulse. Did the controller vibrate?"
+            }
+        } catch {
+            stop()
+            status = "Controller rumble failed: \(error.localizedDescription)"
+        }
+    }
+
+    func stop() {
+        completion?.cancel()
+        completion = nil
+        try? player?.stop(atTime: CHHapticTimeImmediate)
+        player = nil
+        engine?.stop(completionHandler: nil)
+        engine = nil
+        isTesting = false
+    }
+}
+
+private struct ControllerRumbleDiagnosticsView: View {
+    @StateObject private var diagnostics = ControllerRumbleDiagnostics()
+    @Environment(\.scenePhase) private var scenePhase
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Controller Rumble Test").font(.headline)
+            ForEach(diagnostics.controllers, id: \.self) { controller in
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(controller.vendorName ?? "Controller").font(.subheadline.bold())
+                    Text(controller.productCategory).font(.caption).foregroundStyle(.secondary)
+                    if let haptics = controller.haptics {
+                        Text("iOS controller haptics: Available")
+                        Text("Outputs: " + haptics.supportedLocalities.map { $0.rawValue }.sorted().joined(separator: ", "))
+                            .font(.caption).foregroundStyle(.secondary)
+                        Button("Test Controller Rumble") { diagnostics.test(controller, locality: .default) }
+                        if haptics.supportedLocalities.contains(.leftHandle) {
+                            Button("Test Left Handle") { diagnostics.test(controller, locality: .leftHandle) }
+                        }
+                        if haptics.supportedLocalities.contains(.rightHandle) {
+                            Button("Test Right Handle") { diagnostics.test(controller, locality: .rightHandle) }
+                        }
+                    } else {
+                        Text("iOS controller haptics: Unavailable")
+                        Text("The connected controller does not expose rumble through Apple's controller API.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                .disabled(diagnostics.isTesting)
+            }
+            Text(diagnostics.status).font(.footnote).foregroundStyle(.secondary)
+            Text("Tests only the controller's motors. Phone vibration fallback is not used. No stream is required.")
+                .font(.caption).foregroundStyle(.secondary)
+            if diagnostics.isTesting {
+                Button("Stop Test") { diagnostics.stop() }
+            }
+            Button("Refresh Controllers") { diagnostics.refresh() }
+                .disabled(diagnostics.isTesting)
+        }
+        .buttonStyle(.borderless)
+        .onAppear { diagnostics.refresh() }
+        .onDisappear { diagnostics.stop() }
+        .onReceive(NotificationCenter.default.publisher(for: .GCControllerDidConnect)) { _ in diagnostics.refresh() }
+        .onReceive(NotificationCenter.default.publisher(for: .GCControllerDidDisconnect)) { _ in diagnostics.refresh() }
+        .onChangeCompat(of: scenePhase) { phase in
+            if phase != .active { diagnostics.stop() }
+        }
+    }
+}
+#endif
