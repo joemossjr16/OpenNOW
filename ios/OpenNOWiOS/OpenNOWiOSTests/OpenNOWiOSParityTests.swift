@@ -13,6 +13,79 @@ import CoreImage
 @testable import OpenNOWiOS
 
 final class OpenNOWiOSParityTests: XCTestCase {
+    func testControllerShortcutsPersistWithoutChangingSavedRumbleGain() throws {
+        let legacy = try JSONDecoder().decode(AppSettings.self, from: Data("{}".utf8))
+        XCTAssertEqual(legacy.controllerShortcuts.action(for: "Button A"), .none)
+        var settings = legacy
+        settings.controllerRumbleStrength = 48
+        settings.controllerShortcuts.firstButton = "Back Left Button 0"
+        settings.controllerShortcuts.secondButton = "Back Right Button 0"
+        let restored = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings))
+        XCTAssertEqual(restored.controllerShortcuts.action(for: "Back Left Button 0"), .controls)
+        XCTAssertEqual(restored.controllerShortcuts.action(for: "Back Right Button 0"), .stats)
+        XCTAssertEqual(restored.controllerShortcuts.action(for: ""), .none)
+        XCTAssertEqual(restored.controllerRumbleStrength, 48)
+        XCTAssertEqual(NativeStreamControllerRumbleGain.label(48), "75%")
+    }
+
+    func testControllerHUDDirectionRejectsDriftAndInvalidAxes() {
+        XCTAssertNil(NativeStreamControllerHUDRouting.direction(x: 0.59, y: 0.1))
+        XCTAssertNil(NativeStreamControllerHUDRouting.direction(x: .nan, y: 1))
+        XCTAssertNil(NativeStreamControllerHUDRouting.direction(x: 1, y: .infinity))
+        XCTAssertEqual(NativeStreamControllerHUDRouting.direction(x: -0.8, y: 0.2), .left)
+        XCTAssertEqual(NativeStreamControllerHUDRouting.direction(x: 0.7, y: -1), .down)
+        XCTAssertEqual(NativeStreamControllerHUDRouting.direction(x: 0, y: 1), .up)
+    }
+
+    func testControllerHUDReleasesGameControlsWhileKeepingControllerConnected() {
+        let held = NativeStreamGamepadState(controllerId: 2, buttons: 0xffff, leftTrigger: 255,
+            rightTrigger: 255, leftStickX: 32767, leftStickY: -32767,
+            rightStickX: 1000, rightStickY: -1000, connected: true)
+        let neutral = NativeStreamControllerHUDRouting.gameState(held, captured: true)
+        XCTAssertEqual(neutral.controllerId, 2)
+        XCTAssertTrue(neutral.connected)
+        XCTAssertEqual(neutral.buttons, 0)
+        XCTAssertEqual(neutral.leftTrigger, 0)
+        XCTAssertEqual(neutral.rightTrigger, 0)
+        XCTAssertEqual(neutral.leftStickX, 0)
+        XCTAssertEqual(neutral.leftStickY, 0)
+        XCTAssertEqual(neutral.rightStickX, 0)
+        XCTAssertEqual(neutral.rightStickY, 0)
+        XCTAssertEqual(NativeStreamControllerHUDRouting.gameState(held, captured: false), held)
+        let disconnected = NativeStreamGamepadState(controllerId: 2, buttons: 0, leftTrigger: 0,
+            rightTrigger: 0, leftStickX: 0, leftStickY: 0, rightStickX: 0, rightStickY: 0, connected: false)
+        XCTAssertEqual(NativeStreamControllerHUDRouting.gameState(disconnected, captured: true), disconnected)
+    }
+
+    @MainActor
+    func testControllerHUDNavigationSkipsDisabledAndAdjustsSlider() {
+        let nav = NativeStreamControllerHUDNavigator()
+        let first = UUID(), disabled = UUID(), slider = UUID()
+        var activations = 0
+        var value = 50.0
+        nav.register(first, enabled: true, activate: { activations += 1 }, adjust: nil)
+        nav.register(disabled, enabled: false, activate: { XCTFail("Disabled control activated") }, adjust: nil)
+        nav.register(slider, enabled: true, activate: {}, adjust: { value += $0 })
+        nav.updatePositions([first: CGRect(x: 0, y: 0, width: 100, height: 20),
+            disabled: CGRect(x: 0, y: 30, width: 100, height: 20),
+            slider: CGRect(x: 0, y: 60, width: 100, height: 20)])
+        nav.handle(.down)
+        XCTAssertEqual(nav.selected, first)
+        nav.handle(.activate)
+        XCTAssertEqual(activations, 1)
+        nav.handle(.down)
+        XCTAssertEqual(nav.selected, slider)
+        nav.handle(.right)
+        XCTAssertEqual(value, 51)
+        nav.handle(.left)
+        XCTAssertEqual(value, 50)
+        nav.remove(slider)
+        XCTAssertNil(nav.selected)
+        nav.handle(.activate)
+        XCTAssertEqual(nav.selected, first)
+        XCTAssertEqual(activations, 1, "Selecting after a page change must not activate a control")
+    }
+
     @MainActor
     func testQuickVirtualButtonTapSurvivesHostPollingAndReleases() async throws {
         var events: [Bool] = []
@@ -238,7 +311,7 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(NativeStreamControllerRumbleGain.apply(0.0030469215, multiplier: 48), 0.14625223, accuracy: 0.00001)
         XCTAssertEqual(NativeStreamControllerRumbleGain.normalize(.infinity), 1)
         XCTAssertEqual(NativeStreamControllerRumbleGain.normalize(-1), 0)
-        XCTAssertEqual(NativeStreamControllerRumbleGain.normalize(99), 48)
+        XCTAssertEqual(NativeStreamControllerRumbleGain.normalize(99), 64)
     }
 
     func testGameSirMotorCommandsPreserveFramingAndIndependentMotors() {
@@ -246,6 +319,9 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(Array(NativeStreamGameSirMotorPacket.packet(low: 65535, high: 0)), [4, 255, 1, 0, 1, 0, 0, 0, 0])
         XCTAssertEqual(Array(NativeStreamGameSirMotorPacket.packet(low: 0, high: 65535)), [4, 0, 1, 255, 1, 0, 0, 0, 0])
         XCTAssertEqual(NativeStreamGameSirMotorPacket.amplitude(512, gain: 48), 24576)
+        XCTAssertEqual(NativeStreamGameSirMotorPacket.amplitude(512, gain: 64), 32768)
+        XCTAssertEqual(NativeStreamGameSirMotorPacket.amplitude(65535, gain: 64), 65535)
+        XCTAssertEqual(NativeStreamControllerRumbleGain.apply(0, multiplier: 64), 0)
         XCTAssertEqual(NativeStreamGameSirMotorPacket.amplitude(512, gain: 0), 0)
         XCTAssertEqual(NativeStreamGameSirMotorPacket.amplitude(65535, gain: 48), 65535)
         XCTAssertEqual(NativeStreamGameSirMotorPacket.amplitude(-1, gain: 48), 0)
@@ -260,10 +336,10 @@ final class OpenNOWiOSParityTests: XCTestCase {
     }
 
     func testControllerRumblePercentLabelsMatchQuarterSteps() {
-        for (gain, label) in [(0.0, "Off"), (12.0, "25%"), (24.0, "50%"), (36.0, "75%"), (48.0, "100%")] {
+        for (gain, label) in [(0.0, "Off"), (16.0, "25%"), (32.0, "50%"), (48.0, "75%"), (64.0, "100%")] {
             XCTAssertEqual(NativeStreamControllerRumbleGain.label(gain), label)
         }
-        XCTAssertEqual(NativeStreamControllerRumbleGain.label(32), "67%")
+        XCTAssertEqual(NativeStreamControllerRumbleGain.label(32), "50%")
     }
 
     func testControllerRumbleGainMigratesAndPersistsWithoutChangingPhoneFallback() throws {
@@ -279,7 +355,7 @@ final class OpenNOWiOSParityTests: XCTestCase {
         let strongest = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings))
         XCTAssertEqual(strongest.controllerRumbleStrength, 32)
         XCTAssertFalse(strongest.phoneRumbleFallback)
-        for gain in [0.0, 48.0] {
+        for gain in [0.0, 48.0, 64.0] {
             settings.controllerRumbleStrength = gain
             let saved = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings))
             XCTAssertEqual(saved.controllerRumbleStrength, gain)

@@ -1528,6 +1528,8 @@ private struct NativeStreamControlsPanel: View {
     @State private var keyboardText = ""
     @State private var keyboardPresented = false
     @State private var bugReportDeck: BugReportPreflightDeck?
+    @State private var controllerMappingsPresented = false
+    @StateObject private var controllerNavigator = NativeStreamControllerHUDNavigator()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private enum Page: Hashable {
@@ -1570,6 +1572,7 @@ private struct NativeStreamControlsPanel: View {
         VStack(alignment: .leading, spacing: 0) {
             header
 
+            ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     switch page {
@@ -1590,6 +1593,35 @@ private struct NativeStreamControlsPanel: View {
                 .id(page)
             }
             .scrollIndicators(.visible)
+            .onChange(of: controllerNavigator.selected) { selected in
+                if let selected { withAnimation { proxy.scrollTo(selected, anchor: .center) } }
+            }
+            }
+        }
+        .environment(\.controllerHUDNavigator, controllerNavigator)
+        .onPreferenceChange(NativeStreamHUDPositions.self) { controllerNavigator.updatePositions($0) }
+        .onChange(of: coordinator.controllerHUDInput) { input in
+            guard let input else { return }
+            if input.command == .back {
+                if keyboardPresented { keyboardPresented = false }
+                else if controllerMappingsPresented { controllerMappingsPresented = false }
+                else if bugReportDeck != nil { bugReportDeck = nil }
+                else if page != .main { page = .main }
+                else { coordinator.finishControlsPanel() }
+            } else if !keyboardPresented && !controllerMappingsPresented && bugReportDeck == nil {
+                controllerNavigator.handle(input.command)
+            }
+        }
+        .sheet(isPresented: $controllerMappingsPresented) {
+            NavigationStack {
+                ScrollView {
+                    NativeStreamControllerShortcutsView(settings: Binding(get: { coordinator.liveSettings },
+                        set: { next in coordinator.updateLiveSettings { $0.controllerShortcuts = next.controllerShortcuts } }))
+                        .padding()
+                }
+                .navigationTitle("Controller Shortcuts")
+                .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { controllerMappingsPresented = false } } }
+            }
         }
         // Fixed dark: this sits on live video, where the system's light grouped colour would put
         // a near-white slab over the game for anyone not in dark mode.
@@ -1720,11 +1752,14 @@ private struct NativeStreamControlsPanel: View {
             }
 
             NativeStreamPanelSection(title: "Controller") {
+                NativeStreamActionRow(title: "Back button shortcuts", value: "Learn buttons and choose HUD actions", actionLabel: "Configure") {
+                    controllerMappingsPresented = true
+                }
                 NativeStreamSliderRow(title: "Controller rumble strength",
                     value: Binding(get: { coordinator.liveSettings.controllerRumbleStrength },
                         set: { value in coordinator.updateLiveSettings { $0.controllerRumbleStrength = value } }),
-                    range: NativeStreamControllerRumbleGain.range, step: 0.48, format: NativeStreamControllerRumbleGain.label)
-                Text("Applies immediately and saves. 0% is Off; 50% applies 24× gain and 100% applies 48× gain.")
+                    range: NativeStreamControllerRumbleGain.range, step: 0.64, format: NativeStreamControllerRumbleGain.label)
+                Text("Applies immediately and saves. 0% is Off; 50% applies 32× gain and 100% applies 64× gain.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -2266,6 +2301,7 @@ private struct NativeStreamPanelPillButton<Content: View>: View {
             )
         )
         .contentShape(Capsule())
+        .controllerHUDControl(activate: action)
     }
 }
 
@@ -2309,6 +2345,7 @@ private struct NativeStreamToggleRow: View {
                 .fixedSize()
         }
         .streamPanelRow()
+        .controllerHUDControl(activate: { isOn.toggle() })
         .accessibilityElement(children: .combine)
         .accessibilityLabel(title)
         .accessibilityValue(value)
@@ -2349,6 +2386,9 @@ private struct NativeStreamSliderRow: View {
             Slider(value: $value, in: range, step: step)
         }
         .streamPanelRow()
+        .controllerHUDControl(activate: {}, adjust: { direction in
+            value = min(max(value + direction * step, range.lowerBound), range.upperBound)
+        })
         .accessibilityElement(children: .combine)
         .accessibilityLabel(title)
         .accessibilityValue(percentText)
@@ -2396,6 +2436,7 @@ private struct NativeStreamActionRow: View {
             .streamPanelRow()
         }
         .buttonStyle(.plain)
+        .controllerHUDControl(activate: action)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(title)
         .accessibilityValue(value)
@@ -2458,6 +2499,7 @@ private struct NativeStreamKeyButton: View {
                 .padding(.vertical, 10)
         }
         .buttonStyle(.bordered)
+        .controllerHUDControl(activate: action)
     }
 }
 
@@ -2487,7 +2529,10 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     @Published var showStatusOverlay = true
     @Published var retryAvailable = false
     @Published var showStatsOverlay = false
-    @Published var controlsPanelVisible = false
+    @Published var controlsPanelVisible = false {
+        didSet { inputBridge.setControllerHUDActive(controlsPanelVisible) }
+    }
+    @Published var controllerHUDInput: NativeStreamControllerHUDInput?
     @Published fileprivate var touchLayoutEditing = false
     @Published fileprivate var statsDisplayStyle: StreamStatsStyle = .compact
     @Published fileprivate var statsMetrics: StreamStatsMetrics = .default
@@ -2735,6 +2780,23 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             mouseScrollSensitivity: settings.mouseScrollSensitivity,
             controllerRumbleStrength: settings.controllerRumbleStrength
         )
+        inputBridge.setControllerShortcuts(settings.controllerShortcuts)
+        inputBridge.onControllerShortcut = { [weak self] action in
+            Task { @MainActor in
+                guard let self else { return }
+                switch action {
+                case .controls: self.toggleControlsPanel()
+                case .stats: self.setStatsOverlayVisible(!self.showStatsOverlay)
+                case .none: break
+                }
+            }
+        }
+        inputBridge.onControllerHUDCommand = { [weak self] command in
+            Task { @MainActor in
+                guard let self, self.controlsPanelVisible else { return }
+                self.controllerHUDInput = NativeStreamControllerHUDInput(command: command)
+            }
+        }
         inputBridge.onPhysicalControllerAvailabilityChanged = { [weak self] connected in
             Task { @MainActor in
                 guard let self else { return }
@@ -3155,6 +3217,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             mouseScrollSensitivity: next.mouseScrollSensitivity,
             controllerRumbleStrength: next.controllerRumbleStrength
         )
+        inputBridge.setControllerShortcuts(next.controllerShortcuts)
         onSettingsChange(next)
     }
 

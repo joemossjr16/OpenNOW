@@ -898,6 +898,7 @@ struct AppSettings: Codable, Equatable {
     var fingerMouseEnabled: Bool = true
     var phoneRumbleFallback: Bool = true
     var controllerRumbleStrength: Double = 1
+    var controllerShortcuts = NativeStreamControllerShortcuts()
     var launchPage: AppLaunchPage = .store
     var posterSizeScale: Double = 1
     var compactGameCards: Bool = true
@@ -1011,6 +1012,7 @@ struct AppSettings: Codable, Equatable {
         case fingerMouseEnabled
         case phoneRumbleFallback
         case controllerRumbleStrength
+        case controllerShortcuts
         case launchPage
         case posterSizeScale
         case compactGameCards
@@ -1136,6 +1138,7 @@ struct AppSettings: Codable, Equatable {
         fingerMouseEnabled = try container.decodeIfPresent(Bool.self, forKey: .fingerMouseEnabled) ?? true
         phoneRumbleFallback = try container.decodeIfPresent(Bool.self, forKey: .phoneRumbleFallback) ?? true
         controllerRumbleStrength = try container.decodeIfPresent(Double.self, forKey: .controllerRumbleStrength) ?? 1
+        controllerShortcuts = try container.decodeIfPresent(NativeStreamControllerShortcuts.self, forKey: .controllerShortcuts) ?? .init()
         launchPage = try container.decodeIfPresent(AppLaunchPage.self, forKey: .launchPage) ?? .store
         posterSizeScale = try container.decodeIfPresent(Double.self, forKey: .posterSizeScale) ?? 1
         compactGameCards = try container.decodeIfPresent(Bool.self, forKey: .compactGameCards) ?? true
@@ -7834,6 +7837,7 @@ final class OpenNOWStore: ObservableObject {
         var next = settings
         next.streamStatsMetrics = updated.streamStatsMetrics
         next.controllerRumbleStrength = updated.controllerRumbleStrength
+        next.controllerShortcuts = updated.controllerShortcuts
         next.metal4Enabled = updated.metal4Enabled
         next.metalFXUpscalingEnabled = updated.metalFXUpscalingEnabled
         next.touch = updated.touch
@@ -7841,8 +7845,10 @@ final class OpenNOWStore: ObservableObject {
         next.mouseScrollSensitivity = updated.mouseScrollSensitivity
         next.controllerMouseEmulation = updated.controllerMouseEmulation
         next.streamKeyboardClearConfirmationDisabled = updated.streamKeyboardClearConfirmationDisabled
-        if let active = activeStreamSettings, active.controllerRumbleStrength != next.controllerRumbleStrength {
+        if let active = activeStreamSettings,
+           active.controllerRumbleStrength != next.controllerRumbleStrength || active.controllerShortcuts != next.controllerShortcuts {
             activeStreamSettings?.controllerRumbleStrength = next.controllerRumbleStrength
+            activeStreamSettings?.controllerShortcuts = next.controllerShortcuts
             syncTrackedSessionSurface()
         }
         guard next != settings else { return }
