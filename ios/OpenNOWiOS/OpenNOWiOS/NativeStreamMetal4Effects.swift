@@ -180,8 +180,10 @@ final class NativeStreamMetal4EffectsRenderer {
             encoder.setViewport(MTLViewport(originX: 0, originY: 0, width: Double(key.width), height: Double(key.height), znear: 0, zfar: 1))
             encoder.setArgumentTable(slot.conversionArguments, stages: .fragment)
             encoder.drawPrimitives(primitiveType: .triangleStrip, vertexStart: 0, vertexCount: 4)
-            // Conversion's fragment writes must be visible to MetalFX's passes.
-            encoder.barrier(afterStages: [.fragment, .tile], beforeQueueStages: [.dispatch, .blit], visibilityOptions: .device)
+            // Conversion's fragment writes must be visible to subsequent compute or render passes.
+            encoder.barrier(afterStages: [.fragment, .tile],
+                            beforeQueueStages: key.upscale || key.sharpen ? [.dispatch, .blit] : [.fragment, .tile],
+                            visibilityOptions: .device)
             encoder.endEncoding()
         }
         let processingInput = slot.sharpened ?? slot.input
@@ -212,8 +214,9 @@ final class NativeStreamMetal4EffectsRenderer {
         guard let encoder = slot.command.makeRenderCommandEncoder(descriptor: pass) else {
             slot.command.endCommandBuffer(); resource.release(index); return false
         }
-        // Metal 4 does not infer dependencies between the scaler and fragment read.
-        encoder.barrier(afterQueueStages: [.dispatch, .blit], beforeStages: .fragment, visibilityOptions: [.device, .resourceAlias])
+        // Metal 4 does not infer dependencies between previous stages and fragment read.
+        encoder.barrier(afterQueueStages: key.upscale || key.sharpen ? [.dispatch, .blit] : [.fragment, .tile],
+                        beforeStages: .fragment, visibilityOptions: [.device, .resourceAlias])
         encoder.setRenderPipelineState(transfer == 0 ? sdrPipeline : hdrPipeline)
         encoder.setViewport(MTLViewport(originX: destination.minX, originY: destination.minY,
             width: destination.width, height: destination.height, znear: 0, zfar: 1))
