@@ -942,6 +942,11 @@ final class NativeStreamInputBridge {
             weakMagnitude: weakMagnitude,
             strongMagnitude: strongMagnitude
         )
+        if !profile.isStopped {
+            NativeStreamRumbleDiagnostics.shared.record("activeMotorEvent", details: [
+                "lastActiveWeakMagnitude": String(weakMagnitude), "lastActiveStrongMagnitude": String(strongMagnitude),
+                "lastActiveIntensity": String(profile.intensity), "controllerStartup": "unmuted-preconfigured"])
+        }
         if profile.isStopped {
             stopControllerRumble(slot: controllerId, shutdown: false)
             stopPhoneRumble(shutdown: false)
@@ -1529,10 +1534,16 @@ final class NativeStreamInputBridge {
             try playback.player.sendParameters(parameters, atTime: CHHapticTimeImmediate)
         } else {
             try playback.engine.start()
-            playback.player.isMuted = true
-            try playback.player.start(atTime: CHHapticTimeImmediate)
-            try playback.player.sendParameters(parameters, atTime: CHHapticTimeImmediate)
-            playback.player.isMuted = false
+            if playback.controllerIdentifier != nil {
+                // Configure gain before starting; avoid a muted startup on controller engines.
+                try playback.player.sendParameters(parameters, atTime: CHHapticTimeImmediate)
+                try playback.player.start(atTime: CHHapticTimeImmediate)
+            } else {
+                playback.player.isMuted = true
+                try playback.player.start(atTime: CHHapticTimeImmediate)
+                try playback.player.sendParameters(parameters, atTime: CHHapticTimeImmediate)
+                playback.player.isMuted = false
+            }
             playback.isPlaying = true
         }
         playback.lastProfile = profile
