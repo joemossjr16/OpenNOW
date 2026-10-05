@@ -13,6 +13,36 @@ import CoreHaptics
 import UIKit
 #endif
 
+/// Bounded, account-free status snapshot for isolating controller rumble failures.
+final class NativeStreamRumbleDiagnostics {
+    static let shared = NativeStreamRumbleDiagnostics()
+    private let lock = NSLock()
+    private let writer = DispatchQueue(label: "OpenNOW.rumbleStatus")
+    private var fields: [String: String] = [:]
+    private var counts: [String: Int] = [:]
+    private var lastWrite = Date.distantPast
+
+    func record(_ event: String, details: [String: String] = [:]) {
+        lock.lock()
+        counts[event, default: 0] += 1
+        fields.merge(details) { _, new in new }
+        fields["lastEvent"] = event
+        let now = Date()
+        let shouldWrite = now.timeIntervalSince(lastWrite) >= 1
+        if shouldWrite { fields["updatedAt"] = ISO8601DateFormatter().string(from: now) }
+        let snapshot: [String: Any] = ["fields": fields, "counts": counts]
+        if shouldWrite { lastWrite = now }
+        lock.unlock()
+        guard shouldWrite else { return }
+        writer.async {
+            guard let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
+                  let data = try? JSONSerialization.data(withJSONObject: snapshot, options: [.sortedKeys]) else { return }
+            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try? data.write(to: directory.appendingPathComponent("controller-rumble-status.json"), options: .atomic)
+        }
+    }
+}
+
 protocol NativeStreamInputSink: AnyObject {
     func sendReliableInput(_ data: Data)
     func sendPartiallyReliableInput(_ data: Data)
@@ -847,6 +877,9 @@ final class NativeStreamInputBridge {
         #else
         let phoneAvailable = false
         #endif
+        NativeStreamRumbleDiagnostics.shared.record("enableRequested", details: [
+            "controllerAvailable": String(controllerAvailable), "phoneFallbackAvailable": String(phoneAvailable),
+            "registeredSlots": controllersBySlot.keys.sorted().map(String.init).joined(separator: ",")])
         sink?.sendReliableInput(encoder.encodeHapticsEnabled(controllerAvailable || phoneAvailable))
         if force {
             sink?.logInputEvent(
@@ -900,6 +933,11 @@ final class NativeStreamInputBridge {
             return
         }
 
+        NativeStreamRumbleDiagnostics.shared.record("motorEvent", details: [
+            "requestedSlot": String(controllerId), "weakMagnitude": String(weakMagnitude),
+            "strongMagnitude": String(strongMagnitude), "passthrough": String(physicalControllerPassthroughEnabled),
+            "matchedController": controllersBySlot[controllerId]?.vendorName ?? "none",
+            "registeredSlots": controllersBySlot.keys.sorted().map(String.init).joined(separator: ",")])
         let profile = NativeStreamRumbleProfile(
             weakMagnitude: weakMagnitude,
             strongMagnitude: strongMagnitude
@@ -914,11 +952,13 @@ final class NativeStreamInputBridge {
            let controller = controllersBySlot[controllerId],
            controller.haptics != nil,
            playControllerRumble(profile, controller: controller, slot: controllerId) {
+            NativeStreamRumbleDiagnostics.shared.record("controllerPlaybackAccepted")
             stopPhoneRumble(shutdown: false)
             return
         }
 
         if phoneRumbleFallbackEnabled, playPhoneRumble(profile) {
+            NativeStreamRumbleDiagnostics.shared.record("phoneFallbackPlaybackAccepted")
             return
         }
         logHapticsFailure("No haptic output available for controller slot \(controllerId)")
@@ -1568,6 +1608,7 @@ final class NativeStreamInputBridge {
 
     #if canImport(CoreHaptics)
     private func logHapticsFailure(_ message: String) {
+        NativeStreamRumbleDiagnostics.shared.record("playbackError", details: ["error": message])
         let now = ProcessInfo.processInfo.systemUptime
         guard now - lastHapticsFailureLogAt >= 5 else { return }
         lastHapticsFailureLogAt = now

@@ -2014,6 +2014,9 @@ private final class ControllerRumbleDiagnostics: ObservableObject {
     func refresh() {
         stop()
         controllers = GCController.controllers()
+        NativeStreamRumbleDiagnostics.shared.record("controllersRefreshed", details: [
+            "controllers": controllers.map { $0.vendorName ?? "Controller" }.joined(separator: ","),
+            "hapticsAvailable": String(controllers.contains { $0.haptics != nil })])
         status = controllers.isEmpty ? "No controller connected." : "Choose a controller test below."
     }
 
@@ -2046,6 +2049,8 @@ private final class ControllerRumbleDiagnostics: ObservableObject {
             self.player = player
             try player.start(atTime: CHHapticTimeImmediate)
             isTesting = true
+            NativeStreamRumbleDiagnostics.shared.record("directTestAccepted", details: [
+                "testController": controller.vendorName ?? "Controller", "testOutput": locality.rawValue])
             status = "Sending a short controller pulse…"
             completion = Task { [weak self] in
                 do { try await Task.sleep(nanoseconds: 700_000_000) }
