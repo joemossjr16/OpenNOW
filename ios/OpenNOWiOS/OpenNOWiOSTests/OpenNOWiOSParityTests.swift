@@ -421,6 +421,13 @@ final class OpenNOWiOSParityTests: XCTestCase {
         }
     }
 
+    func testMetal4FrameSlotPolicyMatchesTripleBufferedRenderers() {
+        XCTAssertEqual(NativeStreamMetal4FrameSlotPolicy.inFlightCount, 3)
+        XCTAssertEqual(NativeStreamMetal4FrameSlotPolicy.indices, [0, 1, 2])
+        XCTAssertTrue(NativeStreamMetal4FrameSlotPolicy.isComplete(3))
+        XCTAssertFalse(NativeStreamMetal4FrameSlotPolicy.isComplete(2))
+    }
+
     func testRetiredFrameGenerationPreferencesAreIgnoredAndOmittedOnSave() throws {
         var settings = AppSettings.default
         settings.preferredResolution = "2560x1440"

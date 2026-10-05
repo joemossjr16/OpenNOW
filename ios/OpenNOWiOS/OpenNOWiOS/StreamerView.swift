@@ -6220,6 +6220,8 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     private var metal4EffectsStorage: AnyObject?
     private var metal4Disabled = false
     private var metal4ConsecutiveFailures = 0
+    private var metal4Status = "Off"
+    private var metal4FallbackReason: String?
     private let submissionTimeline: NativeStreamMetalFrameTimeline?
     private var rendererBackend = "Metal / Core Image"
     private var metal4UpscalingStatus: String?
@@ -6236,7 +6238,15 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     var videoEffectsStatus: String {
         var parts: [String] = ["Renderer: " + rendererBackend]
         if cloudGsyncEnabled {
-            parts.append("G-Sync: VRR")
+            parts.append("Cloud G-Sync requested · adaptive display range requested")
+        } else {
+            parts.append("Cloud G-Sync off · fixed display range requested")
+        }
+        if metal4Enabled && !rendererBackend.hasPrefix("Metal 4") {
+            let status = metal4Disabled
+                ? (metal4FallbackReason ?? "disabled after repeated GPU errors")
+                : (metal4FallbackReason ?? metal4Status)
+            parts.append("Metal 4 fallback: " + status)
         }
         if upscalingEnabled {
             parts.append("MetalFX: " + (CACurrentMediaTime() < suspendUpscalingUntil
@@ -6251,7 +6261,12 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         if metal4 {
             metal4Disabled = false
             metal4ConsecutiveFailures = 0
+            metal4FallbackReason = nil
+            metal4Status = "Preparing"
             prepareMetal4IfNeeded()
+        } else {
+            metal4Status = "Off"
+            metal4FallbackReason = nil
         }
         updateDisplayLinkFrameRateRange()
         guard upscalingEnabled != upscaling else { return }
@@ -6316,17 +6331,43 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     private func prepareMetal4IfNeeded() {
         guard !metal4PreparationStarted, let device = mtkView.device else { return }
         metal4PreparationStarted = true
-        if #available(iOS 26.0, *), submissionTimeline != nil {
-            DispatchQueue.global(qos:.userInitiated).async { [weak self] in
-                let renderer = NativeStreamMetal4HDRRenderer(device:device)
-                let effects = NativeStreamMetal4EffectsRenderer(device:device)
-                DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
-                    if let layer = self.mtkView.layer as? CAMetalLayer {
-                        renderer?.setDrawableResidency(layer.residencySet)
-                        effects?.setDrawableResidency(layer.residencySet)
-                    }
-                    self.metal4HDRStorage = renderer; self.metal4EffectsStorage = effects
+        guard #available(iOS 26.0, *) else {
+            metal4Status = "Unavailable on this iOS version"
+            metal4FallbackReason = metal4Status
+            return
+        }
+        guard submissionTimeline != nil else {
+            metal4Status = "Unavailable: Metal 4 timeline could not be created"
+            metal4FallbackReason = metal4Status
+            return
+        }
+        guard NativeStreamMetal4HDRRenderer.isSupported(device: device) else {
+            metal4Status = "Unavailable: device does not support Metal 4"
+            metal4FallbackReason = metal4Status
+            return
+        }
+        DispatchQueue.global(qos:.userInitiated).async { [weak self] in
+            let renderer = NativeStreamMetal4HDRRenderer(device:device)
+            let effects = NativeStreamMetal4EffectsRenderer(device:device)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if let layer = self.mtkView.layer as? CAMetalLayer {
+                    renderer?.setDrawableResidency(layer.residencySet)
+                    effects?.setDrawableResidency(layer.residencySet)
+                }
+                self.metal4HDRStorage = renderer
+                self.metal4EffectsStorage = effects
+                if renderer == nil && effects == nil {
+                    self.metal4Status = "Initialization failed; see device log"
+                    self.metal4FallbackReason = self.metal4Status
+                    self.metal4PreparationStarted = false
+                    NSLog("[OpenNOW] Metal 4 renderer initialization failed on supported device")
+                } else {
+                    let paths = [renderer == nil ? nil : "direct HDR", effects == nil ? nil : "effects"]
+                        .compactMap { $0 }.joined(separator: ", ")
+                    self.metal4Status = "Ready (\(paths))"
+                    self.metal4FallbackReason = effects == nil
+                        ? "effects renderer unavailable; direct HDR only" : nil
                 }
             }
         }
@@ -6413,41 +6454,48 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
             upscalingEnabled: shouldUpscale, upscaleEligible: upscaleSize != nil,
             sharpeningAmount: sharpeningAmount
         )
-        if #available(iOS 26.0, *), metal4Enabled && !metal4Disabled, hdrTransfer == .pq,
-           useDirectHDRPath,
-           let metal4 = metal4HDRStorage as? NativeStreamMetal4HDRRenderer {
-            let admission = gpuAdmission
-            if metal4.submit(buffer:pixelBuffer,target:drawable.texture,destination:destination,drawable:drawable,ticket:ticket,
-                presented: { time in
-                    presentationTracker.recordPresentation(at:time)
-                }, completion: { [weak self] duration,error in
-                    admission.signal()
-                    mailbox.complete()
-                    if let error {
-                        NSLog("[OpenNOW] Metal 4 HDR failed code=%ld", error.code)
-                        DispatchQueue.main.async { [weak self] in
-                            guard let self else { return }
-                            self.metal4ConsecutiveFailures += 1
-                            if self.metal4ConsecutiveFailures >= 5 {
-                                self.metal4Disabled = true
+        if #available(iOS 26.0, *), metal4Enabled && !metal4Disabled,
+           hdrTransfer == .pq, useDirectHDRPath {
+            if let metal4 = metal4HDRStorage as? NativeStreamMetal4HDRRenderer {
+                let admission = gpuAdmission
+                if metal4.submit(buffer:pixelBuffer,target:drawable.texture,destination:destination,drawable:drawable,ticket:ticket,
+                    presented: { time in
+                        presentationTracker.recordPresentation(at:time)
+                    }, completion: { [weak self] _,error in
+                        admission.signal()
+                        mailbox.complete()
+                        if let error {
+                            NSLog("[OpenNOW] Metal 4 HDR failed code=%ld", error.code)
+                            DispatchQueue.main.async { [weak self] in
+                                guard let self else { return }
+                                self.metal4ConsecutiveFailures += 1
+                                self.metal4FallbackReason = "direct HDR GPU error \(error.code) (\(self.metal4ConsecutiveFailures)/5)"
+                                if self.metal4ConsecutiveFailures >= 5 {
+                                    self.metal4Disabled = true
+                                }
+                            }
+                        } else {
+                            DispatchQueue.main.async { [weak self] in
+                                self?.metal4ConsecutiveFailures = 0
                             }
                         }
-                    } else {
-                        DispatchQueue.main.async { [weak self] in
-                            self?.metal4ConsecutiveFailures = 0
-                        }
+                    }) {
+                    if let ticket { submissionTimeline?.accept(ticket) }
+                    rendererBackend = "Metal 4 · direct 10-bit HDR"
+                    metal4Status = "Active · direct HDR"
+                    metal4FallbackReason = nil
+                    if upscalingEnabled {
+                        metal4UpscalingStatus = shouldUpscale
+                            ? "No upscale: \(Int(frameSize.width))×\(Int(frameSize.height)) → \(Int(destination.width))×\(Int(destination.height))"
+                            : nil
                     }
-                }) {
-                if let ticket { submissionTimeline?.accept(ticket) }
-                rendererBackend = "Metal 4 · direct 10-bit HDR"
-                if upscalingEnabled {
-                    metal4UpscalingStatus = shouldUpscale
-                        ? "No upscale: \(Int(frameSize.width))×\(Int(frameSize.height)) → \(Int(destination.width))×\(Int(destination.height))"
-                        : nil
+                    submitted = true
+                    return
+                } else {
+                    metal4FallbackReason = "direct HDR submission declined (format, residency, or GPU slots)"
                 }
-
-                submitted = true
-                return
+            } else {
+                metal4FallbackReason = metal4Status
             }
         }
         // Cross-queue ordering also covers live switching to effects/legacy.
@@ -6475,8 +6523,9 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                 if let error { NSLog("[OpenNOW] Metal 4 effects failed code=%ld", error.code) }
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.effectsGeneration == effectsToken else { return }
-                    if error != nil {
+                    if let error {
                         self.metal4ConsecutiveFailures += 1
+                        self.metal4FallbackReason = "effects GPU error \(error.code) (\(self.metal4ConsecutiveFailures)/5)"
                         if self.metal4ConsecutiveFailures >= 5 {
                             self.metal4Disabled = true
                         }
@@ -6495,6 +6544,8 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                 if let ticket { submissionTimeline?.accept(ticket) }
                 rendererBackend = (hdrTransfer == .pq ? "Metal 4 · native PQ conversion"
                     : hdrTransfer == .hlg ? "Metal 4 · native HLG conversion" : "Metal 4 · native SDR conversion")
+                metal4Status = "Active · effects"
+                metal4FallbackReason = nil
                 metal4UpscalingStatus = shouldUpscale ? effects.status : nil
 
                 submitted = true
@@ -6535,10 +6586,19 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                     presented: presentedMetal4, completion: completeMetal4) {
                     if let ticket { submissionTimeline?.accept(ticket) }
                     rendererBackend = "Metal 4 · effects"
+                    metal4Status = "Active · Core Image effects"
+                    metal4FallbackReason = nil
                     if shouldUpscale { metal4UpscalingStatus = effects.status } else { metal4UpscalingStatus = nil }
 
                     submitted = true
                     return
+                }
+            }
+            if #available(iOS 26.0, *), metal4Enabled && !metal4Disabled {
+                if let effects = metal4EffectsStorage as? NativeStreamMetal4EffectsRenderer {
+                    metal4FallbackReason = effects.status
+                } else if metal4FallbackReason == nil {
+                    metal4FallbackReason = metal4Status
                 }
             }
             #endif

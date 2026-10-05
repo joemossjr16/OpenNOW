@@ -238,12 +238,14 @@ import QuartzCore
     ticket:NativeStreamMetalFrameTimeline.Ticket(event:gate,previous:1,value:2),completion:done))
   precondition(renderer.submit(buffer:warm,destination:nativeDestination,upscale:true,target:switched,
     ticket:NativeStreamMetalFrameTimeline.Ticket(event:gate,previous:2,value:3),completion:done))
+  precondition(renderer.submit(buffer:warm,destination:nativeDestination,upscale:true,target:switched,
+    ticket:NativeStreamMetalFrameTimeline.Ticket(event:gate,previous:3,value:4),completion:done))
   precondition(!renderer.submit(buffer:warm,destination:nativeDestination,upscale:true,target:switched,completion:done),
-    "Native effects exceeded two slots")
+    "Native effects exceeded three slots")
   gate.signaledValue=1;var finished=0
-  for await success in pending.stream { precondition(success);finished+=1;if finished==2 { break } }
+  for await success in pending.stream { precondition(success);finished+=1;if finished==3 { break } }
   pending.continuation.finish()
-  print("PASS: native PQ effects bound GPU work to two retained slots")
+  print("PASS: native PQ effects bound GPU work to three retained slots")
   for transfer in ["UnknownTransfer" as CFString] {
    let invalid=fixture(format:kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange,transfer:transfer)
    precondition(!renderer.submit(buffer:invalid,destination:nativeDestination,upscale:true,target:switched) { _,_ in fatalError("Invalid transfer submitted") })
