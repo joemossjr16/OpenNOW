@@ -6247,8 +6247,8 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     private var hdrTransfer = NativeStreamHDRTransfer.sdr
     private let mtkView: MTKView
     private let frameBridge = NativeStreamFramePixelBufferBridge()
-    private let frames = NativeStreamLatestFrameMailbox<RTCVideoFrame>()
-    private let gpuAdmission = DispatchSemaphore(value: 2)
+    private let frames = NativeStreamLatestFrameMailbox<RTCVideoFrame>(maximumInFlight: 3)
+    private let gpuAdmission = DispatchSemaphore(value: 3)
     private let presentations = NativeStreamPresentationTracker()
     private var displayLink: CADisplayLink?
     private var displayTargetTimestamp: CFTimeInterval?
@@ -6279,6 +6279,10 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         spatialUpscaler = NativeStreamSpatialUpscaler(device: device)
         ciContext = CIContext(mtlDevice: device, options: [.cacheIntermediates: false])
         mtkView = MTKView(frame: .zero, device: device)
+        if let layer = mtkView.layer as? CAMetalLayer {
+            layer.maximumDrawableCount = 3
+        }
+        mtkView.preferredFramesPerSecond = 120
         super.init(frame: .zero)
         isOpaque = true
         backgroundColor = .black
@@ -6355,8 +6359,6 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     func draw(in view: MTKView) {
         guard !isHidden, window != nil else { return }
         let drawStarted = CACurrentMediaTime()
-        let presentAt = displayTargetTimestamp
-        displayTargetTimestamp = nil
         guard gpuAdmission.wait(timeout: .now()) == .success else { return }
         var submitted = false
         defer { if !submitted { gpuAdmission.signal() } }
@@ -6393,7 +6395,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
             if metal4.submit(buffer:pixelBuffer,target:drawable.texture,destination:destination,drawable:drawable,ticket:ticket,
                 presented: { time in
                     presentationTracker.recordPresentation(at:time)
-                }, presentAt: presentAt, completion: { [weak self] duration,error in
+                }, completion: { [weak self] duration,error in
                     admission.signal()
                     mailbox.complete()
                     if let error {
@@ -6447,7 +6449,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                effects.submit(buffer: pixelBuffer, destination: destination, upscale: shouldUpscale,
                     target: drawable.texture, sharpening:Float(sharpeningAmount),
                     drawable: drawable, ticket: ticket,
-                    presented: presentedMetal4, presentAt: presentAt, completion: completeMetal4) {
+                    presented: presentedMetal4, completion: completeMetal4) {
                 if let ticket { submissionTimeline?.accept(ticket) }
                 rendererBackend = (hdrTransfer == .pq ? "Metal 4 · native PQ conversion"
                     : hdrTransfer == .hlg ? "Metal 4 · native HLG conversion" : "Metal 4 · native SDR conversion")
@@ -6488,7 +6490,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                     transfer: hdrTransfer == .pq ? 1 : hdrTransfer == .hlg ? 2 : 0,
                     upscale: shouldUpscale, context: ciContext, producer: commandBuffer,
                     target: drawable.texture, drawable: drawable, ticket: ticket,
-                    presented: presentedMetal4, presentAt: presentAt, completion: completeMetal4) {
+                    presented: presentedMetal4, completion: completeMetal4) {
                     if let ticket { submissionTimeline?.accept(ticket) }
                     rendererBackend = "Metal 4 · effects"
                     if shouldUpscale { metal4UpscalingStatus = effects.status } else { metal4UpscalingStatus = nil }
@@ -6545,7 +6547,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         }
 
         if let ticket { commandBuffer.encodeSignalEvent(ticket.event,value:ticket.value) }
-        if let presentAt { commandBuffer.present(drawable, atTime: presentAt) } else { commandBuffer.present(drawable) }
+        commandBuffer.present(drawable)
         submitted = true
         commandBuffer.commit()
         if let ticket { submissionTimeline?.accept(ticket) }

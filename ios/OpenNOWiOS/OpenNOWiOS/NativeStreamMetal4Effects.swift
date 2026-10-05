@@ -260,7 +260,7 @@ final class NativeStreamMetal4EffectsRenderer {
         if let drawable { queue.waitForDrawable(drawable) }
         queue.commit([slot.command], options: options)
         if let ticket { queue.signalEvent(ticket.event, value: ticket.value) }
-        if let drawable { queue.signalDrawable(drawable); if let presentAt { drawable.present(at:presentAt) } else { drawable.present() } }
+        if let drawable { queue.signalDrawable(drawable); drawable.present() }
         status = key.upscale ? "Metal 4 · \(key.width)×\(key.height) → \(key.outputWidth)×\(key.outputHeight)"
             : upscale ? "No upscale: \(key.width)×\(key.height) → \(Int(destination.width))×\(Int(destination.height))" : "Metal 4 · presentation"
         return true
@@ -277,7 +277,7 @@ final class NativeStreamMetal4EffectsRenderer {
         setupQueue.async { [weak self] in
             var slots: [Slot] = []
             do {
-                for _ in 0..<2 {
+                for _ in 0..<3 {
                     var scaler: (any MTL4FXSpatialScaler)?
                     if key.upscale {
                         let descriptor = MTLFXSpatialScalerDescriptor()

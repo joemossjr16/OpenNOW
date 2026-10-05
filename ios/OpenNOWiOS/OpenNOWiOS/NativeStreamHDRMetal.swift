@@ -217,7 +217,7 @@ final class NativeStreamMetal4HDRRenderer {
             descriptor.colorAttachments[0].pixelFormat = .bgr10a2Unorm
             pipeline = try compiler.makeRenderPipelineState(descriptor:descriptor)
             var slots: [Slot] = []
-            for _ in 0..<2 {
+            for _ in 0..<3 {
                 let table = MTL4ArgumentTableDescriptor(); table.maxBufferBindCount = 1; table.maxTextureBindCount = 2
                 let residency = MTLResidencySetDescriptor(); residency.initialCapacity = 4
                 guard let allocator = device.makeCommandAllocator(), let command = device.makeCommandBuffer(),
@@ -294,7 +294,7 @@ final class NativeStreamMetal4HDRRenderer {
         if let ticket { queue.signalEvent(ticket.event,value:ticket.value) }
         if let drawable {
             queue.signalDrawable(drawable)
-            if let presentAt { drawable.present(at: presentAt) } else { drawable.present() }
+            drawable.present()
         }
         return true
     }
