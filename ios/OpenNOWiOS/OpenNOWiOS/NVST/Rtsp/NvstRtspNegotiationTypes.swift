@@ -155,6 +155,8 @@ public struct NvstRtspNegotiationInput: Sendable {
     /// The client's VSync mode, announced as `video[0].framePacing.mode` / `feedbackMode`.
     /// Nil keeps the captured baseline, which is the Adaptive announce.
     public let vsyncMode: NvstVsyncMode?
+    /// Whether Cloud G-Sync / VRR is requested in the RTSP ANNOUNCE (`x-nv-video[0].cloudGsync`).
+    public let cloudGsync: Bool?
     /// Attributes applied after every other layer, verbatim. The encoder-knob A/B harness
     /// (`OPN_NVST_ANNOUNCE_OVERRIDES`, see `NvstBifrostFreeTransport.announceOverridesFromEnvironment`);
     /// empty in normal operation.
@@ -181,12 +183,14 @@ public struct NvstRtspNegotiationInput: Sendable {
                 announcesExtendedSettings: Bool = false,
                 echoesOfferedAttributes: Bool = false,
                 vsyncMode: NvstVsyncMode? = nil,
+                cloudGsync: Bool? = nil,
                 announceOverrides: [(String, String)] = []) {
         self.audioChannelCount = audioChannelCount
         self.disablesOwdCongestionControl = disablesOwdCongestionControl
         self.announcesExtendedSettings = announcesExtendedSettings
         self.echoesOfferedAttributes = echoesOfferedAttributes
         self.vsyncMode = vsyncMode
+        self.cloudGsync = cloudGsync
         self.announceOverrides = announceOverrides
         self.sessionID = sessionID
         self.rtspsEndpoints = rtspsEndpoints

@@ -1801,6 +1801,10 @@ private struct NativeStreamControlsPanel: View {
                     value: coordinator.liveSettings.metalFXUpscalingEnabled ? "On" : "Off",
                     isOn: Binding(get: { coordinator.liveSettings.metalFXUpscalingEnabled },
                         set: { value in coordinator.updateLiveSettings { $0.metalFXUpscalingEnabled = value } }))
+                NativeStreamToggleRow(title: "Cloud G-Sync",
+                    value: coordinator.liveSettings.enableCloudGsync ? "On" : "Off",
+                    isOn: Binding(get: { coordinator.liveSettings.enableCloudGsync },
+                        set: { value in coordinator.updateLiveSettings { $0.enableCloudGsync = value } }))
                 if let rates = coordinator.statsSnapshot.presentationRates {
                     Text(rates.label).font(.footnote.monospacedDigit()).foregroundStyle(.secondary)
                 }
@@ -3243,7 +3247,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         guard next != liveSettings else { return }
         liveSettings = next
         statsMetrics = next.streamStatsMetrics
-        renderer?.setVideoEffects(upscaling: next.metalFXUpscalingEnabled, metal4: next.metal4Enabled)
+        renderer?.setVideoEffects(upscaling: next.metalFXUpscalingEnabled, metal4: next.metal4Enabled, cloudGsync: next.enableCloudGsync)
         inputBridge.configureUserPreferences(
             mouseSensitivity: next.mouseSensitivity,
             mouseAcceleration: next.mouseAcceleration,
@@ -3630,7 +3634,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         renderer.setStretchStreamToFill(streamerPreferences.stretchStreamToFill)
         renderer.setStreamSharpening(enabled: streamSharpeningEnabled, amount: streamSharpeningAmount)
         renderer.setViewportTransform(scale: streamZoomScale, offset: streamZoomOffset)
-        renderer.setVideoEffects(upscaling: liveSettings.metalFXUpscalingEnabled, metal4: liveSettings.metal4Enabled)
+        renderer.setVideoEffects(upscaling: liveSettings.metalFXUpscalingEnabled, metal4: liveSettings.metal4Enabled, cloudGsync: liveSettings.enableCloudGsync)
         attachCurrentVideoSinkIfNeeded()
     }
 
@@ -5898,16 +5902,18 @@ private final class NativeStreamRenderView: UIView {
     private var streamSharpeningAmount = 0.25
     private var metal4Enabled = false
     private var upscalingEnabled = false
+    private var cloudGsyncEnabled = false
     var videoEffectsStatus: String { filteredMetalView?.videoEffectsStatus ?? "" }
     var presentationRates: NativeStreamPresentationRates? {
         filteredRendererActive ? filteredMetalView?.presentationRates : nil
     }
 
-    func setVideoEffects(upscaling: Bool, metal4: Bool) {
+    func setVideoEffects(upscaling: Bool, metal4: Bool, cloudGsync: Bool = false) {
         metal4Enabled = metal4
         upscalingEnabled = upscaling
-        if upscaling { ensureFilteredMetalView() }
-        filteredMetalView?.setVideoEffects(upscaling: upscaling, metal4: metal4)
+        cloudGsyncEnabled = cloudGsync
+        if upscaling || metal4 || cloudGsync { ensureFilteredMetalView() }
+        filteredMetalView?.setVideoEffects(upscaling: upscaling, metal4: metal4, cloudGsync: cloudGsync)
         updateRendererVisibility()
     }
     private var viewportTransformScale: CGFloat = 1
@@ -6037,7 +6043,7 @@ private final class NativeStreamRenderView: UIView {
     }
 
     private var shouldRequestFilteredRenderer: Bool {
-        upscalingEnabled || nativeStreamShouldUseFilteredRenderer(
+        upscalingEnabled || metal4Enabled || cloudGsyncEnabled || nativeStreamShouldUseFilteredRenderer(
             osMajorVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,
             streamSharpeningEnabled: streamSharpeningEnabled,
             isSimulator: {
@@ -6058,7 +6064,7 @@ private final class NativeStreamRenderView: UIView {
         filtered.frame = videoContainerView.bounds
         filtered.stretchToFill = stretchStreamToFill
         filtered.sharpeningAmount = streamSharpeningEnabled ? streamSharpeningAmount : 0
-        filtered.setVideoEffects(upscaling: upscalingEnabled, metal4: metal4Enabled)
+        filtered.setVideoEffects(upscaling: upscalingEnabled, metal4: metal4Enabled, cloudGsync: cloudGsyncEnabled)
         filtered.isHidden = true
         videoContainerView.addSubview(filtered)
         rendererStateLock.lock()
@@ -6213,12 +6219,14 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     private var metal4HDRStorage: AnyObject?
     private var metal4EffectsStorage: AnyObject?
     private var metal4Disabled = false
+    private var metal4ConsecutiveFailures = 0
     private let submissionTimeline: NativeStreamMetalFrameTimeline?
     private var rendererBackend = "Metal / Core Image"
     private var metal4UpscalingStatus: String?
     private let spatialUpscaler: NativeStreamSpatialUpscaler
     private var metal4Enabled = false
     private var upscalingEnabled = false
+    private var cloudGsyncEnabled = false
     private var suspendUpscalingUntil: CFTimeInterval = 0
     private var effectsGeneration: UInt64 = 0
     var presentationRates: NativeStreamPresentationRates? {
@@ -6227,6 +6235,9 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
 
     var videoEffectsStatus: String {
         var parts: [String] = ["Renderer: " + rendererBackend]
+        if cloudGsyncEnabled {
+            parts.append("G-Sync: VRR")
+        }
         if upscalingEnabled {
             parts.append("MetalFX: " + (CACurrentMediaTime() < suspendUpscalingUntil
                 ? "Paused: processing error" : (metal4UpscalingStatus ?? spatialUpscaler.status)))
@@ -6234,9 +6245,15 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         return parts.joined(separator: " · ")
     }
 
-    func setVideoEffects(upscaling: Bool, metal4: Bool) {
+    func setVideoEffects(upscaling: Bool, metal4: Bool, cloudGsync: Bool = false) {
         metal4Enabled = metal4
-        if metal4 { prepareMetal4IfNeeded() }
+        cloudGsyncEnabled = cloudGsync
+        if metal4 {
+            metal4Disabled = false
+            metal4ConsecutiveFailures = 0
+            prepareMetal4IfNeeded()
+        }
+        updateDisplayLinkFrameRateRange()
         guard upscalingEnabled != upscaling else { return }
         if !upscaling { spatialUpscaler.reset() }
         upscalingEnabled = upscaling
@@ -6328,20 +6345,28 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         super.didMoveToWindow()
         displayLink?.invalidate()
         displayLink = nil
-        // Use one explicit display clock. MTKView's own timer remains paused.
-        // A fixed range asks ProMotion to keep video cadence instead of choosing
-        // an intermediate refresh rate during otherwise static game scenes.
         mtkView.isPaused = true
         guard let window else { return }
-        let screenMax = Float(max(window.screen.maximumFramesPerSecond, UIScreen.main.maximumFramesPerSecond))
         let link = CADisplayLink(target: displayClock, selector: #selector(DisplayClock.tick(_:)))
+        link.add(to: .main, forMode: .common)
+        displayLink = link
+        updateDisplayLinkFrameRateRange()
+    }
+
+    private func updateDisplayLinkFrameRateRange() {
+        guard let window, let link = displayLink else { return }
+        let screenMax = Float(max(window.screen.maximumFramesPerSecond, UIScreen.main.maximumFramesPerSecond))
         if screenMax > 60.0 {
-            link.preferredFrameRateRange = CAFrameRateRange(minimum: 60.0, maximum: screenMax, preferred: screenMax)
+            if cloudGsyncEnabled {
+                // VRR / ProMotion mode: Allow dynamic refresh rate pacing
+                link.preferredFrameRateRange = CAFrameRateRange(minimum: 48.0, maximum: screenMax, preferred: screenMax)
+            } else {
+                // Fixed VSync mode: Lock to max refresh (120Hz)
+                link.preferredFrameRateRange = CAFrameRateRange(minimum: screenMax, maximum: screenMax, preferred: screenMax)
+            }
         } else {
             link.preferredFrameRateRange = CAFrameRateRange(minimum: 30.0, maximum: 60.0, preferred: 60.0)
         }
-        link.add(to: .main, forMode: .common)
-        displayLink = link
     }
 
     private func displayTick(_ link: CADisplayLink) {
@@ -6400,7 +6425,17 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                     mailbox.complete()
                     if let error {
                         NSLog("[OpenNOW] Metal 4 HDR failed code=%ld", error.code)
-                        DispatchQueue.main.async { [weak self] in self?.metal4Disabled = true }
+                        DispatchQueue.main.async { [weak self] in
+                            guard let self else { return }
+                            self.metal4ConsecutiveFailures += 1
+                            if self.metal4ConsecutiveFailures >= 5 {
+                                self.metal4Disabled = true
+                            }
+                        }
+                    } else {
+                        DispatchQueue.main.async { [weak self] in
+                            self?.metal4ConsecutiveFailures = 0
+                        }
                     }
                 }) {
                 if let ticket { submissionTimeline?.accept(ticket) }
@@ -6440,7 +6475,14 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                 if let error { NSLog("[OpenNOW] Metal 4 effects failed code=%ld", error.code) }
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.effectsGeneration == effectsToken else { return }
-                    if error != nil { self.metal4Disabled = true }
+                    if error != nil {
+                        self.metal4ConsecutiveFailures += 1
+                        if self.metal4ConsecutiveFailures >= 5 {
+                            self.metal4Disabled = true
+                        }
+                    } else {
+                        self.metal4ConsecutiveFailures = 0
+                    }
                     if self.upscalingEnabled { self.finishEffects(failed: error != nil) }
                 }
             }

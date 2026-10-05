@@ -554,6 +554,7 @@ extension NvstRtspNegotiator {
             announcesExtendedSettings: input.announcesExtendedSettings,
             echoesOfferedAttributes: input.echoesOfferedAttributes,
             vsyncMode: input.vsyncMode,
+            cloudGsync: input.cloudGsync,
             announceOverrides: input.announceOverrides
         )
     }

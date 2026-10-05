@@ -108,8 +108,9 @@ actor NativeStreamNVST: NativeStreamNVSTTransport {
             resolution: profile.resolutionString, fps: profile.fps, codec: codec == .h265 ? "HEVC" : codec.rawValue,
             bitrateKbps: profile.maxBitrateKbps, maximumBitrateKbps: profile.maxBitrateKbps,
             colorQuality: color, hdrEnabled: settings.hdrEnabled, audioChannelCount: 2, rtcpOnSctp: true,
-            disablesOwdCongestionControl: false, vsyncMode: .adaptive,
-            announceOverrides: [("x-nv-vqos[0].dfc.enable", "0")])
+            disablesOwdCongestionControl: false, vsyncMode: settings.enableCloudGsync ? .adaptive : .on,
+            cloudGsync: settings.enableCloudGsync,
+            announceOverrides: settings.enableCloudGsync ? [] : [("x-nv-vqos[0].dfc.enable", "0")])
         do {
             let negotiated = try await NvstRtspNegotiator(reserver: reserver).negotiate(input,
                 onVideoReady: { [weak self] handoff in

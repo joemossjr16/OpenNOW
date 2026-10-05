@@ -301,15 +301,11 @@ extension NvstRtspSdp {
                 // alone too, so we match it and leave it alone.
             }
         }
-        // The captured official client also always sends this. "Cloud G-Sync" — the seat's own
-        // session response separately carries `finalizedStreamingFeatures.cloudGsync`, but that
-        // reflects account/GPU-tier eligibility, not confirmation this client asked for it. Never
-        // sent before; worth a direct test given the gameFps evidence (a captured official
-        // session's game engine itself rendered at ~120fps, matching the stream target, not the
-        // 155-160fps this repro's own sessions render at) that this may be the seat's real lever
-        // for keeping the source itself paced to the client instead of decode having to catch up
-        // to a faster one.
-        attributes.set("x-nv-video[0].cloudGsync", "1")
+        if let cloudGsync = options.cloudGsync {
+            attributes.set("x-nv-video[0].cloudGsync", cloudGsync ? "1" : "0")
+        } else {
+            attributes.set("x-nv-video[0].cloudGsync", "1")
+        }
         // The captured baseline's frame-pacing pair is the Adaptive announce
         // (`mode:1`/`feedbackMode:1`, `FRAME_PACING_FEEDBACK_INTERVAL`). A different VSync mode
         // has to override both, in the same client-owned layer as everything else the client

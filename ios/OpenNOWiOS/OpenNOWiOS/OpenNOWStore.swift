@@ -1963,7 +1963,7 @@ enum StreamSettingsResolver {
         updated.preferredResolution = choice.value
         updated.preferredColorQuality = StreamColorQuality.eightBit420.rawValue
         updated.hdrEnabled = false
-        updated.enableCloudGsync = false
+        updated.enableCloudGsync = settings.enableCloudGsync
         switch preset {
         case .custom:
             break
@@ -3128,6 +3128,7 @@ enum CloudMatchStreamingFeatureRequest {
             "bitDepth": bitDepth == 10 ? 1 : 0,
             "trueHdr": settings.hdrEnabled,
             "cloudGsync": settings.enableCloudGsync,
+            "vsyncMode": settings.enableCloudGsync ? 2 : 1,
             "enabledL4S": settings.enableL4S,
             "supportedHidDevices": 0,
             "profile": 0,

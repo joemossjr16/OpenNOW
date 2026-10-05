@@ -672,6 +672,14 @@ extension NvstRtspSdpTests {
         #expect(adaptive.contains("a=x-nv-video[0].framePacing.feedbackMode:1"))
     }
 
+    @Test func cloudGsyncAnnounceHonorsOption() {
+        let enabled = NvstRtspSdp.buildAnnounceSdp(.init(cloudGsync: true))
+        #expect(enabled.contains("a=x-nv-video[0].cloudGsync:1"))
+
+        let disabled = NvstRtspSdp.buildAnnounceSdp(.init(cloudGsync: false))
+        #expect(disabled.contains("a=x-nv-video[0].cloudGsync:0"))
+    }
+
     @Test func explicitHDRRequestOverridesSDRDescribeAndPreserves444() {
         let offered = [("x-nv-video[0].dynamicRangeMode", "0"),
                        ("x-nv-video[0].encoderCscMode", "2"),

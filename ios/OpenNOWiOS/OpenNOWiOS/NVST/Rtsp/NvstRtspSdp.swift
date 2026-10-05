@@ -318,6 +318,8 @@ public enum NvstRtspSdp {
         /// announce — the official client's profiles all pin `vSync` to Adaptive and the capture
         /// never left it). Nil keeps the captured baseline, matching today's behaviour.
         public var vsyncMode: NvstVsyncMode?
+        /// Whether Cloud G-Sync / VRR is announced (`x-nv-video[0].cloudGsync`).
+        public var cloudGsync: Bool?
         /// Applied last, verbatim: the A/B harness for encoder knobs. Empty in normal operation.
         public var announceOverrides: [(String, String)]
 
@@ -353,11 +355,13 @@ public enum NvstRtspSdp {
                     announcesExtendedSettings: Bool = false,
                     echoesOfferedAttributes: Bool = false,
                     vsyncMode: NvstVsyncMode? = nil,
+                    cloudGsync: Bool? = nil,
                     announceOverrides: [(String, String)] = []) {
             self.disablesOwdCongestionControl = disablesOwdCongestionControl
             self.announcesExtendedSettings = announcesExtendedSettings
             self.echoesOfferedAttributes = echoesOfferedAttributes
             self.vsyncMode = vsyncMode
+            self.cloudGsync = cloudGsync
             self.announceOverrides = announceOverrides
             self.offeredAttributes = offeredAttributes
             self.codec = codec
