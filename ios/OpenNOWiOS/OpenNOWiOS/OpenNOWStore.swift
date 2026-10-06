@@ -562,6 +562,9 @@ struct ActiveSession: Identifiable, Codable, Equatable {
     /// we performed"; those sessions keep the old behaviour of trusting the setting.
     var touchProvisioned: Bool? = nil
     var nativeRtspsEndpoints: [String]? = nil
+    /// A queued allocation was adopted before RESUME could submit this device's settings.
+    /// Retain this across polls/restores until a native resume PUT has succeeded.
+    var nativeResumePending: Bool? = nil
 }
 
 struct RemoteSessionCandidate: Identifiable, Codable, Equatable {
@@ -4955,6 +4958,7 @@ private actor GFNAPIClient {
         active.sessionControlBaseUrl = SessionControlRouting.baseURL(
             host: claimedControl?["ip"] as? String, port: claimedControl?["port"] as? Int
         ) ?? refreshedControlBaseUrl ?? retainedControlBaseUrl
+        active.nativeResumePending = settings.experimentalNativeNVSTEnabled && preClaimStatus == 1
 
         try CloudMatchSessionResponse.validateAllocationState(active.status)
         for _ in 0..<45 {
@@ -7713,6 +7717,7 @@ final class OpenNOWStore: ObservableObject {
                     settings: launchSettings
                 )) ?? pending
                 started = mergeQueueSessionState(previous: pending, next: hydrated)
+                started.nativeResumePending = launchSettings.experimentalNativeNVSTEnabled
             } else {
                 if let staleLaunchCandidate {
                     do {
@@ -9290,12 +9295,25 @@ final class OpenNOWStore: ObservableObject {
                             break
                         }
                         let handoffSession = try await self.prepareSessionForStreamer(polled)
+                        try Task.checkCancellation()
+                        guard generation == self.authGeneration,
+                              self.activeSession?.id == handoffSession.id else { break }
+                        self.activeSession = handoffSession
+                        // RESUME can return to setup, or be deferred while the old seat is
+                        // initializing. The pre-claim ready snapshot cannot authorize RTSP.
+                        guard self.isReadyForStreamer(handoffSession),
+                              !self.currentStreamerSettings.experimentalNativeNVSTEnabled
+                                || NativeStreamSessionHandoff.canConnect(handoffSession) else {
+                            readyPollStreak = 0
+                            readySince = nil
+                            self.recordDebugEvent("queue", "Waiting after resume status=\(handoffSession.status) pending=\(handoffSession.nativeResumePending == true)")
+                            self.syncTrackedSessionSurface()
+                            try await Task.sleep(for: .seconds(2))
+                            continue
+                        }
                         self.logger.notice(
                             "Session ready for streamer handoff id=\(handoffSession.id, privacy: .public) status=\(handoffSession.status) readyStreak=\(readyPollStreak) readyHoldSeconds=\(Int(readyHoldElapsed)). Presenting iOS streamer."
                         )
-                        if self.activeSession?.id == handoffSession.id {
-                            self.activeSession = handoffSession
-                        }
                         self.setStreamSession(handoffSession, reason: "sessionPollTask.handoffReady")
                         self.recordDebugEvent("stream", "Session ready for streamer handoff status=\(handoffSession.status)")
                         loggedReadyForStreamer = true
@@ -9518,7 +9536,8 @@ final class OpenNOWStore: ObservableObject {
             activeStreamSettings = requestedSettings
             lastError = nil
             sessionError = nil
-            if isReadyForStreamer(claimed) {
+            if isReadyForStreamer(claimed),
+               !requestedSettings.experimentalNativeNVSTEnabled || NativeStreamSessionHandoff.canConnect(claimed) {
                 showStreamLoading = false
                 queueOverlayVisible = false
                 setStreamSession(claimed, reason: "reopenStreamer.claimed")

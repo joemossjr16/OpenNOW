@@ -13,12 +13,18 @@ final class NativeStreamSessionHandoff {
         if restoredAllocationID == allocationID { restoredAllocationID = nil }
     }
 
+    static func canConnect(_ allocation: ActiveSession) -> Bool {
+        CloudMatchSessionState(rawValue: allocation.status)?.isReady == true
+            && allocation.nativeResumePending != true
+    }
+
     func prepare(
         _ allocation: ActiveSession,
         usesNativeNVST: Bool,
         claim: (ActiveSession) async throws -> ActiveSession
     ) async throws -> ActiveSession {
-        guard usesNativeNVST, restoredAllocationID == allocation.id,
+        guard usesNativeNVST,
+              restoredAllocationID == allocation.id || allocation.nativeResumePending == true,
               allocation.status == 2 || allocation.status == 3 else { return allocation }
         return try await reconnect(allocation, refresh: { $0 }, claim: claim)
     }
@@ -46,7 +52,7 @@ final class NativeStreamSessionHandoff {
             ])
         }
         try CloudMatchSessionResponse.validateAllocationState(claimed.status)
-        didClaim(allocationID: claimed.id)
+        if claimed.nativeResumePending != true { didClaim(allocationID: claimed.id) }
         return claimed
     }
 }

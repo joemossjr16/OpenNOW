@@ -1735,6 +1735,84 @@ final class OpenNOWiOSParityTests: XCTestCase {
     }
 
     @MainActor
+    func testQueuedNativeResumeSurvivesReadyPollAndSnapshotBeforeSubmittingNewDeviceSettings() async throws {
+        let handoff = NativeStreamSessionHandoff()
+        var allocation = queueFixture()
+        allocation.nativeResumePending = true
+        allocation.nativeRtspsEndpoints = ["rtsps://old.example:322"]
+        allocation.negotiatedStreamProfile = NegotiatedStreamProfile(resolution: "1280x720", fps: 120)
+        handoff.didClaim(allocationID: allocation.id)
+        var claims = 0
+        let claim: (ActiveSession) async throws -> ActiveSession = { saved in
+            claims += 1
+            var resumed = saved
+            resumed.nativeResumePending = false
+            resumed.nativeRtspsEndpoints = ["rtsps://new.example:322"]
+            resumed.negotiatedStreamProfile = NegotiatedStreamProfile(resolution: "1600x1200", fps: 120)
+            return resumed
+        }
+        _ = try await handoff.prepare(allocation, usesNativeNVST: true, claim: claim)
+        XCTAssertEqual(claims, 0, "An initializing seat must finish setup before RESUME")
+        allocation.status = 2
+        allocation = try JSONDecoder().decode(ActiveSession.self, from: JSONEncoder().encode(allocation))
+        XCTAssertFalse(NativeStreamSessionHandoff.canConnect(allocation), "Ready endpoints alone must not bypass a deferred RESUME")
+        let resumed = try await handoff.prepare(allocation, usesNativeNVST: true, claim: claim)
+        XCTAssertEqual(claims, 1)
+        XCTAssertEqual(resumed.negotiatedStreamProfile?.resolution, "1600x1200")
+        XCTAssertEqual(resumed.nativeRtspsEndpoints, ["rtsps://new.example:322"])
+        XCTAssertTrue(NativeStreamSessionHandoff.canConnect(resumed))
+        _ = try await handoff.prepare(resumed, usesNativeNVST: true, claim: claim)
+        XCTAssertEqual(claims, 1)
+    }
+
+    @MainActor
+    func testNativeResumeDeferredAgainRemainsPendingUntilSuccessfulClaim() async throws {
+        let handoff = NativeStreamSessionHandoff()
+        var allocation = queueFixture(); allocation.status = 2
+        handoff.restore(allocationID: allocation.id)
+        var claims = 0
+        var deferred = try await handoff.prepare(allocation, usesNativeNVST: true) { saved in
+            claims += 1
+            var queued = saved
+            queued.status = 1
+            queued.nativeResumePending = true
+            return queued
+        }
+        XCTAssertFalse(NativeStreamSessionHandoff.canConnect(deferred))
+        deferred.status = 3
+        let resumed = try await handoff.prepare(deferred, usesNativeNVST: true) { saved in
+            claims += 1
+            var ready = saved; ready.nativeResumePending = false; return ready
+        }
+        XCTAssertEqual(claims, 2)
+        XCTAssertTrue(NativeStreamSessionHandoff.canConnect(resumed))
+    }
+
+    @MainActor
+    func testAcceptedNativeResumeWaitsForReadyWithoutRepeatingPut() async throws {
+        let handoff = NativeStreamSessionHandoff()
+        var allocation = queueFixture(); allocation.status = 2
+        handoff.restore(allocationID: allocation.id)
+        var claims = 0
+        var resuming = try await handoff.prepare(allocation, usesNativeNVST: true) { saved in
+            claims += 1
+            var pending = saved; pending.status = 6; pending.nativeResumePending = false
+            return pending
+        }
+        XCTAssertFalse(NativeStreamSessionHandoff.canConnect(resuming), "Pre-claim readiness must not permit connecting during RESUMING")
+        resuming.status = 2
+        XCTAssertTrue(NativeStreamSessionHandoff.canConnect(resuming))
+        _ = try await handoff.prepare(resuming, usesNativeNVST: true) { saved in
+            claims += 1; return saved
+        }
+        XCTAssertEqual(claims, 1)
+        var legacy = queueFixture(); legacy.status = 2
+        legacy = try JSONDecoder().decode(ActiveSession.self, from: JSONEncoder().encode(legacy))
+        XCTAssertNil(legacy.nativeResumePending)
+        XCTAssertTrue(NativeStreamSessionHandoff.canConnect(legacy))
+    }
+
+    @MainActor
     func testFailedRestoredNativeClaimRemainsPendingForRetry() async throws {
         let handoff = NativeStreamSessionHandoff()
         var old = queueFixture(); old.status = 2
