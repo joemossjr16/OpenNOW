@@ -4841,6 +4841,29 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertNil(SessionControlRouting.readyDetailsBase(for: session))
     }
 
+    func testReadyAllocationHydratesNumericRigHostnamesRatherThanReusingZoneDetails() {
+        var session = queueFixture()
+        session.sessionControlBaseUrl = "https://np-dal-06.cloudmatchbeta.nvidiagrid.net"
+        for host in ["66-22-149-37.cloudmatchbeta.nvidiagrid.net", "66-22-149-37.cloudmatch.nvidiagrid.net"] {
+            XCTAssertFalse(SessionControlRouting.isZoneHostname(host))
+            session.serverIp = host
+            session.status = 1
+            XCTAssertNil(SessionControlRouting.readyDetailsBase(for: session))
+            for status in [2, 3] {
+                session.status = status
+                XCTAssertEqual(SessionControlRouting.readyDetailsBase(for: session), "https://\(host)")
+                XCTAssertEqual(SessionControlRouting.pollBase(for: session), session.sessionControlBaseUrl)
+            }
+        }
+        for host in ["prod.cloudmatchbeta.nvidiagrid.net", "np-dal-06.cloudmatchbeta.nvidiagrid.net",
+                     "999-22-149-37.cloudmatchbeta.nvidiagrid.net"] {
+            XCTAssertTrue(SessionControlRouting.isZoneHostname(host))
+            session.serverIp = host
+            XCTAssertNil(SessionControlRouting.readyDetailsBase(for: session))
+        }
+        XCTAssertFalse(SessionControlRouting.isZoneHostname("np-dal-06.cloudmatchbeta.nvidiagrid.net.attacker.test"))
+    }
+
     func testNextInQueueAndMissingSetupMetadataDoNotStartSetupTimeout() {
         var session = queueFixture()
         XCTAssertTrue(QueueSessionPhase.isQueued(session))

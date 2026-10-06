@@ -2569,6 +2569,24 @@ private func validEndpointHost(_ host: String?) -> String? {
 
 /// CloudMatch's control address is a queue endpoint, never a media/signaling address.
 enum SessionControlRouting {
+    static func isZoneHostname(_ value: String) -> Bool {
+        guard let host = normalizedEndpointHost(from: value)?.lowercased() else { return false }
+        for domain in ["cloudmatchbeta.nvidiagrid.net", "cloudmatch.nvidiagrid.net"] {
+            if host == domain { return true }
+            guard host.hasSuffix(".\(domain)") else { continue }
+            // Assigned rigs also use this domain, with their IPv4 address encoded in the
+            // first label. They own ready-session connection details; zone servers do not.
+            let label = host.dropLast(domain.count + 1)
+            let octets = label.split(separator: "-", omittingEmptySubsequences: false)
+            let isRig = octets.count == 4 && octets.allSatisfy { octet in
+                !octet.isEmpty && octet.allSatisfy { $0 >= "0" && $0 <= "9" }
+                    && Int(octet).map { (0...255).contains($0) } == true
+            }
+            return !isRig
+        }
+        return false
+    }
+
     static func baseURL(host rawHost: String?, port: Int?) -> String? {
         guard port == nil || port == 443 else { return nil }
         var host = rawHost?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
@@ -2583,8 +2601,7 @@ enum SessionControlRouting {
               let launchHost = URL(string: session.streamingBaseUrl)?.host,
               launchHost.hasSuffix(".cloudmatchbeta.nvidiagrid.net") || launchHost.hasSuffix(".cloudmatch.nvidiagrid.net"),
               let server = normalizedEndpointHost(from: session.serverIp),
-              !server.contains("cloudmatchbeta.nvidiagrid.net"),
-              !server.contains("cloudmatch.nvidiagrid.net"),
+              !isZoneHostname(server),
               let url = URL(string: "https://\(server)"), url.host != nil else { return nil }
         return url.absoluteString
     }
@@ -3341,7 +3358,7 @@ private actor GFNAPIClient {
               let host = url.host else {
             return false
         }
-        return isZoneHostname(host)
+        return SessionControlRouting.isZoneHostname(host)
     }
 
     private func proxiedSession(settings: AppSettings?) -> URLSession {
@@ -4771,7 +4788,7 @@ private actor GFNAPIClient {
             vpcId: vpcId
         )
 
-        if Self.isZoneHostname(effectiveServerIp) {
+        if SessionControlRouting.isZoneHostname(effectiveServerIp) {
             do {
                 let preflightURL = URL(string: "https://\(effectiveServerIp)/v2/session/\(candidate.id)")!
                 let (prefetchData, prefetchResponse) = try await request(
@@ -4925,11 +4942,6 @@ private actor GFNAPIClient {
             return host
         }
         return "\(vpcId.lowercased()).cloudmatchbeta.nvidiagrid.net"
-    }
-
-    private static func isZoneHostname(_ value: String) -> Bool {
-        let normalized = value.lowercased()
-        return normalized.contains("cloudmatchbeta.nvidiagrid.net") || normalized.contains("cloudmatch.nvidiagrid.net")
     }
 
     private static func extractZoneId(from streamingBaseUrl: String, fallback: String) -> String {
