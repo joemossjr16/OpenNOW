@@ -1200,12 +1200,12 @@ private struct NativeStreamStatsPill: View {
                     detailedPanel
                 }
             }
-            if let rates = snapshot.presentationRates {
+            if metrics.displayedFPS, let rates = snapshot.presentationRates {
                 Text(rates.label).font(.caption2.monospacedDigit()).foregroundStyle(.white)
                     .padding(.horizontal, 10).padding(.vertical, 4)
                     .background(.black.opacity(0.50), in: Capsule())
             }
-            if !snapshot.effects.isEmpty {
+            if metrics.renderer, !snapshot.effects.isEmpty {
                 Text(snapshot.effects).font(.caption2.monospacedDigit()).foregroundStyle(.white)
                     .padding(.horizontal, 10).padding(.vertical, 4)
                     .background(.black.opacity(0.50), in: Capsule())
@@ -1379,7 +1379,7 @@ private struct NativeStreamStatsPill: View {
                 detailed: server
             ))
         }
-        if let gpu = snapshot.gpuLabel, !gpu.isEmpty {
+        if metrics.gpu, let gpu = snapshot.gpuLabel, !gpu.isEmpty {
             items.append(Readout(id: "gpu", label: "GPU", compact: gpu, detailed: gpu))
         }
         if metrics.connection {
@@ -1908,6 +1908,7 @@ private struct NativeStreamControlsPanel: View {
 
             NativeStreamPanelSection(title: "Connection metrics") {
                 metricToggle("Frame rate", \.fps)
+                metricToggle("Displayed FPS", \.displayedFPS)
                 metricToggle("Ping", \.ping)
                 metricToggle("Decode", \.latency)
                 metricToggle("Bitrate", \.bitrate)
@@ -1915,6 +1916,8 @@ private struct NativeStreamControlsPanel: View {
             }
 
             NativeStreamPanelSection(title: "Session metrics") {
+                metricToggle("Renderer status", \.renderer)
+                metricToggle("GPU", \.gpu)
                 metricToggle("Resolution", \.resolution)
                 metricToggle("Codec", \.codec)
                 metricToggle("Server", \.location)

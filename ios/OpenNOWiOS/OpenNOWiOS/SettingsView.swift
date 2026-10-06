@@ -1905,6 +1905,7 @@ private struct StatsMetricsPicker: View {
         Form {
             Section("Connection") {
                 metricToggle("Frame Rate", \.fps)
+                metricToggle("Displayed FPS", \.displayedFPS)
                 metricToggle("Ping", \.ping)
                 metricToggle("Latency", \.latency)
                 metricToggle("Bitrate", \.bitrate)
@@ -1913,6 +1914,8 @@ private struct StatsMetricsPicker: View {
 
             Section {
                 metricToggle("Resolution", \.resolution)
+                metricToggle("Renderer status", \.renderer)
+                metricToggle("GPU", \.gpu)
                 metricToggle("Codec", \.codec)
                 metricToggle("Server", \.location)
                 metricToggle("Battery", \.battery)

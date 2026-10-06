@@ -162,10 +162,13 @@ enum CatalogWallpaperPreset: String, Codable, CaseIterable, Identifiable {
 
 // MARK: - Stats HUD
 
-/// The ten metrics the in-stream HUD can show. Defaults match Android so a user moving between
+/// Optional metrics the in-stream HUD can show. Defaults match Android so a user moving between
 /// platforms sees the same four readouts.
 struct StreamStatsMetrics: Codable, Equatable {
     var fps: Bool = true
+    var displayedFPS: Bool = false
+    var renderer: Bool = false
+    var gpu: Bool = false
     var ping: Bool = true
     var bitrate: Bool = false
     var battery: Bool = true
@@ -178,7 +181,7 @@ struct StreamStatsMetrics: Codable, Equatable {
     var packetLoss: Bool = false
 
     var enabledCount: Int {
-        [fps, ping, bitrate, battery, sessionBattery, connection, resolution, codec, location, latency, packetLoss]
+        [fps, displayedFPS, renderer, gpu, ping, bitrate, battery, sessionBattery, connection, resolution, codec, location, latency, packetLoss]
             .filter { $0 }
             .count
     }
@@ -194,6 +197,9 @@ struct StreamStatsMetrics: Codable, Equatable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         fps = try c.decodeIfPresent(Bool.self, forKey: .fps) ?? true
+        displayedFPS = try c.decodeIfPresent(Bool.self, forKey: .displayedFPS) ?? false
+        renderer = try c.decodeIfPresent(Bool.self, forKey: .renderer) ?? false
+        gpu = try c.decodeIfPresent(Bool.self, forKey: .gpu) ?? false
         ping = try c.decodeIfPresent(Bool.self, forKey: .ping) ?? true
         bitrate = try c.decodeIfPresent(Bool.self, forKey: .bitrate) ?? false
         battery = try c.decodeIfPresent(Bool.self, forKey: .battery) ?? true

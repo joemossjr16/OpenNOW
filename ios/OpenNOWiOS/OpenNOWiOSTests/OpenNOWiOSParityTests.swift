@@ -3229,6 +3229,32 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(try JSONDecoder().decode(StreamStatsMetrics.self, from: JSONEncoder().encode(metrics)), metrics)
     }
 
+    func testOlderSingleMetricHUDSettingsDoNotEnableRenderingReadouts() throws {
+        let saved = Data(#"{"fps":true,"ping":false,"battery":false,"connection":false}"#.utf8)
+        let metrics = try JSONDecoder().decode(StreamStatsMetrics.self, from: saved)
+        XCTAssertTrue(metrics.fps)
+        XCTAssertFalse(metrics.displayedFPS)
+        XCTAssertFalse(metrics.renderer)
+        XCTAssertFalse(metrics.gpu)
+        XCTAssertEqual(metrics.enabledCount, 1)
+    }
+
+    func testRenderingHUDMetricsPersistAsIndependentSelections() throws {
+        let selections: [WritableKeyPath<StreamStatsMetrics, Bool>] = [\.displayedFPS, \.renderer, \.gpu]
+        for selected in selections {
+            var metrics = StreamStatsMetrics()
+            metrics.fps = false
+            metrics.ping = false
+            metrics.battery = false
+            metrics.connection = false
+            metrics[keyPath: selected] = true
+            XCTAssertTrue(metrics.isMinimallyPopulated)
+            XCTAssertEqual(metrics.enabledCount, 1)
+            let restored = try JSONDecoder().decode(StreamStatsMetrics.self, from: JSONEncoder().encode(metrics))
+            XCTAssertEqual(restored, metrics)
+        }
+    }
+
     func testMobileGameSprintActivatesOnlyAtTheMarkedMovementRim() {
         XCTAssertTrue(TouchpadStickMath.shouldSprint(dx: 0, dy: -60, travel: 60))
         XCTAssertFalse(TouchpadStickMath.shouldSprint(dx: 60, dy: 0, travel: 60))
