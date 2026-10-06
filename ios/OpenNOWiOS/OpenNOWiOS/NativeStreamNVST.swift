@@ -43,6 +43,7 @@ actor NativeStreamNVST: NativeStreamNVSTTransport {
     private let allocation: ActiveSession
     private let settings: AppSettings
     private let profile: StreamVideoProfile
+    private let videoTrace: NativeStreamVideoTrace
     private let codec: NativeStreamVideoCodec
     private let displayFPS: Int
     private let onFrame: @Sendable (RTCVideoFrame) -> Void
@@ -90,6 +91,7 @@ actor NativeStreamNVST: NativeStreamNVSTTransport {
          onFailure: @escaping @Sendable (String) -> Void,
          onHaptics: @escaping @Sendable ([NvstHapticEvent]) -> Void) {
         self.allocation = allocation; self.settings = settings; self.profile = profile
+        videoTrace = NativeStreamVideoTrace(profile: profile)
         self.codec = codec; self.displayFPS = displayFPS
         self.onFrame = onFrame; self.onSample = onSample; self.onFailure = onFailure; self.onHaptics = onHaptics
     }
@@ -111,7 +113,8 @@ actor NativeStreamNVST: NativeStreamNVSTTransport {
             disablesOwdCongestionControl: false, vsyncMode: .adaptive,
             announceOverrides: [("x-nv-vqos[0].dfc.enable", "0")])
         do {
-            let negotiated = try await NvstRtspNegotiator(reserver: reserver).negotiate(input,
+            let trace = videoTrace
+            let negotiated = try await NvstRtspNegotiator(reserver: reserver, logger: { trace.record($0) }).negotiate(input,
                 onVideoReady: { [weak self] handoff in
                     guard let self else { throw CancellationError() }
                     try await self.startVideo(handoff)
@@ -121,6 +124,7 @@ actor NativeStreamNVST: NativeStreamNVSTTransport {
                 throw CancellationError()
             }
             rtsp = negotiated
+            videoTrace.finishNegotiation(succeeded: true)
             if let preparationError { throw preparationError }
             lastProgressAt = Date()
             sampling = Task { [weak self] in
@@ -130,6 +134,7 @@ actor NativeStreamNVST: NativeStreamNVSTTransport {
                 }
             }
         } catch {
+            videoTrace.finishNegotiation(succeeded: false)
             await close()
             throw error
         }
@@ -362,6 +367,7 @@ actor NativeStreamNVST: NativeStreamNVSTTransport {
 
     private func sample() async {
         guard !stopped, let receiver, let decoder, let pipeline else { return }
+        videoTrace.recordDecodedResolution(decoder.decodedResolution)
         let stats = receiver.stats
         if let ssrc = stats.boundSSRC { feedback.updateMediaSSRC(ssrc) }
         let decoded = decoder.decodedFrameCount

@@ -436,6 +436,39 @@ import Testing
         #expect(!body.contains("a=x-nv-ri.protocol:"))
     }
 
+    @Test func selectedResolutionOverridesOfferedDownscaleControllersWhileKeepingBandwidthFeedback() {
+        let offer: [(String, String)] = [
+            ("x-nv-video[0].clientViewportWd", "1280"),
+            ("x-nv-video[0].clientViewportHt", "720"),
+            ("x-nv-vqos[0].dynamicStreamingMode", "1"),
+            ("x-nv-vqos[0].grc.enable", "7"),
+            ("x-nv-vqos[0].resControl.enable", "1"),
+            ("x-nv-vqos[0].resControl.dfc.adjustResAndFps", "1"),
+            ("x-nv-vqos[0].resControl.dfc.maxResLevels", "5")]
+        for (width, height) in [(1600, 1200), (2560, 1080), (5120, 2160)] {
+            for echo in [false, true] {
+                let sdp = NvstRtspSdp.buildAnnounceSdp(.init(resolution: "\(width)x\(height)",
+                    fps: 120, bitDepth: 10, hdrEnabled: true, offeredAttributes: offer,
+                    codec: .hevc, bitrateKbps: 100_000, maximumBitrateKbps: 100_000,
+                    disablesOwdCongestionControl: false, echoesOfferedAttributes: echo))
+                let lines = sdp.components(separatedBy: "\r\n")
+                #expect(lines.contains("a=x-nv-video[0].clientViewportWd:\(width)"))
+                #expect(lines.contains("a=x-nv-video[0].clientViewportHt:\(height)"))
+                #expect(lines.contains("a=x-nv-video[0].maxFPS:120"))
+                #expect(lines.contains("a=x-nv-video[0].dynamicRangeMode:1"))
+                for flag in ["dynamicStreamingMode", "drc.enable", "dfc.adjustResAndFps", "grc.enable",
+                             "resControl.enable", "resControl.dfc.adjustResAndFps", "resControl.dfc.maxResLevels",
+                             "resControl.cpmRtc.featureMask"] {
+                    #expect(lines.filter { $0.hasPrefix("a=x-nv-vqos[0].\(flag):") } == ["a=x-nv-vqos[0].\(flag):0"])
+                }
+                #expect(lines.contains("a=x-nv-bwe.useOwdCongestionControl:1"))
+                #expect(lines.contains("a=x-nv-vqos[0].bw.minimumBitrateKbps:1000"))
+                #expect(lines.contains("a=x-nv-vqos[0].resControl.bitrateIirFilterFactor:128"))
+                #expect(lines.contains("a=x-nv-vqos[0].bw.maximumBitrateKbps:100000"))
+            }
+        }
+    }
+
     @Test func theAnnounceCarriesTheEncoderProfileAndBitrate() {
         let body = NvstRtspSdp.buildAnnounceSdp(.init(resolution: "5120x2160",
                                                      fps: 120,

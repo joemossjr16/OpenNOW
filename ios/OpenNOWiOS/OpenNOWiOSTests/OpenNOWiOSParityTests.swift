@@ -2461,6 +2461,61 @@ final class OpenNOWiOSParityTests: XCTestCase {
         }
     }
 
+    func testReadyResumeTraceKeepsOnlyMatchingReadyAllocation() async throws {
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".txt")
+        let ready = destination.deletingPathExtension().appendingPathExtension("ready.txt")
+        defer {
+            try? FileManager.default.removeItem(at: destination)
+            try? FileManager.default.removeItem(at: ready)
+        }
+        let store = DiagnosticsHTTPTraceStore(resumeTraceURL: destination)
+        var request = URLRequest(url: URL(string: "https://resume.example/v2/session/selected-seat")!)
+        request.httpMethod = "PUT"
+        request.httpBody = Data(#"{"action":2,"data":"RESUME"}"#.utf8)
+        await store.record(source: "test", request: request, response: nil, responseData: nil,
+            duration: 0, error: nil)
+        request.httpMethod = "GET"
+        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)
+        await store.record(source: "test", request: request, response: response,
+            responseData: Data(#"{"session":{"status":6}}"#.utf8), duration: 0, error: nil)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: ready.path))
+        await store.record(source: "test", request: request, response: response,
+            responseData: Data(#"{"session":{"status":2,"monitorSettings":[{"widthInPixels":1600,"heightInPixels":1200}]}}"#.utf8),
+            duration: 0, error: nil)
+        let saved = try String(contentsOf: ready, encoding: .utf8)
+        XCTAssertTrue(saved.contains("1600"))
+        request.url = URL(string: "https://resume.example/v2/session/other-seat")!
+        await store.record(source: "test", request: request, response: response,
+            responseData: Data(#"{"session":{"status":2,"monitorSettings":[]}}"#.utf8), duration: 0, error: nil)
+        XCTAssertEqual(try String(contentsOf: ready, encoding: .utf8), saved)
+    }
+
+    func testNativeVideoTraceRetainsOnlyNumericVideoAttributesAndDecodedSizeChanges() throws {
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: destination) }
+        let trace = NativeStreamVideoTrace(profile: .init(width: 1600, height: 1200, fps: 120,
+            maxBitrateKbps: 100_000), destination: destination)
+        trace.record("NVST DESCRIBE sdp a=x-nv-video[0].clientViewportWd:1280")
+        trace.record("NVST ANNOUNCE sdp a=x-nv-video[0].clientViewportWd:1600")
+        trace.record("NVST ANNOUNCE sdp a=x-nv-vqos[0].resControl.enable:0")
+        trace.record("NVST ANNOUNCE sdp a=x-nv-video[0].clientViewportHt:secret")
+        trace.record("NVST ANNOUNCE sdp a=x-nv-runtime.encryptionKey:secret-key")
+        trace.finishNegotiation(succeeded: true)
+        trace.recordDecodedResolution("1280x720")
+        trace.recordDecodedResolution("1280x720")
+        trace.recordDecodedResolution("1600x1200")
+        let saved = try String(contentsOf: destination, encoding: .utf8)
+        XCTAssertTrue(saved.contains("requested=1600x1200 fps=120"))
+        XCTAssertTrue(saved.contains("clientViewportWd:1280"))
+        XCTAssertTrue(saved.contains("clientViewportWd:1600"))
+        XCTAssertTrue(saved.contains("resControl.enable:0"))
+        XCTAssertTrue(saved.contains("negotiation=accepted"))
+        XCTAssertEqual(saved.components(separatedBy: "decoded=1280x720").count, 2)
+        XCTAssertTrue(saved.contains("decoded=1600x1200"))
+        XCTAssertFalse(saved.contains("secret"))
+        XCTAssertFalse(saved.contains("encryptionKey"))
+    }
+
     func testAccountSnapshotRoundTripsSubscriptionStorageAndConnections() throws {
         let storage = StorageAddon(
             type: "STORAGE",

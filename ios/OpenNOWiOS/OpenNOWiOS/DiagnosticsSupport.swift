@@ -285,6 +285,11 @@ actor DiagnosticsHTTPTraceStore {
     static let shared = DiagnosticsHTTPTraceStore()
 
     private let resumeTraceURL: URL
+    private var resumedSessionPath: String?
+
+    private var readyTraceURL: URL {
+        resumeTraceURL.deletingPathExtension().appendingPathExtension("ready.txt")
+    }
     private var traceEntries: [DiagnosticsTraceEntry] = []
     private var entries: [String] = []
     private var storedBytes = 0
@@ -351,7 +356,16 @@ actor DiagnosticsHTTPTraceStore {
         // Keep one bounded, already-redacted handover request available after
         // app closure, when the in-memory API list is otherwise lost.
         if Self.isSessionResume(request) {
+            resumedSessionPath = request.url?.path
+            try? FileManager.default.removeItem(at: readyTraceURL)
             try? Data(rendered.utf8).write(to: resumeTraceURL, options: .atomic)
+        } else if let resumedSessionPath, request.url?.path == resumedSessionPath,
+                  request.httpMethod == "GET", response?.statusCode == 200,
+                  let responseData,
+                  let json = (try? JSONSerialization.jsonObject(with: responseData)) as? [String: Any],
+                  let session = json["session"] as? [String: Any],
+                  let status = session["status"] as? Int, status == 2 || status == 3 {
+            try? Data(rendered.utf8).write(to: readyTraceURL, options: .atomic)
         }
     }
 
@@ -379,6 +393,63 @@ actor DiagnosticsHTTPTraceStore {
     private func bounded(_ value: String) -> String {
         guard value.count > maximumBodyCharacters else { return value }
         return String(value.prefix(maximumBodyCharacters)) + "\n[TRUNCATED bodyChars=\(value.count)]"
+    }
+}
+
+/// Small numeric-only journal of native video negotiation and decoded size changes.
+/// Credentials, endpoints and arbitrary SDP attributes are never retained.
+final class NativeStreamVideoTrace: @unchecked Sendable {
+    private let lock = NSLock()
+    private let destination: URL
+    private var lines: [String]
+    private var decodedResolution: String?
+    private var negotiationFinished = false
+
+    init(profile: StreamVideoProfile, destination: URL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("opennow-last-native-video.txt")) {
+        self.destination = destination
+        lines = ["time=\(ISO8601DateFormatter().string(from: Date()))",
+                 "requested=\(profile.resolutionString) fps=\(profile.fps) bitrateKbps=\(profile.maxBitrateKbps)"]
+    }
+
+    func record(_ message: String) {
+        let attributes = ["video[0].clientViewportWd", "video[0].clientViewportHt", "video[0].maxFPS",
+            "vqos[0].dynamicStreamingMode", "vqos[0].drc.enable", "vqos[0].dfc.adjustResAndFps",
+            "vqos[0].grc.enable", "vqos[0].resControl.enable", "vqos[0].resControl.dfc.adjustResAndFps",
+            "vqos[0].resControl.dfc.maxResLevels", "vqos[0].resControl.cpmRtc.featureMask"]
+        guard let prefix = ["NVST DESCRIBE sdp a=x-nv-", "NVST ANNOUNCE sdp a=x-nv-"]
+            .first(where: { message.hasPrefix($0) }) else { return }
+        let attribute = String(message.dropFirst(prefix.count))
+        guard let separator = attribute.firstIndex(of: ":"),
+              attributes.contains(String(attribute[..<separator])) else { return }
+        let value = attribute[attribute.index(after: separator)...].trimmingCharacters(in: .whitespaces)
+        guard !value.isEmpty, value.allSatisfy({ $0.isASCII && $0.isNumber }) else { return }
+        lock.lock(); defer { lock.unlock() }
+        guard lines.count < 128 else { return }
+        lines.append(message)
+    }
+
+    func finishNegotiation(succeeded: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        negotiationFinished = true
+        lines.append("negotiation=\(succeeded ? "accepted" : "failed")")
+        persist()
+    }
+
+    func recordDecodedResolution(_ resolution: String?) {
+        guard let resolution else { return }
+        let dimensions = resolution.split(separator: "x", omittingEmptySubsequences: false)
+        guard dimensions.count == 2,
+              dimensions.allSatisfy({ Int($0).map { $0 > 0 } == true }) else { return }
+        lock.lock(); defer { lock.unlock() }
+        guard resolution != decodedResolution, lines.count < 128 else { return }
+        decodedResolution = resolution
+        lines.append("decoded=\(resolution)")
+        if negotiationFinished { persist() }
+    }
+
+    private func persist() {
+        try? Data(lines.joined(separator: "\n").utf8).write(to: destination, options: .atomic)
     }
 }
 

@@ -131,6 +131,7 @@ extension NvstRtspSdp {
         applyOfferedAttributes(&attributes, options: options)
         applyVideoAttributes(&attributes, options: options)
         applyBitrateAttributes(&attributes, options: options)
+        applyResolutionAttributes(&attributes, options: options)
         applyAudioAttributes(&attributes, options: options)
         applyMicrophoneAttributes(&attributes, options: options)
         // The A/B harness: whatever the run under test asks for wins over every layer above,
@@ -328,7 +329,20 @@ extension NvstRtspSdp {
         }
     }
 
-    /// Layer three, part two: congestion control and the bitrate envelope.
+    /// The receiving device's selected resolution takes precedence over adaptive downscaling.
+    static func applyResolutionAttributes(_ attributes: inout AnnounceAttributes, options: AnnounceOptions) {
+        guard options.resolution != nil else { return }
+        // The selected viewport must remain the encoder target after handover.
+        // Disabling legacy DRC alone leaves the newer resControl controllers and
+        // GRC free to reduce resolution. Keep bandwidth estimation independent.
+        for name in ["dynamicStreamingMode", "drc.enable", "dfc.adjustResAndFps", "grc.enable",
+                     "resControl.enable", "resControl.dfc.adjustResAndFps", "resControl.dfc.maxResLevels",
+                     "resControl.cpmRtc.featureMask"] {
+            attributes.set("x-nv-vqos[0].\(name)", "0")
+        }
+    }
+
+    /// Congestion control and the bitrate envelope remain active at the selected resolution.
     static func applyBitrateAttributes(_ attributes: inout AnnounceAttributes, options: AnnounceOptions) {
         // The seat's rate control is one-way-delay based (the vendor default). Its OWD samples ride
         // in the client's `0x0207` QoS reports (the rtpTimestamp at +36), which we now send at
@@ -353,15 +367,6 @@ extension NvstRtspSdp {
             attributes.set("x-nv-vqos[0].bw.minimumBitrateKbps", "1000")
             attributes.set("x-nv-vqos[0].drc.bitrateIirFilterFactor", "128")
             attributes.set("x-nv-vqos[0].resControl.bitrateIirFilterFactor", "128")
-            // Gradual Rate Control: the mechanism that lets the seat come DOWN from the announced
-            // ceiling when our receiver reports loss. Without it the encoder holds the opening bid
-            // regardless of feedback, which is what a 5K120 session at a 100 Mbps ceiling looks
-            // like from here — measured 1% wire loss, 265 reference recoveries and 655 bad-data
-            // frames in 65 s, with the seat re-sending keyframes into the same congestion.
-            // `7` enables all H.264/H.265 modes, matching OpenNOW's native Linux client (which
-            // moved off `0` for exactly this reason) and the key exists verbatim in libBifrost2.
-            // DRC stays off, so resolution and frame rate remain predictable — only bitrate moves.
-            attributes.set("x-nv-vqos[0].grc.enable", "7")
         }
         // Corrected 2026-08-28: the claim that the vendor sends 16666/16684 here was based on an
         // earlier, incomplete capture. A full byte-exact capture of the real client's own ANNOUNCE
