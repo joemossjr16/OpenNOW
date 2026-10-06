@@ -338,6 +338,7 @@ struct MainTabView: View {
         case home
         case browse
         case library
+        case sessions
         case settings
 
         var title: String {
@@ -345,6 +346,7 @@ struct MainTabView: View {
             case .home: return "Home"
             case .browse: return "Browse"
             case .library: return "Library"
+            case .sessions: return "Sessions"
             case .settings: return "Settings"
             }
         }
@@ -354,6 +356,7 @@ struct MainTabView: View {
             case .home: return "house.fill"
             case .browse: return "square.grid.2x2.fill"
             case .library: return "books.vertical.fill"
+            case .sessions: return "clock.arrow.circlepath"
             case .settings: return "slider.horizontal.3"
             }
         }
@@ -603,6 +606,7 @@ struct MainTabView: View {
         case .home: HomeView()
         case .browse: BrowseView()
         case .library: LibraryView()
+        case .sessions: StreamSessionsView(history: store.sessionHistory)
         case .settings: SettingsView()
         }
     }
@@ -612,6 +616,7 @@ struct MainTabView: View {
         StreamerView(
             session: session,
             settings: store.currentStreamerSettings,
+            sessionHistory: store.sessionHistory,
             membershipTier: store.subscription?.membershipTier ?? store.user?.membershipTier,
             onTouchLayoutChange: { profile, layout in
                 store.updateTouchControlLayout(layout, profile: profile)

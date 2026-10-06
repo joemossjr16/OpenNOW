@@ -110,9 +110,20 @@ enum TouchControlMode: String, Codable, CaseIterable, Identifiable {
 enum TouchControllerPreset: String, Codable, CaseIterable, Identifiable {
     case standard
     case mobileGame
+    case geForceNOW
 
     var id: String { rawValue }
-    var label: String { self == .standard ? "Standard" : "Mobile Game" }
+    var label: String {
+        switch self {
+        case .standard: return "Standard"
+        case .mobileGame: return "Mobile Game"
+        case .geForceNOW: return "GeForce NOW"
+        }
+    }
+    var next: Self { Self.allCases[(Self.allCases.firstIndex(of: self)! + 1) % Self.allCases.count] }
+    var usesIndependentControls: Bool { self != .standard }
+    var usesSplitTouchpad: Bool { self == .mobileGame }
+    var supportsControlModeSelection: Bool { self == .standard }
 }
 
 enum TouchAimMode: String, Codable, CaseIterable, Identifiable {
@@ -158,6 +169,7 @@ struct StreamStatsMetrics: Codable, Equatable {
     var ping: Bool = true
     var bitrate: Bool = false
     var battery: Bool = true
+    var sessionBattery: Bool = false
     var connection: Bool = true
     var resolution: Bool = false
     var codec: Bool = false
@@ -166,7 +178,7 @@ struct StreamStatsMetrics: Codable, Equatable {
     var packetLoss: Bool = false
 
     var enabledCount: Int {
-        [fps, ping, bitrate, battery, connection, resolution, codec, location, latency, packetLoss]
+        [fps, ping, bitrate, battery, sessionBattery, connection, resolution, codec, location, latency, packetLoss]
             .filter { $0 }
             .count
     }
@@ -185,6 +197,7 @@ struct StreamStatsMetrics: Codable, Equatable {
         ping = try c.decodeIfPresent(Bool.self, forKey: .ping) ?? true
         bitrate = try c.decodeIfPresent(Bool.self, forKey: .bitrate) ?? false
         battery = try c.decodeIfPresent(Bool.self, forKey: .battery) ?? true
+        sessionBattery = try c.decodeIfPresent(Bool.self, forKey: .sessionBattery) ?? false
         connection = try c.decodeIfPresent(Bool.self, forKey: .connection) ?? true
         resolution = try c.decodeIfPresent(Bool.self, forKey: .resolution) ?? false
         codec = try c.decodeIfPresent(Bool.self, forKey: .codec) ?? false
@@ -253,6 +266,14 @@ struct TouchSettings: Codable, Equatable {
     var leftOffsetY: Double = 0
     var rightOffsetX: Double = 0
     var rightOffsetY: Double = 0
+
+    func sideOffset(for point: TouchControlPoint) -> CGSize {
+        switch point.x {
+        case ..<0.4: return CGSize(width: leftOffsetX, height: leftOffsetY)
+        case 0.6...: return CGSize(width: rightOffsetX, height: rightOffsetY)
+        default: return .zero
+        }
+    }
 
     static let `default` = TouchSettings()
 

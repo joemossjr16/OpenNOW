@@ -1569,7 +1569,7 @@ struct TouchControlLayout: Codable, Equatable {
     var leftStick: TouchControlPoint
     var rightCluster: TouchControlPoint
     var bottomCenter: TouchControlPoint
-    /// Optional per-control positions used by the Mobile Game preset. Old group layouts omit
+    /// Optional per-control positions used by independent presets. Old group layouts omit
     /// these keys and continue using their existing grouped positions.
     var independentPositions: [String: TouchControlPoint]
 
@@ -6277,6 +6277,7 @@ private enum AuthKeychainStore {
 
 @MainActor
 final class OpenNOWStore: ObservableObject {
+    let sessionHistory = StreamSessionHistoryStore()
     @Published private(set) var user: UserProfile?
     @Published private(set) var providers: [LoginProvider] = []
     @Published private(set) var allGames: [CloudGame] = []

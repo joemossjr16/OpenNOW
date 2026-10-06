@@ -849,8 +849,8 @@ struct SettingsView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                if store.settings.touch.controllerPreset == .mobileGame {
-                    Text("Split touchpad")
+                if !store.settings.touch.controllerPreset.supportsControlModeSelection {
+                    Text(store.settings.touch.controllerPreset.usesSplitTouchpad ? "Split touchpad" : "Virtual sticks")
                         .foregroundStyle(.secondary)
                 } else {
                     Picker("Control layout", selection: $store.settings.touch.controlMode) {
@@ -859,7 +859,7 @@ struct SettingsView: View {
                         }
                     }
                 }
-                if store.settings.touch.controllerPreset == .mobileGame || store.settings.touch.controlMode == .splitTouchpad {
+                if store.settings.touch.controllerPreset.usesSplitTouchpad || (store.settings.touch.controllerPreset.supportsControlModeSelection && store.settings.touch.controlMode == .splitTouchpad) {
                     settingsSlider(
                         "Touchpad Sensitivity",
                         value: $store.settings.touch.touchpadSensitivity,
@@ -868,9 +868,15 @@ struct SettingsView: View {
                         format: { String(format: "%.0f%%", $0 * 100) }
                     )
                 }
-                Picker("Style", selection: $store.settings.touch.style) {
-                    ForEach(TouchControllerStyle.allCases) { style in
-                        Text(style.label).tag(style)
+                if store.settings.touch.controllerPreset == .geForceNOW {
+                    Text("Outlined controls with separate sticks and stick-click buttons. The center gamepad opens stream controls. Edit the layout to move each control.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                if store.settings.touch.controllerPreset != .geForceNOW {
+                    Picker("Style", selection: $store.settings.touch.style) {
+                        ForEach(TouchControllerStyle.allCases) { style in
+                            Text(style.label).tag(style)
+                        }
                     }
                 }
                 Picker("Joystick", selection: $store.settings.touch.joystickMode) {
@@ -1153,11 +1159,11 @@ struct SettingsView: View {
             }
 
             Toggle("Keep Session Awake", isOn: $store.settings.showAntiAfkIndicator)
-            Toggle("Hide Stream Buttons", isOn: $store.settings.hideStreamButtons)
+            Toggle("Immersive Mode", isOn: $store.settings.hideStreamButtons)
         } header: {
             Text("Stats HUD")
         } footer: {
-            Text("Double tap the top edge during a stream to restore hidden controls. Keeping the session awake nudges the cursor by a pixel after two idle minutes so GeForce NOW does not disconnect you mid-cutscene; a dot in the corner shows while it is doing that. The HUD sits over the game, so keep it to the numbers you actually watch.")
+            Text("Immersive mode hides stream controls, stats, and the system status bar. Double tap near the top to show or hide them. Keeping the session awake nudges the cursor by a pixel after two idle minutes so GeForce NOW does not disconnect you mid-cutscene; a dot in the corner shows while it is doing that. The HUD sits over the game, so keep it to the numbers you actually watch.")
         }
     }
 
@@ -1910,6 +1916,7 @@ private struct StatsMetricsPicker: View {
                 metricToggle("Codec", \.codec)
                 metricToggle("Server", \.location)
                 metricToggle("Battery", \.battery)
+                metricToggle("Session battery", \.sessionBattery)
                 metricToggle("Network Type", \.connection)
             } header: {
                 Text("Session")

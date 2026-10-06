@@ -305,7 +305,7 @@ final class OpenNOWiOSParityTests: XCTestCase {
             }
             let sidebar = try XCTUnwrap(descendants(host.view).compactMap { $0 as? UICollectionView }
                 .first {
-                    $0.numberOfSections > 0 && $0.numberOfItems(inSection: 0) == 4
+                    $0.numberOfSections > 0 && $0.numberOfItems(inSection: 0) == 5
                         && $0.convert($0.bounds, to: host.view).minX < host.view.bounds.width * 0.25
                         && $0.bounds.width < host.view.bounds.width * 0.5
                 })
@@ -319,9 +319,12 @@ final class OpenNOWiOSParityTests: XCTestCase {
         }
         try await settle()
         XCTAssertEqual(host.traitCollection.horizontalSizeClass, compact ? .compact : .regular)
+        try await selectSidebarRow(3)
+        XCTAssertTrue(titles().contains("Sessions"), "Sessions must open its actual history page: \(titles())")
+        try await selectSidebarRow(0)
         for route in [SettingsRouteTarget.general, .stream, .input, .interface, .account] {
             NSLog("[SettingsNavigationTest] opening settings for %@", String(describing: route))
-            try await selectSidebarRow(3)
+            try await selectSidebarRow(4)
             let settingsTitles = ["Settings", "General", "Stream", "Input", "Interface", "Account"]
             XCTAssertTrue(titles().contains(where: settingsTitles.contains),
                           "Selection must open the actual Settings view: \(titles())")
@@ -1055,20 +1058,49 @@ final class OpenNOWiOSParityTests: XCTestCase {
     }
 
     @MainActor
-    func testStreamPresentationOwnsPointerLockAndReleasesOnTeardown() async throws {
+    func testStreamPresentationOwnsPointerLockAndStatusBarAndReleasesOnTeardown() async throws {
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
-        let priorWindow = scene.windows.first(where: \.isKeyWindow)
-        let window = UIWindow(windowScene: scene)
+        // Check the scene's actual status bar, in the app's main window.
+        let window = try XCTUnwrap(scene.windows.first(where: \.isKeyWindow))
+        let priorController = window.rootViewController
+        func waitForStatusBar(hidden: Bool, file: StaticString = #filePath, line: UInt = #line) async throws {
+            // UIKit updates the scene asynchronously, including its visibility animation.
+            for _ in 0..<40 {
+                if scene.statusBarManager?.isStatusBarHidden == hidden { return }
+                try await Task.sleep(nanoseconds: 50_000_000)
+            }
+            XCTAssertEqual(scene.statusBarManager?.isStatusBarHidden, hidden, file: file, line: line)
+        }
         let presenter = NativeStreamPresentationController(content: AnyView(
-            Color.black.background(NativeStreamPointerLockPreference(requested: true))))
+            Color.black.background(NativeStreamPresentationPreferences(
+                pointerCaptureRequested: true, statusBarHidden: true))))
         window.rootViewController = presenter
         window.makeKeyAndVisible()
-        defer { presenter.tearDown(); window.isHidden = true; priorWindow?.makeKeyAndVisible() }
+        defer { presenter.tearDown(); window.rootViewController = priorController }
         try await Task.sleep(nanoseconds: 300_000_000)
         XCTAssertTrue(presenter.presentedViewController === presenter.host)
         XCTAssertTrue(presenter.host.prefersPointerLocked)
+        XCTAssertTrue(presenter.host.prefersStatusBarHidden)
+        try await waitForStatusBar(hidden: true)
+
+        // Revealing controls updates the existing presented host, without dismissal.
+        presenter.host.rootView = AnyView(Color.black.background(NativeStreamPresentationPreferences(
+            pointerCaptureRequested: false, statusBarHidden: false)))
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertTrue(presenter.presentedViewController === presenter.host)
+        XCTAssertFalse(presenter.host.prefersPointerLocked)
+        XCTAssertFalse(presenter.host.prefersStatusBarHidden)
+        try await waitForStatusBar(hidden: false)
+
+        presenter.host.rootView = AnyView(Color.black.background(NativeStreamPresentationPreferences(
+            pointerCaptureRequested: true, statusBarHidden: true)))
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertTrue(presenter.host.prefersStatusBarHidden)
+        try await waitForStatusBar(hidden: true)
         presenter.tearDown()
         XCTAssertFalse(presenter.host.prefersPointerLocked)
+        XCTAssertFalse(presenter.host.prefersStatusBarHidden)
+        try await waitForStatusBar(hidden: false)
     }
 
     func testPiPSamplesUseHostClockAndBoundedAspectCorrectSurfaces() {
@@ -3084,6 +3116,117 @@ final class OpenNOWiOSParityTests: XCTestCase {
         layout.independentPositions["faceA"] = TouchControlPoint(x: 0.73, y: 0.61)
         XCTAssertEqual(try JSONDecoder().decode(TouchControlLayout.self, from: JSONEncoder().encode(layout)), layout)
         XCTAssertEqual(TouchControlLayout.mobileGamePositions["aimShoot"], TouchControlPoint(x: 0.70, y: 0.61))
+    }
+
+    func testGeForceNOWPresetKeepsSeparateControlsAndPersistsCustomPositions() throws {
+        var settings = TouchSettings()
+        settings.controllerPreset = .geForceNOW
+        XCTAssertEqual(try JSONDecoder().decode(TouchSettings.self, from: JSONEncoder().encode(settings)), settings)
+        XCTAssertTrue(settings.controllerPreset.usesIndependentControls)
+        XCTAssertFalse(settings.controllerPreset.usesSplitTouchpad)
+        XCTAssertFalse(settings.controllerPreset.supportsControlModeSelection)
+        XCTAssertEqual(TouchControllerPreset.standard.next.next, .geForceNOW)
+        XCTAssertEqual(TouchControllerPreset.geForceNOW.next, .standard)
+        XCTAssertEqual(GeForceNOWTouchControl.allCases.count, 19)
+        XCTAssertEqual(Set(GeForceNOWTouchControl.allCases.map(\.id)).count, 19)
+        XCTAssertEqual(GeForceNOWTouchControl.back.button, .options)
+        XCTAssertEqual(GeForceNOWTouchControl.start.button, .menu)
+        XCTAssertEqual(GeForceNOWTouchControl.lb.button, .leftShoulder)
+        XCTAssertEqual(GeForceNOWTouchControl.rb.button, .rightShoulder)
+        XCTAssertEqual(GeForceNOWTouchControl.l3.button, .leftStick)
+        XCTAssertEqual(GeForceNOWTouchControl.r3.button, .rightStick)
+        XCTAssertNil(GeForceNOWTouchControl.hub.button) // Opens local controls, without sending a host button.
+        var layout = TouchControlLayout.standard
+        layout.independentPositions[GeForceNOWTouchControl.hub.id] = .init(x: 0.6, y: 0.1)
+        layout.independentPositions["faceA"] = .init(x: 0.7, y: 0.8)
+        XCTAssertEqual(try JSONDecoder().decode(TouchControlLayout.self, from: JSONEncoder().encode(layout)), layout)
+    }
+
+    func testSessionBatteryIgnoresUnknownReadingsAndUsesFirstAvailableLevel() {
+        var battery = StreamSessionBattery()
+        battery.record(percent: nil, charging: false)
+        battery.record(percent: -1, charging: false)
+        battery.record(percent: 101, charging: false)
+        XCTAssertNil(battery.change)
+        battery.record(percent: 82, charging: false)
+        battery.record(percent: 76, charging: false)
+        XCTAssertEqual(battery.startPercent, 82)
+        XCTAssertEqual(battery.change, -6)
+        XCTAssertEqual(battery.changeText, "6% used")
+        battery.record(percent: nil, charging: false)
+        XCTAssertEqual(battery.currentPercent, 76)
+    }
+
+    func testSessionBatteryLabelsChargingAsNetChange() {
+        var battery = StreamSessionBattery()
+        battery.record(percent: 70, charging: false)
+        battery.record(percent: 65, charging: false)
+        battery.record(percent: 74, charging: true)
+        XCTAssertEqual(battery.changeText, "+4% net")
+        XCTAssertTrue(battery.summary.contains("Charging"))
+        battery.record(percent: 69, charging: false)
+        XCTAssertEqual(battery.changeText, "-1% net")
+        XCTAssertTrue(battery.includedCharging)
+        XCTAssertFalse(battery.charging)
+    }
+
+    @MainActor
+    func testSessionHistoryPersistsCompletedMetadataBatteryAndDeletion() throws {
+        let suite = "OpenNOW.tests.history.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let history = StreamSessionHistoryStore(defaults: defaults)
+        let start = Date(timeIntervalSince1970: 1000)
+        var record = StreamSessionRecord(gameTitle: "Control", resolution: "2560×1080",
+            targetFPS: 120, codec: "H.265", hdr: true, transport: "Native NVST", at: start)
+        record.battery.record(percent: 90, charging: false)
+        history.update(record, force: true)
+        record.updatedAt = start.addingTimeInterval(3661)
+        record.endedAt = record.updatedAt
+        record.battery.record(percent: 80, charging: false)
+        history.update(record, force: true)
+        let restored = StreamSessionHistoryStore(defaults: defaults)
+        XCTAssertEqual(restored.records, [record])
+        XCTAssertEqual(restored.records[0].durationText, "1h 1m")
+        XCTAssertEqual(restored.records[0].battery.changeText, "10% used")
+        restored.delete(at: IndexSet(integer: 0))
+        XCTAssertTrue(StreamSessionHistoryStore(defaults: defaults).records.isEmpty)
+    }
+
+    @MainActor
+    func testSessionHistoryRecoversInterruptedSessionAtLastCheckpointAndBoundsStorage() throws {
+        let suite = "OpenNOW.tests.history.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let history = StreamSessionHistoryStore(defaults: defaults)
+        let start = Date(timeIntervalSince1970: 1000)
+        var record = StreamSessionRecord(gameTitle: "Game", resolution: "1920×1080",
+            targetFPS: 60, codec: "H.265", hdr: false, transport: "WebRTC", at: start)
+        record.updatedAt = start.addingTimeInterval(125)
+        history.update(record, force: true)
+        let recovered = StreamSessionHistoryStore(defaults: defaults)
+        XCTAssertEqual(recovered.records.first?.endedAt, record.updatedAt)
+        XCTAssertEqual(recovered.records.first?.duration, 125)
+        XCTAssertEqual(recovered.records.first?.interrupted, true)
+        for index in 0...StreamSessionHistoryStore.maximumRecords {
+            var completed = StreamSessionRecord(gameTitle: "Game \(index)", resolution: "1920×1080",
+                targetFPS: 60, codec: "H.265", hdr: false, transport: "WebRTC",
+                at: start.addingTimeInterval(Double(index + 1)))
+            completed.endedAt = completed.updatedAt
+            recovered.update(completed, force: true)
+        }
+        XCTAssertEqual(recovered.records.count, StreamSessionHistoryStore.maximumRecords)
+        XCTAssertEqual(recovered.records.first?.gameTitle, "Game 100")
+        XCTAssertEqual(StreamSessionHistoryStore(defaults: defaults).records, recovered.records)
+    }
+
+    func testSessionBatteryHUDMetricDefaultsOffAndPersistsWhenEnabled() throws {
+        var metrics = try JSONDecoder().decode(StreamStatsMetrics.self, from: Data("{}".utf8))
+        XCTAssertFalse(metrics.sessionBattery)
+        let originalCount = metrics.enabledCount
+        metrics.sessionBattery = true
+        XCTAssertEqual(metrics.enabledCount, originalCount + 1)
+        XCTAssertEqual(try JSONDecoder().decode(StreamStatsMetrics.self, from: JSONEncoder().encode(metrics)), metrics)
     }
 
     func testMobileGameSprintActivatesOnlyAtTheMarkedMovementRim() {
