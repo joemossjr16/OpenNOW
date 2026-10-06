@@ -1705,6 +1705,77 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(claims, 0)
     }
 
+    func testProviderConfirmedMissingAllocationIsRecognizedWithoutExposingJSON() {
+        let response: [String: Any] = ["session": ["status": 0],
+            "requestStatus": ["statusCode": 22,
+                "statusDescription": "INVALID_SESSION_ID_NOT_FOUND_STATUS 8A8C2000"]]
+        for status in [200, 404] {
+            XCTAssertThrowsError(try CloudMatchSessionResponse.validate(response, httpStatus: status)) { error in
+                XCTAssertTrue(CloudMatchSessionResponse.isMissingAllocation(error))
+                XCTAssertEqual(error.localizedDescription, "INVALID_SESSION_ID_NOT_FOUND_STATUS 8A8C2000")
+            }
+        }
+        XCTAssertThrowsError(try CloudMatchClaimResponse.validate(response, httpStatus: 404)) { error in
+            XCTAssertTrue(CloudMatchSessionResponse.isMissingAllocation(error))
+        }
+    }
+
+    func testMissingAllocationRecoveryDoesNotDiscardOnGenericHTTPOrTransportFailure() {
+        for status in [404, 401, 503] {
+            XCTAssertThrowsError(try CloudMatchSessionResponse.validate([:], httpStatus: status)) { error in
+                XCTAssertFalse(CloudMatchSessionResponse.isMissingAllocation(error))
+            }
+        }
+        XCTAssertFalse(CloudMatchSessionResponse.isMissingAllocation(URLError(.timedOut)))
+        XCTAssertFalse(CloudMatchSessionResponse.isMissingAllocation(CancellationError()))
+        XCTAssertNoThrow(try CloudMatchSessionResponse.validate(
+            ["requestStatus": ["statusCode": 1]], httpStatus: 200))
+    }
+
+    func testExpiredSavedSessionSelectsOnlyUnambiguousCurrentSessionForSameGame() {
+        let saved = queueFixture()
+        func candidate(_ id: String, app: String?, status: Int = 2) -> RemoteSessionCandidate {
+            RemoteSessionCandidate(id: id, appId: app, status: status,
+                serverIp: "new-rig.example", streamSettingsSignature: nil,
+                resolution: "1600x1200", fps: 120)
+        }
+        let ipad = candidate("ipad-current", app: saved.game.launchAppId)
+        let otherGame = candidate("other-game", app: "unrelated-game")
+        let stale = candidate(saved.id, app: saved.game.launchAppId)
+        let expired = candidate("expired", app: saved.game.launchAppId, status: 0)
+        XCTAssertEqual(CloudMatchSessionResponse.replacement(for: saved,
+            in: [otherGame, stale, expired, ipad]), ipad)
+        XCTAssertNil(CloudMatchSessionResponse.replacement(for: saved, in: [otherGame, stale, expired]))
+        XCTAssertNil(CloudMatchSessionResponse.replacement(for: saved, in: []))
+        XCTAssertNil(CloudMatchSessionResponse.replacement(for: saved,
+            in: [ipad, candidate("second-match", app: saved.game.launchAppId)]))
+    }
+
+    @MainActor
+    func testExpiredAllocationDoesNotReachNativeClaimOrLaunchStaleEndpoint() async throws {
+        let handoff = NativeStreamSessionHandoff()
+        var allocation = queueFixture(); allocation.status = 2
+        var claims = 0
+        do {
+            _ = try await handoff.reconnect(allocation, refresh: { _ in
+                try CloudMatchSessionResponse.validate(
+                    ["requestStatus": ["statusCode": 22]], httpStatus: 404)
+                return allocation
+            }, claim: { fresh in claims += 1; return fresh })
+            XCTFail("Missing allocations must never reach RTSP hand-over")
+        } catch { XCTAssertTrue(CloudMatchSessionResponse.isMissingAllocation(error)) }
+        XCTAssertEqual(claims, 0)
+        let replacement = ActiveSession(id: "ipad-current", game: allocation.game,
+            startedAt: allocation.startedAt, status: 2, mediaPort: 0,
+            iceServers: [], zone: allocation.zone, streamingBaseUrl: allocation.streamingBaseUrl,
+            clientId: allocation.clientId, deviceId: allocation.deviceId)
+        let ready = try await handoff.reconnect(replacement, refresh: { $0 }, claim: { fresh in
+            claims += 1; return fresh
+        })
+        XCTAssertEqual(ready.id, "ipad-current")
+        XCTAssertEqual(claims, 1)
+    }
+
     func testAccountSessionDiscoveryDistinguishesEmptySuccessFromListingFailure() throws {
         let remote: [String: Any] = ["sessionId": "other-device", "status": 2,
             "monitorSettings": [["widthInPixels": 2560, "heightInPixels": 1080, "framesPerSecond": 120]]]

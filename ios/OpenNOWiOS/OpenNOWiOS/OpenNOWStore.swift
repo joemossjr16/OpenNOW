@@ -2663,10 +2663,7 @@ enum CloudMatchClaimResponse {
         // desktop client: poll its current details instead of treating this as acceptance.
         if (httpStatus == 200 || httpStatus == 400),
            code == 34 || description.contains("SESSION_NOT_PAUSED") { return }
-        guard httpStatus == 200, code == 1 else {
-            throw NSError(domain: "OpenNOW.Session", code: httpStatus == 200 ? code : httpStatus,
-                          userInfo: [NSLocalizedDescriptionKey: description])
-        }
+        try CloudMatchSessionResponse.validate(json, httpStatus: httpStatus)
     }
 }
 
@@ -4536,17 +4533,8 @@ private actor GFNAPIClient {
                 NSLocalizedDescriptionKey: "The cloud provider ended this queue request. Start the game again to join a new queue."
             ])
         }
-        guard response.statusCode == 200 else {
-            let text = String(data: data, encoding: .utf8) ?? "unknown"
-            throw NSError(domain: "OpenNOW.Session", code: response.statusCode, userInfo: [NSLocalizedDescriptionKey: text])
-        }
-
-        let json = try parsedResponse ?? parseJSON(data)
-        let statusCode = requestStatus?["statusCode"] as? Int ?? 0
-        guard statusCode == 1 else {
-            let description = requestStatus?["statusDescription"] as? String ?? "Session poll failed"
-            throw NSError(domain: "OpenNOW.Session", code: statusCode, userInfo: [NSLocalizedDescriptionKey: description])
-        }
+        let json = parsedResponse ?? [:]
+        try CloudMatchSessionResponse.validate(json, httpStatus: response.statusCode)
 
         let sessionObj = json["session"] as? [String: Any] ?? [:]
         let status = sessionObj["status"] as? Int ?? activeSession.status
@@ -7721,7 +7709,7 @@ final class OpenNOWStore: ObservableObject {
             activeStreamSettings = launchSettings
             adReportStateById = [:]
             adStartedAtById = [:]
-                startSessionTasks()
+            startSessionTasks()
             syncTrackedSessionSurface()
             logger.info("Session started id=\(started.id, privacy: .public) status=\(started.status) queue=\(started.queuePosition ?? -1)")
             lastError = nil
@@ -8162,7 +8150,7 @@ final class OpenNOWStore: ObservableObject {
             activeStreamSettings = streamSettings
             adReportStateById = [:]
             adStartedAtById = [:]
-                startSessionTasks()
+            startSessionTasks()
             syncTrackedSessionSurface()
             logger.info("Session resumed id=\(claimed.id, privacy: .public) status=\(claimed.status) queue=\(claimed.queuePosition ?? -1)")
             lastError = nil
@@ -9328,6 +9316,9 @@ final class OpenNOWStore: ObservableObject {
                     self.recordDebugEvent("queue", "Provider ended queue request")
                     await NotificationManager.shared.cancelSessionNotifications()
                     break
+                } catch where CloudMatchSessionResponse.isMissingAllocation(error) {
+                    _ = await self.discardMissingSession(active, generation: generation)
+                    break
                 } catch {
                     consecutivePollFailures += 1
                     self.logger.error("Session poll failed attempt=\(consecutivePollFailures) error=\(error.localizedDescription, privacy: .public)")
@@ -9490,13 +9481,41 @@ final class OpenNOWStore: ObservableObject {
             }
         } catch where OpenNOWErrorPresenter.isCancellation(error) {
             return
+        } catch where CloudMatchSessionResponse.isMissingAllocation(error) {
+            let replacement = await discardMissingSession(session, generation: generation)
+            guard !Task.isCancelled, generation == authGeneration, activeSession == nil else { return }
+            if let replacement {
+                await resumeSession(candidate: replacement)
+            } else {
+                lastError = "This saved session has ended. Choose an available session from Continue playing."
+            }
         } catch {
             guard generation == authGeneration, activeSession?.id == session.id else { return }
             logger.error("Reopen refresh failed id=\(session.id, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
-            lastError = "Failed to reconnect session: \(error.localizedDescription)"
+            lastError = "Failed to reconnect session: \(OpenNOWErrorPresenter.message(for: error, fallback: "The session could not be resumed."))"
             sessionError = lastError
             syncTrackedSessionSurface()
         }
+    }
+
+    /// A provider-confirmed missing allocation is local history, not a retryable seat.
+    /// Refresh first; never substitute a cached listing after a failed account request.
+    private func discardMissingSession(_ allocation: ActiveSession, generation: UUID) async -> RemoteSessionCandidate? {
+        guard streamSession == nil, generation == authGeneration,
+              activeSession?.id == allocation.id else { return nil }
+        await refreshRemoteSessions(reportFailure: false)
+        guard !Task.isCancelled, streamSession == nil, generation == authGeneration,
+              activeSession?.id == allocation.id else { return nil }
+        let replacement = remoteSessionsSnapshotLoaded
+            ? CloudMatchSessionResponse.replacement(for: allocation, in: resumableSessions) : nil
+        resumableSessions.removeAll { $0.id == allocation.id }
+        streamHandoff.restore(allocationID: nil)
+        showStreamLoading = false
+        queueOverlayVisible = false
+        sessionError = nil
+        lastError = nil
+        clearLocalSessionState(reason: "session.providerConfirmedMissing")
+        return replacement
     }
 
     private var isFreeTierUser: Bool {
