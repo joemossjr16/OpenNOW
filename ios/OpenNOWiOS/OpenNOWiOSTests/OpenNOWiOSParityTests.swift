@@ -369,6 +369,121 @@ final class OpenNOWiOSParityTests: XCTestCase {
     }
 
     @MainActor
+    func testStreamHUDSelectionsSurviveDismissalAndRestorationWithoutChangingVideoProfile() throws {
+        let defaults = UserDefaults.standard
+        let keys = ["OpenNOW.iOS.settings", "OpenNOW.iOS.activeSession", "OpenNOW.iOS.activeStreamSettings"]
+        let previous = keys.map { defaults.object(forKey: $0) }
+        defer {
+            for (key, value) in zip(keys, previous) {
+                if let value { defaults.set(value, forKey: key) }
+                else { defaults.removeObject(forKey: key) }
+            }
+        }
+        var launch = AppSettings.default
+        launch.preferredAspectRatio = "21:9"
+        launch.preferredResolution = "2560x1080"
+        launch.preferredFPS = 120
+        launch.maxBitrateMbps = 100
+        launch.hdrEnabled = true
+        launch.queueReadySound = false
+        launch.queueLiveActivitiesEnabled = false
+        launch.streamStatsMetrics.bitrate = true
+        launch.streamStatsMetrics.resolution = true
+        launch.streamStatsMetrics.codec = true
+        launch.streamStatsMetrics.location = true
+        launch.streamStatsMetrics.latency = true
+        launch.streamStatsMetrics.packetLoss = true
+        XCTAssertEqual(launch.streamStatsMetrics.enabledCount, 10)
+        let session = Self.makeActiveSession(game: Self.makeGame(title: "Restore HUD", controls: []), status: 3)
+        defaults.set(try JSONEncoder().encode(launch), forKey: keys[0])
+        defaults.set(try JSONEncoder().encode(session), forKey: keys[1])
+        defaults.set(try JSONEncoder().encode(launch), forKey: keys[2])
+        let store = OpenNOWStore()
+        // A change intended for the next launch must not replace the active allocation's video request.
+        store.settings.preferredAspectRatio = "16:9"
+        store.settings.preferredResolution = "1920x1080"
+        store.settings.preferredFPS = 60
+        store.settings.hdrEnabled = false
+        let coordinator = makeTouchControlsCoordinator(settings: store.currentStreamerSettings,
+            onSettingsChange: store.applyStreamerSettings)
+        var selected = StreamStatsMetrics()
+        selected.bitrate = true
+        selected.resolution = true
+        XCTAssertEqual(selected.enabledCount, 6)
+        coordinator.updateLiveSettings {
+            $0.streamStatsMetrics = selected
+            $0.hideStreamButtons = true
+            $0.metal4Enabled = true
+        }
+        XCTAssertEqual(store.settings.streamStatsMetrics, selected)
+        XCTAssertEqual(store.currentStreamerSettings.streamStatsMetrics, selected)
+        XCTAssertTrue(store.currentStreamerSettings.hideStreamButtons)
+        XCTAssertTrue(store.currentStreamerSettings.metal4Enabled)
+        store.dismissStreamer()
+        let restored = OpenNOWStore()
+        XCTAssertEqual(restored.currentStreamerSettings.streamStatsMetrics, selected)
+        XCTAssertEqual(restored.currentStreamerSettings.preferredResolution, "2560x1080")
+        XCTAssertEqual(restored.currentStreamerSettings.preferredFPS, 120)
+        XCTAssertTrue(restored.currentStreamerSettings.hdrEnabled)
+        XCTAssertEqual(restored.settings.preferredResolution, "1920x1080")
+        XCTAssertEqual(restored.settings.preferredFPS, 60)
+        let persisted = try JSONDecoder().decode(AppSettings.self, from: XCTUnwrap(defaults.data(forKey: keys[2])))
+        XCTAssertEqual(persisted.streamStatsMetrics, selected)
+        // Repair snapshots written by older builds that saved the metrics only globally.
+        defaults.set(try JSONEncoder().encode(launch), forKey: keys[2])
+        let repaired = OpenNOWStore()
+        XCTAssertEqual(repaired.currentStreamerSettings.streamStatsMetrics, selected)
+        XCTAssertTrue(repaired.currentStreamerSettings.hideStreamButtons)
+        XCTAssertEqual(repaired.currentStreamerSettings.preferredResolution, "2560x1080")
+    }
+
+    func testReconnectRetainsSelectedVideoProfileDespiteLowerRemoteListing() {
+        var requested = AppSettings.default
+        requested.preferredAspectRatio = "21:9"
+        requested.preferredResolution = "2560x1080"
+        requested.preferredFPS = 120
+        requested.maxBitrateMbps = 100
+        requested.hdrEnabled = true
+        requested.metal4Enabled = true
+        requested.preferredCodec = "H265"
+        for status in [1, 2, 3] {
+            let candidate = RemoteSessionCandidate(id: "retained", appId: "game", status: status,
+                serverIp: "example.invalid", streamSettingsSignature: nil,
+                resolution: "1280x720", fps: 60)
+            let resumed = StreamSettingsResolver.settingsForResuming(candidate, base: requested,
+                retainedSessionID: "retained", membershipTier: "ULTIMATE")
+            XCTAssertEqual(resumed, requested, "Listing metadata must not replace the saved request")
+            let profile = StreamSettingsResolver.profile(for: resumed, membershipTier: "ULTIMATE")
+            XCTAssertEqual(profile.resolutionString, "2560x1080")
+            XCTAssertEqual(profile.fps, 120)
+            XCTAssertEqual(profile.maxBitrateKbps, 100_000)
+        }
+    }
+
+    func testResumeWithoutMatchingSnapshotStillAdoptsRemoteProfile() {
+        var requested = AppSettings.default
+        requested.preferredAspectRatio = "21:9"
+        requested.preferredResolution = "2560x1080"
+        requested.preferredFPS = 120
+        requested.maxBitrateMbps = 100
+        requested.streamStatsMetrics.bitrate = true
+        requested.streamStatsMetrics.resolution = true
+        let candidate = RemoteSessionCandidate(id: "remote", appId: "game", status: 3,
+            serverIp: "example.invalid", streamSettingsSignature: nil,
+            resolution: "1280x720", fps: 60)
+        for retainedID: String? in [nil, "different-allocation"] {
+            let resumed = StreamSettingsResolver.settingsForResuming(candidate, base: requested,
+                retainedSessionID: retainedID, membershipTier: "ULTIMATE")
+            XCTAssertEqual(resumed.preferredResolution, "1280x720")
+            XCTAssertEqual(resumed.preferredAspectRatio, "16:9")
+            XCTAssertEqual(resumed.preferredFPS, 60)
+            XCTAssertEqual(resumed.streamPreset, .custom)
+            XCTAssertEqual(resumed.streamStatsMetrics, requested.streamStatsMetrics)
+            XCTAssertEqual(resumed.maxBitrateMbps, 100)
+        }
+    }
+
+    @MainActor
     func testIPadSettingsCategoriesCanReturnToHomeRepeatedly() async throws {
         try await verifySettingsCategoriesCanReturnToHome(compact: false)
     }
@@ -3253,7 +3368,8 @@ final class OpenNOWiOSParityTests: XCTestCase {
 
     @MainActor
     private func makeTouchControlsCoordinator(settings: AppSettings,
-        onPreferencesChange: @escaping (StreamerPreferences) -> Void = { _ in }) -> NativeStreamCoordinator {
+        onPreferencesChange: @escaping (StreamerPreferences) -> Void = { _ in },
+        onSettingsChange: @escaping (AppSettings) -> Void = { _ in }) -> NativeStreamCoordinator {
         NativeStreamCoordinator(
             session: Self.makeActiveSession(game: Self.makeGame(title: "Touch controls", controls: []), status: 3),
             settings: settings, membershipTier: "ULTIMATE", sessionHistory: nil,
@@ -3262,7 +3378,7 @@ final class OpenNOWiOSParityTests: XCTestCase {
             onPhoneRumbleFallbackChange: { _ in }, onStreamTutorialCompleted: {},
             onControllerTouchPromptDismissed: {}, onStatsOverlayChange: { _ in },
             onTransportStable: {}, onSelectedVideoProfileRetry: { _ in }, onRuntimeSample: { _ in },
-            onSettingsChange: { _ in }, onBuildBugReportDeck: { BugReportPreflightDeck() },
+            onSettingsChange: onSettingsChange, onBuildBugReportDeck: { BugReportPreflightDeck() },
             onSubmitBugReport: { _, _ in .failure(BugReportError.invalid("Test")) }, onClose: {}, onRetry: nil)
     }
 

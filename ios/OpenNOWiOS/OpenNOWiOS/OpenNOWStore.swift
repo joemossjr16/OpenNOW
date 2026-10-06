@@ -1277,6 +1277,21 @@ struct AppSettings: Codable, Equatable {
         touchControlLayouts[profile] ?? TouchControlLayout.preset(for: profile)
     }
 
+    /// Live controls can change independently of the allocation's pinned video request.
+    mutating func applyStreamerControls(from updated: AppSettings) {
+        streamStatsMetrics = updated.streamStatsMetrics
+        controllerRumbleStrength = updated.controllerRumbleStrength
+        controllerShortcuts = updated.controllerShortcuts
+        metal4Enabled = updated.metal4Enabled
+        metalFXUpscalingEnabled = updated.metalFXUpscalingEnabled
+        hideStreamButtons = updated.hideStreamButtons
+        touch = updated.touch
+        mouseSensitivity = updated.mouseSensitivity
+        mouseScrollSensitivity = updated.mouseScrollSensitivity
+        controllerMouseEmulation = updated.controllerMouseEmulation
+        streamKeyboardClearConfirmationDisabled = updated.streamKeyboardClearConfirmationDisabled
+    }
+
     mutating func migrateLegacyTouchControlDefaults() {
         if touchControlLayouts["default"] == .legacyStandard || touchControlLayouts["default"] == .legacyShrunkStandard {
             touchControlLayouts["default"] = .standard
@@ -2017,6 +2032,35 @@ enum StreamSettingsResolver {
             updated.preferredQuality = "Quality"
         }
         return updated
+    }
+
+    /// A listing can describe a temporarily reduced stream. Reclaiming our own allocation
+    /// must repeat its saved request; only an allocation without that snapshot adopts the listing.
+    static func settingsForResuming(
+        _ candidate: RemoteSessionCandidate,
+        base: AppSettings,
+        retainedSessionID: String?,
+        membershipTier: String?
+    ) -> AppSettings {
+        if candidate.id == retainedSessionID { return base }
+        var adopted = base
+        if let resolution = candidate.resolution?.trimmingCharacters(in: .whitespacesAndNewlines) {
+            let parts = resolution.split(separator: "x", maxSplits: 1)
+            if parts.count == 2, let width = Int(parts[0]), let height = Int(parts[1]),
+               customResolutionIsAvailable(width: width, height: height, membershipTier: membershipTier) {
+                adopted.preferredResolution = "\(width)x\(height)"
+                if let known = resolutionChoices.first(where: { $0.value == adopted.preferredResolution }) {
+                    adopted.preferredAspectRatio = known.aspectRatio
+                }
+            }
+        }
+        if let fps = candidate.fps {
+            let planLimit = plan(for: membershipTier) >= .ultimate ? 120 : 60
+            adopted.preferredFPS = min(max(fps, 30), planLimit)
+        }
+        adopted.streamPreset = .custom
+        adopted.normalizeStreamDefaults()
+        return adopted
     }
 
     static func sessionSignature(for settings: AppSettings) -> String {
@@ -6525,6 +6569,8 @@ final class OpenNOWStore: ObservableObject {
         }
         #endif
         activeStreamSettings = activeSession == nil ? nil : Self.loadActiveStreamSettings(from: defaults)
+        // Older builds persisted live controls only globally, leaving this snapshot stale.
+        activeStreamSettings?.applyStreamerControls(from: settings)
         user = authSession?.user
         if let authSession {
             hydrateCachedCatalog(for: authSession)
@@ -8028,6 +8074,7 @@ final class OpenNOWStore: ObservableObject {
             lastError = StreamZonePolicy.blockedZoneMessage
             return
         }
+        let retainedSessionID = activeStreamSettings == nil ? nil : activeSession?.id
         isLaunchingSession = true
         showStreamLoading = true
         queueOverlayVisible = true
@@ -8037,11 +8084,15 @@ final class OpenNOWStore: ObservableObject {
             let refreshed = try await api.refreshSession(session)
             authSession = refreshed
             persistAuthSession(refreshed)
-            let requestedSettings = nativeLaunchSettings(for: settings, context: "resumeSession")
-            let streamSettings = streamSettingsByAdoptingRemoteProfile(
+            let requestedSettings = nativeLaunchSettings(
+                for: candidate.id == retainedSessionID ? currentStreamerSettings : settings,
+                context: "resumeSession"
+            )
+            let streamSettings = streamSettingsForResuming(
                 candidate,
                 base: requestedSettings,
-                session: refreshed
+                session: refreshed,
+                retainedSessionID: retainedSessionID
             )
             let claimed = try await api.claimSession(
                 session: refreshed,
@@ -8368,24 +8419,8 @@ final class OpenNOWStore: ObservableObject {
     /// silently revert anything changed in Settings while the game was running.
     func applyStreamerSettings(_ updated: AppSettings) {
         var next = settings
-        next.streamStatsMetrics = updated.streamStatsMetrics
-        next.controllerRumbleStrength = updated.controllerRumbleStrength
-        next.controllerShortcuts = updated.controllerShortcuts
-        next.metal4Enabled = updated.metal4Enabled
-        next.metalFXUpscalingEnabled = updated.metalFXUpscalingEnabled
-        next.touch = updated.touch
-        next.mouseSensitivity = updated.mouseSensitivity
-        next.mouseScrollSensitivity = updated.mouseScrollSensitivity
-        next.controllerMouseEmulation = updated.controllerMouseEmulation
-        next.streamKeyboardClearConfirmationDisabled = updated.streamKeyboardClearConfirmationDisabled
-        if let active = activeStreamSettings,
-           active.controllerRumbleStrength != next.controllerRumbleStrength || active.controllerShortcuts != next.controllerShortcuts {
-            activeStreamSettings?.controllerRumbleStrength = next.controllerRumbleStrength
-            activeStreamSettings?.controllerShortcuts = next.controllerShortcuts
-            syncTrackedSessionSurface()
-        }
-        guard next != settings else { return }
-        settings = next
+        next.applyStreamerControls(from: updated)
+        if next != settings { settings = next }
         persistSettings()
     }
 
@@ -8599,6 +8634,13 @@ final class OpenNOWStore: ObservableObject {
         }
         if let encoded = try? JSONEncoder().encode(normalized) {
             defaults.set(encoded, forKey: settingsKey)
+        }
+        if var active = activeStreamSettings {
+            active.applyStreamerControls(from: normalized)
+            if active != activeStreamSettings {
+                activeStreamSettings = active
+                syncTrackedSessionSurface()
+            }
         }
     }
 
@@ -9024,39 +9066,16 @@ final class OpenNOWStore: ObservableObject {
         return candidate.fps == profile.fps
     }
 
-    private func streamSettingsByAdoptingRemoteProfile(
+    private func streamSettingsForResuming(
         _ candidate: RemoteSessionCandidate,
         base: AppSettings,
-        session: AuthSession
+        session: AuthSession,
+        retainedSessionID: String?
     ) -> AppSettings {
-        var adopted = base
-        let membershipTier = subscription?.membershipTier ?? session.user.membershipTier
-
-        if let resolution = candidate.resolution?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !resolution.isEmpty {
-            let parts = resolution.split(separator: "x", maxSplits: 1)
-            if parts.count == 2,
-               let width = Int(parts[0]),
-               let height = Int(parts[1]),
-               StreamSettingsResolver.customResolutionIsAvailable(
-                width: width,
-                height: height,
-                membershipTier: membershipTier
-               ) {
-                adopted.preferredResolution = "\(width)x\(height)"
-                if let known = StreamSettingsResolver.resolutionChoices.first(where: { $0.value == adopted.preferredResolution }) {
-                    adopted.preferredAspectRatio = known.aspectRatio
-                }
-            }
-        }
-
-        if let fps = candidate.fps {
-            let planLimit = StreamSettingsResolver.plan(for: membershipTier) >= .ultimate ? 120 : 60
-            adopted.preferredFPS = min(max(fps, 30), planLimit)
-        }
-        adopted.streamPreset = .custom
-        adopted.normalizeStreamDefaults()
-        return nativeLaunchSettings(for: adopted, context: "adoptRemoteProfile")
+        let resolved = StreamSettingsResolver.settingsForResuming(candidate, base: base,
+            retainedSessionID: retainedSessionID,
+            membershipTier: subscription?.membershipTier ?? session.user.membershipTier)
+        return nativeLaunchSettings(for: resolved, context: "resumeRemoteProfile")
     }
 
     private func remoteSessionIsLaunchable(_ candidate: RemoteSessionCandidate) -> Bool {
@@ -9333,6 +9352,7 @@ final class OpenNOWStore: ObservableObject {
             lastError = "Sign in first."
             return
         }
+        let retainedSessionID = activeStreamSettings == nil ? nil : session.id
 
         do {
             let refreshed = try await api.refreshSession(currentAuth)
@@ -9382,10 +9402,11 @@ final class OpenNOWStore: ObservableObject {
             if let readyCandidate {
                 candidate = readyCandidate
             } else if let launchingCandidate {
-                let pollingSettings = streamSettingsByAdoptingRemoteProfile(
+                let pollingSettings = streamSettingsForResuming(
                     launchingCandidate,
                     base: requestedStreamSettings,
-                    session: refreshed
+                    session: refreshed,
+                    retainedSessionID: retainedSessionID
                 )
                 var latest = ActiveSession(
                     id: launchingCandidate.id,
@@ -9442,10 +9463,11 @@ final class OpenNOWStore: ObservableObject {
                 return
             }
 
-            let streamSettings = streamSettingsByAdoptingRemoteProfile(
+            let streamSettings = streamSettingsForResuming(
                 candidate,
                 base: requestedStreamSettings,
-                session: refreshed
+                session: refreshed,
+                retainedSessionID: retainedSessionID
             )
 
             let claimed = try await api.claimSession(
