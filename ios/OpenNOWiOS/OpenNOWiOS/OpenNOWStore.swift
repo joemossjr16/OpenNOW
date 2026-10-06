@@ -1900,6 +1900,41 @@ enum StreamSettingsResolver {
         plan(for: membershipTier) >= choice.requiredPlan
     }
 
+    /// Use the decoded geometry, rather than the request, when the host substituted a mode.
+    static func liveResolutionChoices(deliveredResolution: String, membershipTier: String?) -> [StreamResolutionChoice] {
+        let size = pixelSize(deliveredResolution)
+        guard size.width > 0, size.height > 0 else { return [] }
+        let ratio = size.width / size.height
+        let aspect = resolutionChoices.first(where: { $0.value == deliveredResolution })?.aspectRatio
+            ?? aspectRatioOptions.min { left, right in
+                func distance(_ aspect: String) -> CGFloat {
+                    let parts = aspect.split(separator: ":").compactMap { Double($0) }
+                    return abs(ratio / CGFloat(parts[0] / parts[1]) - 1)
+                }
+                return distance(left) < distance(right)
+            }
+        guard let aspect else { return [] }
+        return choices(forAspectRatio: aspect).filter {
+            let candidate = pixelSize($0.value)
+            // Catalog ultrawide modes and 1366x768 have slightly rounded aspect ratios.
+            return abs((candidate.width / candidate.height) / ratio - 1) <= 0.02
+                && isResolutionAvailable($0, membershipTier: membershipTier)
+        }
+    }
+
+    static func settingsForLiveResolution(_ resolution: String, deliveredResolution: String,
+                                          base: AppSettings, membershipTier: String?) -> AppSettings? {
+        guard base.experimentalNativeNVSTEnabled, resolution != deliveredResolution,
+              let choice = liveResolutionChoices(deliveredResolution: deliveredResolution,
+                membershipTier: membershipTier).first(where: { $0.value == resolution }) else { return nil }
+        var updated = base
+        updated.preferredResolution = choice.value
+        updated.preferredAspectRatio = choice.aspectRatio
+        updated.streamPreset = .custom
+        updated.metalFXQualityPreset = .manual
+        return updated
+    }
+
     static func resolutionOptions(for aspectRatio: String) -> [(value: String, label: String)] {
         let choices = choices(forAspectRatio: aspectRatio)
             .map { choice in
@@ -4814,7 +4849,8 @@ private actor GFNAPIClient {
         settings: AppSettings,
         streamProfile: StreamVideoProfile,
         deviceId: String,
-        touchProvisionedOverride: Bool? = nil
+        touchProvisionedOverride: Bool? = nil,
+        retainedStartedAt: Date? = nil
     ) async throws -> ActiveSession {
         let token = session.tokens.idToken ?? session.tokens.accessToken
         let clientId = UUID().uuidString
@@ -4942,7 +4978,7 @@ private actor GFNAPIClient {
         var active = ActiveSession(
             id: candidate.id,
             game: game,
-            startedAt: .now,
+            startedAt: retainedStartedAt ?? .now,
             status: (resolvedSessionObj["status"] as? Int) ?? candidate.status,
             queuePosition: Self.extractQueuePosition(sessionObj: resolvedSessionObj),
             seatSetupStep: Self.extractSeatSetupStep(sessionObj: resolvedSessionObj),
@@ -8715,6 +8751,81 @@ final class OpenNOWStore: ObservableObject {
         lastError = nil
         sessionError = nil
         launchTask = Task { await self.reopenCurrentSession(active) }
+    }
+
+    /// The coordinator closes the old native connection before requesting this same seat again.
+    /// Keep the presented streamer and its session report alive throughout the handoff.
+    func changeLiveStreamResolution(_ resolution: String, deliveredResolution: String,
+                                    allocationID: String) async throws -> ActiveSession {
+        guard !isLaunchingSession, let allocation = activeSession,
+              allocation.id == allocationID, streamSession?.id == allocationID,
+              isReadyForStreamer(allocation), let currentAuth = authSession,
+              let requestedSettings = StreamSettingsResolver.settingsForLiveResolution(resolution,
+                deliveredResolution: deliveredResolution, base: currentStreamerSettings,
+                membershipTier: subscription?.membershipTier ?? currentAuth.user.membershipTier) else {
+            throw NSError(domain: "OpenNOW.Session", code: 90, userInfo: [
+                NSLocalizedDescriptionKey: "This resolution cannot be applied to the current stream."
+            ])
+        }
+        isLaunchingSession = true
+        defer { isLaunchingSession = false }
+        sessionPollTask?.cancel()
+        sessionPollTask = nil
+        sessionPollGeneration = UUID()
+        endSessionPollBackgroundTask()
+        let generation = authGeneration
+        let refreshed = try await api.refreshSession(currentAuth)
+        try Task.checkCancellation()
+        guard generation == authGeneration, activeSession?.id == allocationID,
+              streamSession?.id == allocationID else { throw CancellationError() }
+        authSession = refreshed
+        persistAuthSession(refreshed)
+        let claim: (ActiveSession) async throws -> ActiveSession = { allocation in
+            try Task.checkCancellation()
+            guard generation == self.authGeneration, self.activeSession?.id == allocationID,
+                  self.streamSession?.id == allocationID else { throw CancellationError() }
+            let candidate = RemoteSessionCandidate(id: allocation.id,
+                appId: allocation.game.launchAppId, status: allocation.status,
+                serverIp: allocation.serverIp, streamSettingsSignature: nil,
+                resolution: allocation.negotiatedStreamProfile?.resolution,
+                fps: allocation.negotiatedStreamProfile?.fps,
+                sessionControlBaseUrl: allocation.sessionControlBaseUrl)
+            return try await self.api.claimSession(session: refreshed, candidate: candidate,
+                game: allocation.game, streamingBaseUrl: allocation.streamingBaseUrl,
+                vpcId: allocation.zone, settings: requestedSettings,
+                streamProfile: self.requestedStreamProfile(for: requestedSettings, session: refreshed),
+                deviceId: self.persistentDeviceId(), touchProvisionedOverride: allocation.touchProvisioned,
+                retainedStartedAt: allocation.startedAt)
+        }
+        var claimed = try await streamHandoff.reconnect(allocation, refresh: { allocation in
+            try await self.api.pollSession(session: refreshed, activeSession: allocation, settings: requestedSettings)
+        }, claim: claim)
+        // A seat still transitioning at the first claim must become ready before RESUME.
+        claimed = try await streamHandoff.prepare(claimed, usesNativeNVST: true, claim: claim)
+        try Task.checkCancellation()
+        guard generation == authGeneration, activeSession?.id == allocationID,
+              streamSession?.id == allocationID else { throw CancellationError() }
+        guard isReadyForStreamer(claimed), NativeStreamSessionHandoff.canConnect(claimed) else {
+            throw NSError(domain: "OpenNOW.Session", code: 91, userInfo: [
+                NSLocalizedDescriptionKey: "The session is not ready to reconnect. Try reconnecting again."
+            ])
+        }
+        // Controls may be edited while the claim is in flight; rebase only the resolution.
+        let appliedSettings = StreamSettingsResolver.settingsForLiveResolution(resolution,
+            deliveredResolution: deliveredResolution, base: currentStreamerSettings,
+            membershipTier: subscription?.membershipTier ?? refreshed.user.membershipTier) ?? requestedSettings
+        activeSession = claimed
+        activeStreamSettings = appliedSettings
+        streamHandoff.didClaim(allocationID: allocationID)
+        settings.preferredResolution = requestedSettings.preferredResolution
+        settings.preferredAspectRatio = requestedSettings.preferredAspectRatio
+        settings.streamPreset = .custom
+        settings.metalFXQualityPreset = .manual
+        persistSettings()
+        lastError = nil
+        sessionError = nil
+        syncTrackedSessionSurface()
+        return claimed
     }
 
     /// Schedule a streamer reopen with a 0.8s delay.

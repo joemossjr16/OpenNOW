@@ -693,6 +693,10 @@ struct MainTabView: View {
             onSubmitBugReport: { draft, deck in
                 await store.submitBugReport(draft, deck: deck)
             },
+            onResolutionChange: { resolution, deliveredResolution in
+                try await store.changeLiveStreamResolution(resolution,
+                    deliveredResolution: deliveredResolution, allocationID: session.id)
+            },
             onClose: {
                 presentedStreamerSession = nil
                 streamerAutoRetryCount = 0

@@ -50,7 +50,206 @@ private struct GameDetailsPresentationTestRoot: View {
     }
 }
 
+private actor LiveResolutionTestTransport: NativeStreamNVSTTransport {
+    let connection: NativeStreamNVSTConnection
+    private let closeStarted: XCTestExpectation?
+    private var closeWaiter: CheckedContinuation<Void, Never>?
+    private(set) var closed = false
+
+    init(connection: NativeStreamNVSTConnection, closeStarted: XCTestExpectation? = nil) {
+        self.connection = connection
+        self.closeStarted = closeStarted
+    }
+    func start() async throws {
+        connection.onSample(NativeStreamNVSTSample(received: 60, decoded: 60, bytes: 1_000,
+            lost: 0, packets: 60, resolution: connection.profile.resolutionString,
+            decodeMilliseconds: 1, pingMilliseconds: 10, jitterMilliseconds: 0,
+            hardware: true, pixelFormat: "test", bitstream: "test", detail: ""))
+    }
+    func close() async {
+        guard !closed else { return }
+        if let closeStarted {
+            await withCheckedContinuation { waiter in
+                closeWaiter = waiter
+                closeStarted.fulfill()
+            }
+        }
+        closed = true
+    }
+    func finishClose() { closeWaiter?.resume(); closeWaiter = nil }
+    func send(_ data: Data) async -> Bool { !closed }
+    func setAudioMuted(_ muted: Bool) async {}
+}
+
 final class OpenNOWiOSParityTests: XCTestCase {
+    func testLiveResolutionPickerUsesDeliveredAspectAndPlan() {
+        let choices = StreamSettingsResolver.liveResolutionChoices(deliveredResolution: "1600x1200", membershipTier: "ULTIMATE")
+        XCTAssertEqual(choices.map(\.value), ["1024x768", "1112x834", "1600x1200"])
+        XCTAssertTrue(choices.allSatisfy { $0.aspectRatio == "4:3" })
+        let free = StreamSettingsResolver.liveResolutionChoices(deliveredResolution: "1920x1080", membershipTier: nil)
+        XCTAssertTrue(free.contains { $0.value == "1366x768" }) // Rounded 16:9 mode.
+        XCTAssertFalse(free.contains { $0.value == "2560x1440" })
+        let ultimate = StreamSettingsResolver.liveResolutionChoices(deliveredResolution: "1920x1080", membershipTier: "ULTIMATE")
+        XCTAssertTrue(ultimate.contains { $0.value == "3840x2160" })
+        XCTAssertFalse(ultimate.contains { $0.value == "2560x1080" })
+        XCTAssertTrue(StreamSettingsResolver.liveResolutionChoices(deliveredResolution: "2560x1080", membershipTier: "ULTIMATE")
+            .contains { $0.value == "3440x1440" })
+        XCTAssertTrue(StreamSettingsResolver.liveResolutionChoices(deliveredResolution: "--", membershipTier: "ULTIMATE").isEmpty)
+        XCTAssertTrue(StreamSettingsResolver.liveResolutionChoices(deliveredResolution: "0x0", membershipTier: "ULTIMATE").isEmpty)
+        XCTAssertTrue(StreamSettingsResolver.liveResolutionChoices(deliveredResolution: "1000x1000", membershipTier: "ULTIMATE").isEmpty)
+    }
+
+    func testLiveResolutionChangePreservesVideoControlsAndSixHUDMetrics() throws {
+        var active = AppSettings.default
+        active.experimentalNativeNVSTEnabled = true
+        // The server substituted 1112x834 for a 16:9 request. Choices must follow delivery.
+        active.preferredResolution = "1920x1080"
+        active.preferredAspectRatio = "16:9"
+        active.preferredFPS = 120
+        active.maxBitrateMbps = 100
+        active.preferredCodec = "H265"
+        active.hdrEnabled = true
+        active.metal4Enabled = true
+        active.metalFXUpscalingEnabled = true
+        active.controllerRumbleStrength = 48
+        active.touch.controllerPreset = .geForceNOW
+        active.hideStreamButtons = true
+        active.streamStatsMetrics = StreamStatsMetrics()
+        active.streamStatsMetrics.bitrate = true
+        active.streamStatsMetrics.resolution = true
+        XCTAssertEqual(active.streamStatsMetrics.enabledCount, 6)
+        let changed = try XCTUnwrap(StreamSettingsResolver.settingsForLiveResolution("1600x1200",
+            deliveredResolution: "1112x834", base: active, membershipTier: "ULTIMATE"))
+        var expected = active
+        expected.preferredResolution = "1600x1200"
+        expected.preferredAspectRatio = "4:3"
+        expected.streamPreset = .custom
+        expected.metalFXQualityPreset = .manual
+        XCTAssertEqual(changed, expected)
+        let profile = StreamSettingsResolver.profile(for: changed, membershipTier: "ULTIMATE")
+        XCTAssertEqual(profile.resolutionString, "1600x1200")
+        XCTAssertEqual(profile.fps, 120)
+        XCTAssertEqual(profile.maxBitrateKbps, 100_000)
+        XCTAssertNil(StreamSettingsResolver.settingsForLiveResolution("1920x1080",
+            deliveredResolution: "1112x834", base: active, membershipTier: "ULTIMATE"))
+    }
+
+    func testLiveResolutionChangeRejectsNoOpUnavailableAndWebRTCModes() {
+        var settings = AppSettings.default
+        settings.experimentalNativeNVSTEnabled = true
+        for choice in ["1600x1200", "1920x1080", "2048x1536", "Auto"] {
+            XCTAssertNil(StreamSettingsResolver.settingsForLiveResolution(choice,
+                deliveredResolution: "1600x1200", base: settings, membershipTier: "ULTIMATE"))
+        }
+        XCTAssertNil(StreamSettingsResolver.settingsForLiveResolution("3840x2160",
+            deliveredResolution: "1920x1080", base: settings, membershipTier: nil))
+        settings.experimentalNativeNVSTEnabled = false
+        XCTAssertNil(StreamSettingsResolver.settingsForLiveResolution("1024x768",
+            deliveredResolution: "1600x1200", base: settings, membershipTier: "ULTIMATE"))
+    }
+
+    @MainActor
+    func testLiveResolutionRefreshWaitsForTeardownAndIgnoresOldFailures() async throws {
+        guard #available(iOS 17.0, *) else { throw XCTSkip("Native NVST requires iOS 17") }
+        var settings = AppSettings.default
+        settings.experimentalNativeNVSTEnabled = true
+        settings.preferredCodec = "H265"
+        settings.preferredAspectRatio = "4:3"
+        settings.preferredResolution = "1600x1200"
+        settings.preferredFPS = 120
+        settings.maxBitrateMbps = 100
+        settings.streamTutorialCompleted = true
+        let closeStarted = expectation(description: "Old connection began closing")
+        let oldSample = expectation(description: "Old connection decoded at its requested size")
+        let newSample = expectation(description: "Replacement connection decoded at the new size")
+        var connections: [NativeStreamNVSTConnection] = []
+        var transports: [LiveResolutionTestTransport] = []
+        var claimCount = 0
+        let coordinator = makeTouchControlsCoordinator(settings: settings, onRuntimeSample: { sample in
+            if sample.resolution == "1600x1200" { oldSample.fulfill() }
+            if sample.resolution == "1024x768" { newSample.fulfill() }
+        }, onResolutionChange: { resolution, delivered in
+            claimCount += 1
+            XCTAssertEqual(resolution, "1024x768")
+            XCTAssertEqual(delivered, "1600x1200")
+            let closed = await transports[0].closed
+            XCTAssertTrue(closed, "RESUME must wait for old RTSP teardown")
+            return connections[0].allocation
+        }, nativeTransportFactory: { connection in
+            connections.append(connection)
+            let transport = LiveResolutionTestTransport(connection: connection,
+                closeStarted: transports.isEmpty ? closeStarted : nil)
+            transports.append(transport)
+            return transport
+        })
+        defer { coordinator.stop() }
+        coordinator.start(viewportSize: CGSize(width: 1600, height: 1200))
+        await fulfillment(of: [oldSample], timeout: 5)
+        XCTAssertEqual(coordinator.liveResolutionChoices.count, 3)
+        coordinator.changeResolution(to: "1024x768")
+        coordinator.changeResolution(to: "1112x834") // Double tap must not start another handoff.
+        await fulfillment(of: [closeStarted], timeout: 5)
+        XCTAssertEqual(claimCount, 0)
+        XCTAssertEqual(connections.count, 1)
+        XCTAssertTrue(coordinator.resolutionChangeInProgress)
+        var sixMetrics = StreamStatsMetrics()
+        sixMetrics.bitrate = true
+        sixMetrics.resolution = true
+        coordinator.updateLiveSettings { $0.streamStatsMetrics = sixMetrics; $0.controllerRumbleStrength = 48 }
+        connections[0].onFailure("Old RTSP connection ended")
+        await transports[0].finishClose()
+        await fulfillment(of: [newSample], timeout: 5)
+        XCTAssertEqual(claimCount, 1)
+        XCTAssertEqual(connections.count, 2)
+        let new = connections[1]
+        XCTAssertEqual(new.allocation.id, connections[0].allocation.id)
+        XCTAssertEqual(new.allocation.startedAt, connections[0].allocation.startedAt)
+        XCTAssertEqual(new.profile.resolutionString, "1024x768")
+        XCTAssertEqual(new.profile.fps, 120)
+        XCTAssertEqual(new.profile.maxBitrateKbps, 100_000)
+        XCTAssertEqual(new.settings.streamStatsMetrics, sixMetrics)
+        XCTAssertEqual(new.settings.controllerRumbleStrength, 48)
+        XCTAssertFalse(coordinator.resolutionChangeInProgress)
+        XCTAssertEqual(coordinator.deliveredResolution, "1024x768")
+        XCTAssertNotEqual(coordinator.statusText, "Native NVST failed")
+    }
+
+    @MainActor
+    func testLeavingDuringLiveResolutionTeardownDoesNotClaimOrRestart() async throws {
+        guard #available(iOS 17.0, *) else { throw XCTSkip("Native NVST requires iOS 17") }
+        var settings = AppSettings.default
+        settings.experimentalNativeNVSTEnabled = true
+        settings.preferredCodec = "H265"
+        settings.preferredAspectRatio = "4:3"
+        settings.preferredResolution = "1600x1200"
+        let sampleReady = expectation(description: "Decoded geometry known")
+        let closeStarted = expectation(description: "Closing connection")
+        var transport: LiveResolutionTestTransport?
+        var factoryCount = 0
+        var claimCount = 0
+        let coordinator = makeTouchControlsCoordinator(settings: settings,
+            onRuntimeSample: { _ in sampleReady.fulfill() }, onResolutionChange: { _, _ in
+                claimCount += 1
+                throw CancellationError()
+            }, nativeTransportFactory: { connection in
+                factoryCount += 1
+                let created = LiveResolutionTestTransport(connection: connection, closeStarted: closeStarted)
+                transport = created
+                return created
+            })
+        coordinator.start(viewportSize: CGSize(width: 1600, height: 1200))
+        await fulfillment(of: [sampleReady], timeout: 5)
+        coordinator.changeResolution(to: "1024x768")
+        await fulfillment(of: [closeStarted], timeout: 5)
+        coordinator.stop()
+        let closed = try XCTUnwrap(transport)
+        await closed.finishClose()
+        // Wait for the cancelled coordinator task to drain the close continuation.
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertEqual(claimCount, 0)
+        XCTAssertEqual(factoryCount, 1)
+    }
+
     func testControllerShortcutsPersistWithoutChangingSavedRumbleGain() throws {
         let legacy = try JSONDecoder().decode(AppSettings.self, from: Data("{}".utf8))
         XCTAssertEqual(legacy.controllerShortcuts.action(for: "Button A"), .none)
@@ -4081,7 +4280,10 @@ final class OpenNOWiOSParityTests: XCTestCase {
     @MainActor
     private func makeTouchControlsCoordinator(settings: AppSettings,
         onPreferencesChange: @escaping (StreamerPreferences) -> Void = { _ in },
-        onSettingsChange: @escaping (AppSettings) -> Void = { _ in }) -> NativeStreamCoordinator {
+        onSettingsChange: @escaping (AppSettings) -> Void = { _ in },
+        onRuntimeSample: @escaping (StreamRuntimeSample) -> Void = { _ in },
+        onResolutionChange: ((String, String) async throws -> ActiveSession)? = nil,
+        nativeTransportFactory: ((NativeStreamNVSTConnection) -> any NativeStreamNVSTTransport)? = nil) -> NativeStreamCoordinator {
         NativeStreamCoordinator(
             session: Self.makeActiveSession(game: Self.makeGame(title: "Touch controls", controls: []), status: 3),
             settings: settings, membershipTier: "ULTIMATE", sessionHistory: nil,
@@ -4089,9 +4291,9 @@ final class OpenNOWiOSParityTests: XCTestCase {
             onStreamSharpeningChange: { _, _ in }, onFingerMouseEnabledChange: { _ in },
             onPhoneRumbleFallbackChange: { _ in }, onStreamTutorialCompleted: {},
             onControllerTouchPromptDismissed: {}, onStatsOverlayChange: { _ in },
-            onTransportStable: {}, onSelectedVideoProfileRetry: { _ in }, onRuntimeSample: { _ in },
+            onTransportStable: {}, onSelectedVideoProfileRetry: { _ in }, onRuntimeSample: onRuntimeSample,
             onSettingsChange: onSettingsChange, onBuildBugReportDeck: { BugReportPreflightDeck() },
-            onSubmitBugReport: { _, _ in .failure(BugReportError.invalid("Test")) }, onClose: {}, onRetry: nil)
+            onSubmitBugReport: { _, _ in .failure(BugReportError.invalid("Test")) }, onResolutionChange: onResolutionChange, nativeTransportFactory: nativeTransportFactory, onClose: {}, onRetry: nil)
     }
 
     func testSplitTouchpadUsesLandingPointAndClampsAtFullTravel() {

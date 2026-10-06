@@ -38,6 +38,26 @@ protocol NativeStreamNVSTTransport: AnyObject, Sendable {
     func setAudioMuted(_ muted: Bool) async
 }
 
+/// Connection parameters and callbacks stay together when replacing a native transport.
+struct NativeStreamNVSTConnection {
+    let allocation: ActiveSession
+    let settings: AppSettings
+    let profile: StreamVideoProfile
+    let codec: NativeStreamVideoCodec
+    let displayFPS: Int
+    let onFrame: @Sendable (RTCVideoFrame) -> Void
+    let onSample: @Sendable (NativeStreamNVSTSample) -> Void
+    let onFailure: @Sendable (String) -> Void
+    let onHaptics: @Sendable ([NvstHapticEvent]) -> Void
+
+    @available(iOS 17.0, *)
+    func makeTransport() -> any NativeStreamNVSTTransport {
+        NativeStreamNVST(allocation: allocation, settings: settings, profile: profile,
+            codec: codec, displayFPS: displayFPS, onFrame: onFrame, onSample: onSample,
+            onFailure: onFailure, onHaptics: onHaptics)
+    }
+}
+
 @available(iOS 17.0, *)
 actor NativeStreamNVST: NativeStreamNVSTTransport {
     private let allocation: ActiveSession

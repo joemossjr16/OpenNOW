@@ -590,6 +590,7 @@ struct StreamerView: View {
         onSubmitBugReport: @escaping (BugReportDraft, BugReportPreflightDeck) async -> Result<String, Error> = { _, _ in
             .failure(BugReportError.invalid("Bug reporting isn't available in this build."))
         },
+        onResolutionChange: ((String, String) async throws -> ActiveSession)? = nil,
         onClose: @escaping () -> Void,
         onRetry: (() -> Void)? = nil
     ) {
@@ -613,6 +614,7 @@ struct StreamerView: View {
                 onSettingsChange: onSettingsChange,
                 onBuildBugReportDeck: onBuildBugReportDeck,
                 onSubmitBugReport: onSubmitBugReport,
+                onResolutionChange: onResolutionChange,
                 onClose: onClose,
                 onRetry: onRetry
             )
@@ -874,6 +876,7 @@ struct StreamerView: View {
         onSubmitBugReport: @escaping (BugReportDraft, BugReportPreflightDeck) async -> Result<String, Error> = { _, _ in
             .failure(BugReportError.invalid("Bug reporting isn't available in this build."))
         },
+        onResolutionChange: ((String, String) async throws -> ActiveSession)? = nil,
         onClose: @escaping () -> Void,
         onRetry: (() -> Void)? = nil
     ) {
@@ -896,6 +899,7 @@ struct StreamerView: View {
         _ = onSettingsChange
         _ = onBuildBugReportDeck
         _ = onSubmitBugReport
+        _ = onResolutionChange
         _ = onRetry
     }
 
@@ -1572,6 +1576,7 @@ private struct NativeStreamControlsPanel: View {
         case statsHUD
         case touchControls
         case mouseMode
+        case resolution
 
         var title: String {
             switch self {
@@ -1579,6 +1584,7 @@ private struct NativeStreamControlsPanel: View {
             case .statsHUD: return "Status Bar"
             case .touchControls: return "Touch Controls"
             case .mouseMode: return "Mouse Mode"
+            case .resolution: return "Resolution"
             }
         }
 
@@ -1590,6 +1596,7 @@ private struct NativeStreamControlsPanel: View {
             case .statsHUD: return "Choose what the overlay shows"
             case .touchControls: return "Size, style and placement"
             case .mouseMode: return "How touch and sticks reach the game"
+            case .resolution: return "Change resolution while keeping your game running"
             }
         }
 
@@ -1599,6 +1606,7 @@ private struct NativeStreamControlsPanel: View {
             case .statsHUD: return 1
             case .touchControls: return 2
             case .mouseMode: return 3
+            case .resolution: return 4
             }
         }
     }
@@ -1615,6 +1623,7 @@ private struct NativeStreamControlsPanel: View {
                     case .statsHUD: statsPage
                     case .touchControls: touchPage
                     case .mouseMode: mousePage
+                    case .resolution: resolutionPage
                     }
                 }
                 .padding(.horizontal, 12)
@@ -1867,7 +1876,14 @@ private struct NativeStreamControlsPanel: View {
                     )
                 )
                 NativeStreamInfoRow(title: "Codec", value: coordinator.selectedCodecLabel)
-                NativeStreamInfoRow(title: "Resolution", value: coordinator.profileLabel)
+                if coordinator.liveResolutionChangeAvailable {
+                    NativeStreamActionRow(title: "Resolution", value: coordinator.deliveredResolutionLabel, actionLabel: "Change") {
+                        page = .resolution
+                    }
+                    .disabled(coordinator.liveResolutionChoices.isEmpty)
+                } else {
+                    NativeStreamInfoRow(title: "Resolution", value: coordinator.profileLabel)
+                }
             }
 
         }
@@ -2190,6 +2206,23 @@ private struct NativeStreamControlsPanel: View {
             }
         }
     }
+
+    private var resolutionPage: some View {
+        NativeStreamPanelSection(title: "Resolution") {
+            Text("Reconnects the stream briefly. Your game stays running. Only resolutions matching this stream’s aspect ratio are shown.")
+                .font(StreamPanelStyle.supporting)
+                .foregroundStyle(StreamPanelStyle.supportingColor)
+            ForEach(coordinator.liveResolutionChoices) { choice in
+                let isCurrent = choice.value == coordinator.deliveredResolution
+                NativeStreamActionRow(title: choice.label, value: choice.aspectRatio,
+                    actionLabel: isCurrent ? "Current" : "Use") {
+                    coordinator.changeResolution(to: choice.value)
+                    coordinator.finishControlsPanel()
+                }
+                .disabled(isCurrent || coordinator.resolutionChangeInProgress)
+            }
+        }
+    }
 }
 
 private struct NativeStreamKeyboardSheet: View {
@@ -2487,6 +2520,7 @@ private struct NativeStreamSliderRow: View {
     private var percentText: String {
         format?(value) ?? "\(Int((value * 100).rounded()))%"
     }
+
 }
 
 private struct NativeStreamActionRow: View {
@@ -2654,8 +2688,9 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     let sessionID: String
     let inputBridge = NativeStreamInputBridge()
 
-    private let session: ActiveSession
-    private let settings: AppSettings
+    private var session: ActiveSession
+    private var settings: AppSettings
+    private let membershipTier: String?
     private let sessionLimit: StreamSessionLimit
     private let touchLayoutProfile: String
     private let onTouchLayoutChange: (String, TouchControlLayout) -> Void
@@ -2678,13 +2713,19 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     private let onSettingsChange: (AppSettings) -> Void
     private let onBuildBugReportDeck: () -> BugReportPreflightDeck
     private let onSubmitBugReport: (BugReportDraft, BugReportPreflightDeck) async -> Result<String, Error>
+    private let onResolutionChange: ((String, String) async throws -> ActiveSession)?
     private let onClose: () -> Void
     private let onRetry: (() -> Void)?
     private let logger = Logger(subsystem: "OpenNOWiOS", category: "NativeStreamer")
     private let workQueue = DispatchQueue(label: "OpenNOW.NativeStreamer")
     private var nativeNVST: (any NativeStreamNVSTTransport)?
+    private let nativeTransportFactory: ((NativeStreamNVSTConnection) -> any NativeStreamNVSTTransport)?
     private var nativeNVSTStart: Task<Void, Never>?
     private var nativeNVSTFailed = false
+    private var nativeTransportGeneration = UUID()
+    private var nativeDeliveredResolution: String?
+    private var resolutionChangeTask: Task<Void, Never>?
+    @Published private(set) var resolutionChangeInProgress = false
 
     private let networkMonitor = NWPathMonitor()
     private let networkMonitorQueue = DispatchQueue(label: "OpenNOW.NativeStreamer.Network")
@@ -2700,7 +2741,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     private var streamProfile: StreamVideoProfile
     /// What the user actually asked for, before CloudMatch had a say. `streamProfile` already
     /// carries the negotiated geometry, so the two have to be kept apart to spot a difference.
-    private let requestedProfile: StreamVideoProfile
+    private var requestedProfile: StreamVideoProfile
     private var modeNoticeDismissTask: Task<Void, Never>?
     private var reportedModeChangeKey: String?
     /// Set when the app itself dropped the profile, so the notice can say so instead of blaming
@@ -2801,6 +2842,8 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         onSettingsChange: @escaping (AppSettings) -> Void,
         onBuildBugReportDeck: @escaping () -> BugReportPreflightDeck,
         onSubmitBugReport: @escaping (BugReportDraft, BugReportPreflightDeck) async -> Result<String, Error>,
+        onResolutionChange: ((String, String) async throws -> ActiveSession)? = nil,
+        nativeTransportFactory: ((NativeStreamNVSTConnection) -> any NativeStreamNVSTTransport)? = nil,
         onClose: @escaping () -> Void,
         onRetry: (() -> Void)?
     ) {
@@ -2814,6 +2857,9 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             startedAt: session.startedAt
         )
         self.session = session
+        self.membershipTier = membershipTier
+        self.onResolutionChange = onResolutionChange
+        self.nativeTransportFactory = nativeTransportFactory
         self.sessionHistory = sessionHistory
         self.settings = settings
         self.sessionLimit = resolvedSessionLimit
@@ -2960,7 +3006,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
                 fail("Use H.265 for the experimental 10-bit 4:4:4 mode. AV1 remains available with 4:2:0.")
                 return
             }
-            guard codecReport.capability(for: codec)?.videoToolboxHardwareDecode == true else {
+            guard nativeTransportFactory != nil || codecReport.capability(for: codec)?.videoToolboxHardwareDecode == true else {
                 fail("\(codec.rawValue) hardware decoding is unavailable on this device"); return
             }
             selectedCodec = codec
@@ -2997,41 +3043,46 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     @available(iOS 17.0, *)
     private func startNativeNVST() {
         updateStatus("Connecting native NVST", detail: "Negotiating the dedicated video connection")
+        let generation = UUID()
+        nativeTransportGeneration = generation
         let sink = videoSink
         let maxDisplayFPS = max(
             streamProfile.fps,
             max(renderer?.window?.screen.maximumFramesPerSecond ?? 0, UIScreen.main.maximumFramesPerSecond)
         )
-        let transport = NativeStreamNVST(allocation: session, settings: settings, profile: streamProfile,
+        let connection = NativeStreamNVSTConnection(allocation: session, settings: settings, profile: streamProfile,
             codec: selectedCodec, displayFPS: maxDisplayFPS,
             onFrame: { frame in sink.renderFrame(frame) },
             onSample: { [weak self] sample in Task { @MainActor in
-                guard let self, !self.stopped else { return }
+                guard let self, !self.stopped, self.nativeTransportGeneration == generation else { return }
                 self.updateNativeNVSTStats(sample)
             } },
             onFailure: { [weak self] reason in Task { @MainActor in
-                guard let self, !self.stopped else { return }
+                guard let self, !self.stopped, self.nativeTransportGeneration == generation else { return }
                 self.nativeNVSTFailed = true
                 self.markMediaTransportDisconnected()
                 self.updateStatus("Native NVST failed", detail: reason)
                 self.retryAvailable = self.onRetry != nil
             } },
             onHaptics: { [weak self] events in Task { @MainActor in
-                guard let self, !self.stopped else { return }
+                guard let self, !self.stopped, self.nativeTransportGeneration == generation else { return }
                 for event in events {
                     self.inputBridge.applyRumble(controllerId: Int(event.gamepadIndex),
                         weakMagnitude: Int(event.rightMotor), strongMagnitude: Int(event.leftMotor))
                 }
             } })
+        let transport = nativeTransportFactory?(connection) ?? connection.makeTransport()
         nativeNVST = transport
         nativeNVSTStart = Task { [weak self] in
             do {
                 try await transport.start()
-                guard let self, !self.stopped, !Task.isCancelled else { return }
+                guard let self, !self.stopped, !Task.isCancelled, self.nativeTransportGeneration == generation else { return }
+                await transport.setAudioMuted(self.streamerPreferences.audioMuted)
+                guard !self.stopped, !Task.isCancelled, self.nativeTransportGeneration == generation else { return }
                 self.markMediaTransportConnected()
             }
             catch {
-                guard let self, !self.stopped, !Task.isCancelled else { return }
+                guard let self, !self.stopped, !Task.isCancelled, self.nativeTransportGeneration == generation else { return }
                 self.nativeNVSTFailed = true
                 self.updateStatus("Native NVST failed", detail: error.localizedDescription)
                 self.retryAvailable = self.onRetry != nil
@@ -3039,8 +3090,85 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         }
     }
 
+    var liveResolutionChangeAvailable: Bool {
+        if #available(iOS 17.0, *) {
+            return settings.experimentalNativeNVSTEnabled && onResolutionChange != nil
+        }
+        return false
+    }
+
+    var deliveredResolution: String { nativeDeliveredResolution ?? statsSnapshot.resolution }
+
+    var deliveredResolutionLabel: String {
+        deliveredResolution.replacingOccurrences(of: "x", with: " × ")
+    }
+
+    var liveResolutionChoices: [StreamSettingsResolver.StreamResolutionChoice] {
+        guard !stopped, liveResolutionChangeAvailable, !nativeNVSTFailed, !resolutionChangeInProgress,
+              let nativeDeliveredResolution else { return [] }
+        return StreamSettingsResolver.liveResolutionChoices(deliveredResolution: nativeDeliveredResolution,
+            membershipTier: membershipTier)
+    }
+
+    func changeResolution(to resolution: String) {
+        guard !stopped, !nativeNVSTFailed, !resolutionChangeInProgress,
+              #available(iOS 17.0, *), let onResolutionChange, let delivered = nativeDeliveredResolution,
+              var updated = StreamSettingsResolver.settingsForLiveResolution(resolution,
+                deliveredResolution: delivered, base: liveSettings, membershipTier: membershipTier) else { return }
+        resolutionChangeInProgress = true
+        retryAvailable = false
+        nativeTransportGeneration = UUID()
+        let oldTransport = nativeNVST
+        let oldStart = nativeNVSTStart
+        nativeNVST = nil
+        nativeNVSTStart = nil
+        oldStart?.cancel()
+        updateStatus("Changing resolution", detail: "Reconnecting at \(resolution.replacingOccurrences(of: "x", with: " × "))")
+        resolutionChangeTask = Task { [weak self] in
+            // A cancelled startup may still own a negotiated RTSP endpoint. Drain both paths
+            // before REST RESUME so an old TEARDOWN cannot close the replacement connection.
+            await oldTransport?.close()
+            await oldStart?.value
+            guard let self, !self.stopped, !Task.isCancelled else { return }
+            defer {
+                self.resolutionChangeInProgress = false
+                self.resolutionChangeTask = nil
+            }
+            do {
+                let claimed = try await onResolutionChange(resolution, delivered)
+                try Task.checkCancellation()
+                guard !self.stopped, claimed.id == self.sessionID else { throw CancellationError() }
+                self.closeLocalTransportForRetry()
+                self.session = claimed
+                updated = StreamSettingsResolver.settingsForLiveResolution(resolution,
+                    deliveredResolution: delivered, base: self.liveSettings, membershipTier: self.membershipTier) ?? updated
+                updated.streamerPreferences = self.streamerPreferences
+                self.settings = updated
+                self.liveSettings = updated
+                self.streamProfile = Self.effectiveProfile(for: claimed, settings: updated, membershipTier: self.membershipTier)
+                self.requestedProfile = StreamSettingsResolver.profile(for: updated, membershipTier: self.membershipTier)
+                self.nativeDeliveredResolution = nil
+                self.statsSnapshot = .empty
+                self.nativeNVSTFailed = false
+                self.reportedModeChangeKey = nil
+                self.modeNoticeDismissTask?.cancel()
+                self.modeChangeNotice = nil
+                self.resetStreamZoom()
+                self.startNativeNVST()
+            } catch {
+                guard !self.stopped, !Task.isCancelled else { return }
+                self.nativeNVSTFailed = true
+                self.videoActive = false
+                self.markMediaTransportDisconnected()
+                self.updateStatus("Resolution change failed", detail: error.localizedDescription)
+                self.retryAvailable = self.onRetry != nil
+            }
+        }
+    }
+
     private func updateNativeNVSTStats(_ sample: NativeStreamNVSTSample) {
         guard !nativeNVSTFailed else { return }
+        if sample.decoded > 0, let resolution = sample.resolution { nativeDeliveredResolution = resolution }
         updateSessionTimer()
         refreshDeviceStatus()
         let progressed = Int(clamping: sample.decoded) > (lastStatsFramesDecoded ?? 0)
@@ -3754,6 +3882,10 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             self.batteryMonitoringWasEnabled = nil
         }
         stopped = true
+        resolutionChangeTask?.cancel()
+        resolutionChangeTask = nil
+        resolutionChangeInProgress = false
+        nativeTransportGeneration = UUID()
         nativeNVSTStart?.cancel(); nativeNVSTStart = nil
         let nativeTransport = nativeNVST; nativeNVST = nil
         Task { await nativeTransport?.close() }
@@ -5060,7 +5192,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     }
 
     private func noteRenderedFrame(count: Int, size: CGSize, colorMode: String) {
-        guard !stopped, !nativeNVSTFailed else { return }
+        guard !stopped, !nativeNVSTFailed, !resolutionChangeInProgress else { return }
         receivedColorMode = colorMode
         renderedFrameCount = count
         updateRenderedVideoSize(size)
@@ -5225,7 +5357,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     }
 
     private func reconnectAfterBackgroundIfNeeded() {
-        guard needsForegroundReconnect else { return }
+        guard needsForegroundReconnect, !resolutionChangeInProgress else { return }
         needsForegroundReconnect = false
         guard let onRetry else { return }
         updateStatus("Reconnecting", detail: "App returned from background")
