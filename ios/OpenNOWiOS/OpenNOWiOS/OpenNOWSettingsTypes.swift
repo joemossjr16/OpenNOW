@@ -107,6 +107,14 @@ enum TouchControlMode: String, Codable, CaseIterable, Identifiable {
     var label: String { self == .virtualSticks ? "Virtual sticks" : "Split touchpad" }
 }
 
+enum TouchControllerPreset: String, Codable, CaseIterable, Identifiable {
+    case standard
+    case mobileGame
+
+    var id: String { rawValue }
+    var label: String { self == .standard ? "Standard" : "Mobile Game" }
+}
+
 enum TouchAimMode: String, Codable, CaseIterable, Identifiable {
     case lockJoystick
     case lockZone
@@ -230,6 +238,7 @@ struct TouchSettings: Codable, Equatable {
 
     var joystickMode: TouchJoystickMode = .fixed
     var controlMode: TouchControlMode = .virtualSticks
+    var controllerPreset: TouchControllerPreset = .standard
     var aimMode: TouchAimMode = .lockJoystick
     var joystickDeadZone: Double = 0
     var touchpadSensitivity: Double = 1
@@ -256,6 +265,7 @@ struct TouchSettings: Codable, Equatable {
         nativeTouchJitterThreshold = try c.decodeIfPresent(Double.self, forKey: .nativeTouchJitterThreshold) ?? 8
         joystickMode = try c.decodeIfPresent(TouchJoystickMode.self, forKey: .joystickMode) ?? .fixed
         controlMode = try c.decodeIfPresent(TouchControlMode.self, forKey: .controlMode) ?? .virtualSticks
+        controllerPreset = try c.decodeIfPresent(TouchControllerPreset.self, forKey: .controllerPreset) ?? .standard
         aimMode = try c.decodeIfPresent(TouchAimMode.self, forKey: .aimMode) ?? .lockJoystick
         joystickDeadZone = try c.decodeIfPresent(Double.self, forKey: .joystickDeadZone) ?? 0
         touchpadSensitivity = try c.decodeIfPresent(Double.self, forKey: .touchpadSensitivity) ?? 1
@@ -329,6 +339,12 @@ enum TouchpadStickMath {
             y: -dy * scale / radius * gain,
             deadZone: deadZone
         )
+    }
+
+    /// Sprint engages only when the movement thumb reaches the marked upper rim of the circle.
+    static func shouldSprint(dx: CGFloat, dy: CGFloat, travel: CGFloat) -> Bool {
+        let radius = max(travel, 1)
+        return dy <= -radius * 0.84 && abs(dx) <= radius * 0.32
     }
 }
 

@@ -839,12 +839,27 @@ struct SettingsView: View {
             Toggle("Touch Controller", isOn: $store.settings.streamerPreferences.touchControllerVisible)
 
             if store.settings.streamerPreferences.touchControllerVisible {
-                Picker("Control layout", selection: $store.settings.touch.controlMode) {
-                    ForEach(TouchControlMode.allCases) { mode in
-                        Text(mode.label).tag(mode)
+                Picker("Preset", selection: $store.settings.touch.controllerPreset) {
+                    ForEach(TouchControllerPreset.allCases) { preset in
+                        Text(preset.label).tag(preset)
                     }
                 }
-                if store.settings.touch.controlMode == .splitTouchpad {
+                if store.settings.touch.controllerPreset == .mobileGame {
+                    Text("Split movement and look touchpads, an aim-and-fire trigger, sprint at the movement rim, and individually movable controls.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if store.settings.touch.controllerPreset == .mobileGame {
+                    Text("Split touchpad")
+                        .foregroundStyle(.secondary)
+                } else {
+                    Picker("Control layout", selection: $store.settings.touch.controlMode) {
+                        ForEach(TouchControlMode.allCases) { mode in
+                            Text(mode.label).tag(mode)
+                        }
+                    }
+                }
+                if store.settings.touch.controllerPreset == .mobileGame || store.settings.touch.controlMode == .splitTouchpad {
                     settingsSlider(
                         "Touchpad Sensitivity",
                         value: $store.settings.touch.touchpadSensitivity,
@@ -1138,10 +1153,11 @@ struct SettingsView: View {
             }
 
             Toggle("Keep Session Awake", isOn: $store.settings.showAntiAfkIndicator)
+            Toggle("Hide Stream Buttons", isOn: $store.settings.hideStreamButtons)
         } header: {
             Text("Stats HUD")
         } footer: {
-            Text("Keeping the session awake nudges the cursor by a pixel after two idle minutes so GeForce NOW does not disconnect you mid-cutscene; a dot in the corner shows while it is doing that. The HUD sits over the game, so keep it to the numbers you actually watch. Values in the normal range stay untinted on purpose — amber and red are what should catch your eye.")
+            Text("Double tap the top edge during a stream to restore hidden controls. Keeping the session awake nudges the cursor by a pixel after two idle minutes so GeForce NOW does not disconnect you mid-cutscene; a dot in the corner shows while it is doing that. The HUD sits over the game, so keep it to the numbers you actually watch.")
         }
     }
 

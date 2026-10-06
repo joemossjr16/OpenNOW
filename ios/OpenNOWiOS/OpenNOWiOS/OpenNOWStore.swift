@@ -1569,6 +1569,9 @@ struct TouchControlLayout: Codable, Equatable {
     var leftStick: TouchControlPoint
     var rightCluster: TouchControlPoint
     var bottomCenter: TouchControlPoint
+    /// Optional per-control positions used by the Mobile Game preset. Old group layouts omit
+    /// these keys and continue using their existing grouped positions.
+    var independentPositions: [String: TouchControlPoint]
 
     enum CodingKeys: String, CodingKey {
         case scale
@@ -1581,6 +1584,7 @@ struct TouchControlLayout: Codable, Equatable {
         case leftStick
         case rightCluster
         case bottomCenter
+        case independentPositions
     }
 
     init(
@@ -1593,7 +1597,8 @@ struct TouchControlLayout: Codable, Equatable {
         topRight: TouchControlPoint,
         leftStick: TouchControlPoint,
         rightCluster: TouchControlPoint,
-        bottomCenter: TouchControlPoint
+        bottomCenter: TouchControlPoint,
+        independentPositions: [String: TouchControlPoint] = [:]
     ) {
         self.scale = scale
         self.opacity = opacity
@@ -1605,6 +1610,7 @@ struct TouchControlLayout: Codable, Equatable {
         self.leftStick = leftStick
         self.rightCluster = rightCluster
         self.bottomCenter = bottomCenter
+        self.independentPositions = independentPositions
     }
 
     init(from decoder: Decoder) throws {
@@ -1620,6 +1626,7 @@ struct TouchControlLayout: Codable, Equatable {
         leftStick = try container.decodeIfPresent(TouchControlPoint.self, forKey: .leftStick) ?? fallback.leftStick
         rightCluster = try container.decodeIfPresent(TouchControlPoint.self, forKey: .rightCluster) ?? fallback.rightCluster
         bottomCenter = try container.decodeIfPresent(TouchControlPoint.self, forKey: .bottomCenter) ?? fallback.bottomCenter
+        independentPositions = try container.decodeIfPresent([String: TouchControlPoint].self, forKey: .independentPositions) ?? [:]
     }
 
     static let standard = TouchControlLayout(
@@ -1647,6 +1654,17 @@ struct TouchControlLayout: Codable, Equatable {
         rightCluster: .init(x: 0.84, y: 0.75),
         bottomCenter: .init(x: 0.50, y: 0.86)
     )
+
+    static let mobileGamePositions: [String: TouchControlPoint] = [
+        "leftShoulder": .init(x: 0.07, y: 0.12), "leftTrigger": .init(x: 0.17, y: 0.12),
+        "view": .init(x: 0.44, y: 0.12), "menu": .init(x: 0.56, y: 0.12),
+        "rightTrigger": .init(x: 0.83, y: 0.12), "rightShoulder": .init(x: 0.93, y: 0.12),
+        "dpad": .init(x: 0.13, y: 0.77), "sprint": .init(x: 0.13, y: 0.61),
+        "rightStick": .init(x: 0.72, y: 0.78), "faceX": .init(x: 0.87, y: 0.68),
+        "faceY": .init(x: 0.94, y: 0.77), "faceB": .init(x: 0.87, y: 0.86),
+        "faceA": .init(x: 0.80, y: 0.77), "aimShoot": .init(x: 0.70, y: 0.61),
+        "mobileHide": .init(x: 0.50, y: 0.92)
+    ]
 
     static let legacyStandard = TouchControlLayout(
         scale: 1,

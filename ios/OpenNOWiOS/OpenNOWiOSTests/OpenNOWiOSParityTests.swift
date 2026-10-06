@@ -3044,10 +3044,30 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(result.0, 0, accuracy: 0.0001)
     }
 
+    func testMobileGameTouchPresetAndIndependentLayoutPositionsPersist() throws {
+        var settings = TouchSettings()
+        XCTAssertEqual(settings.controllerPreset, .standard)
+        settings.controllerPreset = .mobileGame
+        XCTAssertEqual(try JSONDecoder().decode(TouchSettings.self, from: JSONEncoder().encode(settings)), settings)
+
+        var layout = TouchControlLayout.standard
+        layout.independentPositions["faceA"] = TouchControlPoint(x: 0.73, y: 0.61)
+        XCTAssertEqual(try JSONDecoder().decode(TouchControlLayout.self, from: JSONEncoder().encode(layout)), layout)
+        XCTAssertEqual(TouchControlLayout.mobileGamePositions["aimShoot"], TouchControlPoint(x: 0.70, y: 0.61))
+    }
+
+    func testMobileGameSprintActivatesOnlyAtTheMarkedMovementRim() {
+        XCTAssertTrue(TouchpadStickMath.shouldSprint(dx: 0, dy: -60, travel: 60))
+        XCTAssertFalse(TouchpadStickMath.shouldSprint(dx: 60, dy: 0, travel: 60))
+        XCTAssertFalse(TouchpadStickMath.shouldSprint(dx: 30, dy: -60, travel: 60))
+        XCTAssertFalse(TouchpadStickMath.shouldSprint(dx: 0, dy: -40, travel: 60))
+    }
+
     func testOlderTouchSettingsDefaultToVirtualSticks() throws {
         let data = Data("{}".utf8)
         let settings = try JSONDecoder().decode(TouchSettings.self, from: data)
         XCTAssertEqual(settings.controlMode, .virtualSticks)
+        XCTAssertEqual(settings.controllerPreset, .standard)
         XCTAssertEqual(settings.touchpadSensitivity, 1, accuracy: 0.0001)
     }
 
