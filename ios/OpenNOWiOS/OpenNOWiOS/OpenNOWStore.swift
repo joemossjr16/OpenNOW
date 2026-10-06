@@ -694,7 +694,6 @@ enum StreamStatsPosition: String, Codable, CaseIterable, Identifiable {
 struct StreamingFeatures: Codable, Equatable {
     var reflex: Bool?
     var bitDepth: Int?
-    var cloudGsync: Bool?
     var chromaFormat: Int?
     var enabledL4S: Bool?
     var trueHdr: Bool?
@@ -706,7 +705,6 @@ struct NegotiatedStreamProfile: Codable, Equatable {
     var codec: String?
     var colorQuality: StreamColorQuality?
     var enableL4S: Bool?
-    var enableCloudGsync: Bool?
     var enableReflex: Bool?
 }
 
@@ -902,7 +900,6 @@ struct AppSettings: Codable, Equatable {
     var sessionProxyEnabled: Bool = false
     var sessionProxyUrl: String = ""
     var enableL4S: Bool
-    var enableCloudGsync: Bool
     var metal4Enabled: Bool = false
     var metalFXUpscalingEnabled: Bool = false
     var metalFXQualityPreset: MetalFXQualityPreset = .manual
@@ -1016,7 +1013,6 @@ struct AppSettings: Codable, Equatable {
         case sessionProxyEnabled
         case sessionProxyUrl
         case enableL4S
-        case enableCloudGsync
         case metal4Enabled
         case metalFXUpscalingEnabled
         case metalFXQualityPreset
@@ -1088,7 +1084,6 @@ struct AppSettings: Codable, Equatable {
         keyboardLayout: String,
         gameLanguage: String,
         enableL4S: Bool,
-        enableCloudGsync: Bool,
         keepMicEnabled: Bool,
         showStatsOverlay: Bool,
         hideServerSelector: Bool,
@@ -1109,7 +1104,6 @@ struct AppSettings: Codable, Equatable {
         self.keyboardLayout = keyboardLayout
         self.gameLanguage = gameLanguage
         self.enableL4S = enableL4S
-        self.enableCloudGsync = enableCloudGsync
         self.keepMicEnabled = keepMicEnabled
         self.showStatsOverlay = showStatsOverlay
         self.hideServerSelector = hideServerSelector
@@ -1142,7 +1136,6 @@ struct AppSettings: Codable, Equatable {
         sessionProxyEnabled = try container.decodeIfPresent(Bool.self, forKey: .sessionProxyEnabled) ?? false
         sessionProxyUrl = try container.decodeIfPresent(String.self, forKey: .sessionProxyUrl) ?? ""
         enableL4S = try container.decodeIfPresent(Bool.self, forKey: .enableL4S) ?? false
-        enableCloudGsync = try container.decodeIfPresent(Bool.self, forKey: .enableCloudGsync) ?? false
         metal4Enabled = try container.decodeIfPresent(Bool.self, forKey: .metal4Enabled) ?? false
         metalFXUpscalingEnabled = try container.decodeIfPresent(Bool.self, forKey: .metalFXUpscalingEnabled) ?? false
         metalFXQualityPreset = try container.decodeIfPresent(MetalFXQualityPreset.self, forKey: .metalFXQualityPreset) ?? .manual
@@ -1232,7 +1225,6 @@ struct AppSettings: Codable, Equatable {
         keyboardLayout: "en-US",
         gameLanguage: "en_US",
         enableL4S: false,
-        enableCloudGsync: false,
         keepMicEnabled: false,
         showStatsOverlay: true,
         hideServerSelector: false,
@@ -1317,7 +1309,6 @@ struct AppSettings: Codable, Equatable {
         fallback.preferredCodec = "H264"
         fallback.preferredColorQuality = StreamColorQuality.eightBit420.rawValue
         fallback.hdrEnabled = false
-        fallback.enableCloudGsync = false
         fallback.normalizeStreamDefaults()
         return fallback
     }
@@ -1963,7 +1954,6 @@ enum StreamSettingsResolver {
         updated.preferredResolution = choice.value
         updated.preferredColorQuality = StreamColorQuality.eightBit420.rawValue
         updated.hdrEnabled = false
-        updated.enableCloudGsync = false
         switch preset {
         case .custom:
             break
@@ -2001,7 +1991,6 @@ enum StreamSettingsResolver {
             "color=\(color)",
             "hdr=\(settings.hdrEnabled ? 1 : 0)",
             "l4s=\(settings.enableL4S ? 1 : 0)",
-            "gsync=\(settings.enableCloudGsync ? 1 : 0)",
             "keyboard=\(settings.keyboardLayout.trimmingCharacters(in: .whitespacesAndNewlines))",
             "language=\(settings.gameLanguage.trimmingCharacters(in: .whitespacesAndNewlines))"
         ]
@@ -3123,11 +3112,10 @@ enum CloudMatchStreamingFeatureRequest {
     static func build(settings: AppSettings, profile: StreamVideoProfile,
                       bitDepth: Int, chromaFormat: Int) -> [String: Any] {
         [
-            "reflex": settings.enableCloudGsync || profile.fps >= 120,
+            "reflex": profile.fps >= 120,
             // CloudMatch uses enums, unlike the literal bit count in the NVST SDP.
             "bitDepth": bitDepth == 10 ? 1 : 0,
             "trueHdr": settings.hdrEnabled,
-            "cloudGsync": settings.enableCloudGsync,
             "enabledL4S": settings.enableL4S,
             "supportedHidDevices": 0,
             "profile": 0,
@@ -5049,14 +5037,12 @@ private actor GFNAPIClient {
         let normalized = StreamingFeatures(
             reflex: toBoolean(features["reflex"]),
             bitDepth: toNonnegativeInt(features["bitDepth"]),
-            cloudGsync: toBoolean(features["cloudGsync"]),
             chromaFormat: toNonnegativeInt(features["chromaFormat"]),
             enabledL4S: toBoolean(features["enabledL4S"]),
             trueHdr: toBoolean(features["trueHdr"])
         )
         if normalized.reflex == nil,
            normalized.bitDepth == nil,
-           normalized.cloudGsync == nil,
            normalized.chromaFormat == nil,
            normalized.enabledL4S == nil,
            normalized.trueHdr == nil {
@@ -5086,7 +5072,6 @@ private actor GFNAPIClient {
             codec: toOptionalString(sessionObj["codec"]) ?? toOptionalString(finalized?["codec"]) ?? toOptionalString(requested?["codec"]),
             colorQuality: colorQuality,
             enableL4S: toBoolean(finalized?["enabledL4S"]) ?? toBoolean(requested?["enabledL4S"]),
-            enableCloudGsync: toBoolean(finalized?["cloudGsync"]) ?? toBoolean(requested?["cloudGsync"]),
             enableReflex: toBoolean(finalized?["reflex"]) ?? toBoolean(requested?["reflex"])
         )
         if normalized.resolution == nil,
@@ -5094,7 +5079,6 @@ private actor GFNAPIClient {
            normalized.codec == nil,
            normalized.colorQuality == nil,
            normalized.enableL4S == nil,
-           normalized.enableCloudGsync == nil,
            normalized.enableReflex == nil {
             return nil
         }
@@ -6520,7 +6504,7 @@ final class OpenNOWStore: ObservableObject {
             "session.server=\(active?.serverIp ?? "none") media=\(active?.mediaIp ?? "none"):\(active?.mediaPort ?? 0) signaling=\(active?.signalingServer ?? "none")",
             "session.adsRequired=\(isSessionAdsRequired(adState)) ads=\(sessionAdItems(adState).count) queuePaused=\(adState?.isQueuePaused ?? false) activeAd=\(activeQueueAd?.adId ?? "none")",
             "requested.resolution=\(profile.width)x\(profile.height) fps=\(profile.fps) bitrateKbps=\(profile.maxBitrateKbps) codec=\(currentStreamerSettings.preferredCodec) quality=\(currentStreamerSettings.preferredQuality)",
-            "requested.aspect=\(currentStreamerSettings.preferredAspectRatio) color=\(currentStreamerSettings.preferredColorQuality) hdr=\(currentStreamerSettings.hdrEnabled) l4s=\(currentStreamerSettings.enableL4S) gsync=\(currentStreamerSettings.enableCloudGsync)",
+            "requested.aspect=\(currentStreamerSettings.preferredAspectRatio) color=\(currentStreamerSettings.preferredColorQuality) hdr=\(currentStreamerSettings.hdrEnabled) l4s=\(currentStreamerSettings.enableL4S)",
             "requested.region=\(currentStreamerSettings.preferredRegion.isEmpty ? "automatic" : currentStreamerSettings.preferredRegion) proxy=\(proxyHost)",
             "negotiated.resolution=\(negotiated?.resolution ?? "unknown") fps=\(negotiated?.fps.map(String.init) ?? "unknown") codec=\(negotiated?.codec ?? "unknown") color=\(negotiated?.colorQuality?.rawValue ?? "unknown")",
             "input.keyboard=\(settings.keyboardLayout) language=\(settings.gameLanguage) fingerMouse=\(settings.fingerMouseEnabled) sensitivity=\(settings.mouseSensitivity) acceleration=\(settings.mouseAcceleration) phoneRumble=\(settings.phoneRumbleFallback)",

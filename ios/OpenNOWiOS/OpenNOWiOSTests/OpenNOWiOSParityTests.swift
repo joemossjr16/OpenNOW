@@ -234,14 +234,12 @@ final class OpenNOWiOSParityTests: XCTestCase {
         store.settings.preferredAspectRatio = "21:9"
         store.settings.preferredResolution = "2560x1080"
         store.settings.hdrEnabled = true
-        store.settings.enableCloudGsync = false
         let before = store.settings
         store.applyStreamerSettings(live)
         XCTAssertFalse(store.settings.metalFXUpscalingEnabled)
         XCTAssertEqual(store.settings.preferredFPS, before.preferredFPS)
         XCTAssertEqual(store.settings.preferredResolution, before.preferredResolution)
         XCTAssertEqual(store.settings.hdrEnabled, before.hdrEnabled)
-        XCTAssertEqual(store.settings.enableCloudGsync, before.enableCloudGsync)
         let saved = try JSONDecoder().decode(AppSettings.self, from: XCTUnwrap(defaults.data(forKey: key)))
         XCTAssertEqual(saved.controllerRumbleStrength, 4)
         XCTAssertFalse(saved.metal4Enabled)
@@ -1274,7 +1272,6 @@ final class OpenNOWiOSParityTests: XCTestCase {
         settings.preferredFPS = 120
         settings.preferredCodec = "AV1"
         settings.preferredColorQuality = StreamColorQuality.tenBit420.rawValue
-        settings.enableCloudGsync = false
         for hdr in [false, true] {
             settings.hdrEnabled = hdr
             let features = CloudMatchStreamingFeatureRequest.build(
@@ -1284,7 +1281,7 @@ final class OpenNOWiOSParityTests: XCTestCase {
             XCTAssertEqual(features["bitDepth"] as? Int, 1)
             XCTAssertEqual(features["chromaFormat"] as? Int, 0)
             XCTAssertEqual(features["reflex"] as? Bool, true)
-            XCTAssertEqual(features["cloudGsync"] as? Bool, false)
+            XCTAssertNil(features["cloudGsync"])
             XCTAssertEqual(features["trueHdr"] as? Bool, hdr)
             for field in ["mouseMovementFlags", "hidDevices", "sdrColorSpace", "hdrColorSpace"] {
                 XCTAssertNil(features[field], "\(field) is absent from the desktop request")
@@ -1293,9 +1290,8 @@ final class OpenNOWiOSParityTests: XCTestCase {
         }
     }
 
-    func testCloudMatchReflexUsesDesktopThresholdWithoutCloudGsync() {
+    func testCloudMatchReflexUsesDesktopThreshold() {
         var settings = AppSettings.default
-        settings.enableCloudGsync = false
         for fps in [30, 60, 90, 120] {
             settings.preferredFPS = fps
             let features = CloudMatchStreamingFeatureRequest.build(
@@ -1304,13 +1300,6 @@ final class OpenNOWiOSParityTests: XCTestCase {
             )
             XCTAssertEqual(features["reflex"] as? Bool, fps >= 120)
         }
-        settings.enableCloudGsync = true
-        settings.preferredFPS = 60
-        let features = CloudMatchStreamingFeatureRequest.build(
-            settings: settings, profile: StreamSettingsResolver.profile(for: settings),
-            bitDepth: 0, chromaFormat: 0
-        )
-        XCTAssertEqual(features["reflex"] as? Bool, true)
     }
 
     func testCloudMatchInternalRejectionExplainsThatDecoderHasNotStarted() {
@@ -1943,7 +1932,7 @@ final class OpenNOWiOSParityTests: XCTestCase {
               "keyboardLayout": "en-US",
               "gameLanguage": "en_US",
               "enableL4S": false,
-              "enableCloudGsync": false,
+              "enableCloudGsync": true,
               "keepMicEnabled": false,
               "showStatsOverlay": true,
               "hideServerSelector": false,
@@ -1990,6 +1979,10 @@ final class OpenNOWiOSParityTests: XCTestCase {
             from: JSONEncoder().encode(settings)
         )
         XCTAssertEqual(roundTrip, settings)
+        let migratedJSON = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(settings)) as? [String: Any]
+        )
+        XCTAssertNil(migratedJSON["enableCloudGsync"])
     }
 
     func testSafeVideoFallbackCapsExpensiveAndUnsupportedSettings() {
@@ -2001,7 +1994,6 @@ final class OpenNOWiOSParityTests: XCTestCase {
         settings.preferredCodec = "AV1"
         settings.preferredColorQuality = StreamColorQuality.tenBit444.rawValue
         settings.hdrEnabled = true
-        settings.enableCloudGsync = true
 
         let fallback = settings.safeVideoFallback()
 
@@ -2012,7 +2004,6 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(fallback.preferredCodec, "H264")
         XCTAssertEqual(fallback.preferredColorQuality, StreamColorQuality.eightBit420.rawValue)
         XCTAssertFalse(fallback.hdrEnabled)
-        XCTAssertFalse(fallback.enableCloudGsync)
     }
 
     func testExplicitUnsupportedCodecDoesNotRewriteSelectedProfile() {

@@ -68,7 +68,7 @@ private enum SettingsCategory: String, CaseIterable, Hashable, Identifiable {
         case .interface:
             return ["interface", "ui", "accent", "color", "theme", "expressive", "outline", "cards", "titles", "favorites", "favourites", "store labels", "card size", "launch page", "stats", "hud", "metrics", "position", "afk", "idle", "keep awake", "server selector", "queue", "live activities", "sound", "chime", "ready", "catalog", "wallpaper", "background", "photo", "session report", "counter"]
         case .advanced:
-            return ["advanced", "experimental", "l4s", "cloud g-sync", "gsync", "diagnostics", "debug", "logs", "codec", "probe", "decoder", "decoders", "hardware", "native", "h264", "h265", "hevc", "av1"]
+            return ["advanced", "experimental", "l4s", "diagnostics", "debug", "logs", "codec", "probe", "decoder", "decoders", "hardware", "native", "h264", "h265", "hevc", "av1"]
         case .account:
             return ["account", "login", "logout", "sign in", "saved", "provider", "membership", "subscription", "storage", "hours", "play time", "stores", "steam", "epic", "xbox"]
         case .about:
@@ -1197,11 +1197,10 @@ struct SettingsView: View {
     private var experimentalSection: some View {
         Section {
             Toggle("L4S Low Latency", isOn: $store.settings.enableL4S)
-            Toggle("Cloud G-Sync", isOn: $store.settings.enableCloudGsync)
         } header: {
             Text("Experimental")
         } footer: {
-            Text("Both are negotiated with the server and may be refused. If a game stops launching after you turn one on, turn it off again first.")
+            Text("L4S is negotiated with the server and may be refused. If a game stops launching after you turn it on, turn it off again first.")
         }
     }
 

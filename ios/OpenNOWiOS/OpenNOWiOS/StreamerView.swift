@@ -6251,7 +6251,6 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     private let gpuAdmission = DispatchSemaphore(value: 3)
     private let presentations = NativeStreamPresentationTracker()
     private var displayLink: CADisplayLink?
-    private var displayTargetTimestamp: CFTimeInterval?
     private lazy var displayClock = DisplayClock(owner: self)
 
     private final class DisplayClock: NSObject {
@@ -6329,8 +6328,6 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         displayLink?.invalidate()
         displayLink = nil
         // Use one explicit display clock. MTKView's own timer remains paused.
-        // A fixed range asks ProMotion to keep video cadence instead of choosing
-        // an intermediate refresh rate during otherwise static game scenes.
         mtkView.isPaused = true
         guard let window else { return }
         let screenMax = Float(max(window.screen.maximumFramesPerSecond, UIScreen.main.maximumFramesPerSecond))
@@ -6345,7 +6342,6 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     }
 
     private func displayTick(_ link: CADisplayLink) {
-        displayTargetTimestamp = link.targetTimestamp
         mtkView.draw()
     }
 
