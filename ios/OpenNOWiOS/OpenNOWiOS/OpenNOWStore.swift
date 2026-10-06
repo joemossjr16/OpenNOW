@@ -6515,6 +6515,7 @@ final class OpenNOWStore: ObservableObject {
     private var authSession: AuthSession?
     private var authGeneration = UUID()
     private var sessionPollTask: Task<Void, Never>?
+    private var sessionPollGeneration = UUID()
     private var launchTask: Task<Void, Never>?
     private var sessionReportAccumulator: StreamSessionReportAccumulator?
     private var sessionReportSessionId: String?
@@ -8605,7 +8606,7 @@ final class OpenNOWStore: ObservableObject {
     }
 
     private func restoreActiveSessionSurface(_ session: ActiveSession) {
-        guard activeSession?.id == session.id else { return }
+        guard activeSession?.id == session.id, !isLaunchingSession, streamSession == nil else { return }
         if canReopenStreamer {
             reopenStreamer()
             return
@@ -8615,11 +8616,8 @@ final class OpenNOWStore: ObservableObject {
             showStreamLoading = true
             queueOverlayVisible = true
         }
-        if sessionPollTask == nil {
-            startSessionTasks()
-        } else {
-            syncTrackedSessionSurface()
-        }
+        startSessionTasks()
+        syncTrackedSessionSurface()
     }
 
     func reopenStreamer() {
@@ -8627,8 +8625,16 @@ final class OpenNOWStore: ObservableObject {
             lastError = OpenNOWPlatform.streamingUnavailableReason
             return
         }
-        guard let active = activeSession, isReadyForStreamer(active) else { return }
+        guard !isLaunchingSession, streamSession == nil,
+              let active = activeSession, isReadyForStreamer(active) else { return }
+        sessionPollTask?.cancel()
+        sessionPollTask = nil
+        sessionPollGeneration = UUID()
+        endSessionPollBackgroundTask()
         launchTask?.cancel()
+        isLaunchingSession = true
+        lastError = nil
+        sessionError = nil
         launchTask = Task { await self.reopenCurrentSession(active) }
     }
 
@@ -9111,7 +9117,7 @@ final class OpenNOWStore: ObservableObject {
         candidate.status == 1 || candidate.status == 2 || candidate.status == 3
     }
 
-    private func startSessionTasks() {
+    private func startSessionTasks(autoConnect: Bool = true) {
         recordDebugEvent("queue", "Starting session poll status=\(activeSession?.status ?? -1) queue=\(activeSession?.queuePosition ?? -1)")
         setStreamSession(nil, reason: "startSessionTasks.reset")
         if activeSession != nil, activeStreamSettings == nil {
@@ -9129,8 +9135,16 @@ final class OpenNOWStore: ObservableObject {
         // derived from `activeSession.startedAt` on demand instead, and the surfaces that show it
         // ticking use `Text(_:style: .timer)`, which the system animates locally.
 
+        let pollGeneration = UUID()
+        sessionPollGeneration = pollGeneration
         sessionPollTask = Task { [weak self] in
             guard let self else { return }
+            defer {
+                if self.sessionPollGeneration == pollGeneration {
+                    self.sessionPollTask = nil
+                    self.endSessionPollBackgroundTask()
+                }
+            }
             let generation = self.authGeneration
             var previousStatus = self.activeSession?.status
             var consecutivePollFailures = 0
@@ -9206,6 +9220,14 @@ final class OpenNOWStore: ObservableObject {
                             self.syncTrackedSessionSurface()
                             self.sessionPollTask?.cancel()
                             continue
+                        }
+                        // A restored allocation stays on the return banner until the user
+                        // asks to connect. Polling must not race that tap with its own RESUME.
+                        guard autoConnect else {
+                            self.showStreamLoading = false
+                            self.queueOverlayVisible = false
+                            self.syncTrackedSessionSurface()
+                            break
                         }
                         let handoffSession = try await self.prepareSessionForStreamer(polled)
                         self.logger.notice(
@@ -9293,7 +9315,6 @@ final class OpenNOWStore: ObservableObject {
                 }
                 try? await Task.sleep(for: .seconds(2))
             }
-            self.endSessionPollBackgroundTask()
         }
     }
 
@@ -9396,152 +9417,59 @@ final class OpenNOWStore: ObservableObject {
     }
 
     private func reopenCurrentSession(_ session: ActiveSession) async {
+        defer { isLaunchingSession = false }
         guard let currentAuth = authSession else {
             lastError = "Sign in first."
+            sessionError = lastError
             return
         }
-        let retainedSessionID = activeStreamSettings == nil ? nil : session.id
-
+        let generation = authGeneration
+        let requestedSettings = currentStreamerSettings
         do {
             let refreshed = try await api.refreshSession(currentAuth)
+            try Task.checkCancellation()
+            guard generation == authGeneration, activeSession?.id == session.id else { throw CancellationError() }
             authSession = refreshed
             persistAuthSession(refreshed)
-            let requestedStreamSettings = currentStreamerSettings
-            let deviceId = persistentDeviceId()
-            let baseUrl = refreshed.provider.streamingServiceUrl
-            let activeCandidates = try await api.fetchActiveSessions(
-                session: refreshed,
-                streamingBaseUrl: baseUrl,
-                vpcId: cachedVpcId,
-                settings: requestedStreamSettings,
-                deviceId: deviceId
-            )
-            let compatibleCandidates = activeCandidates.filter {
-                remoteSession($0, matchesStreamSettings: requestedStreamSettings, session: refreshed)
-            }
-            let gameAppIds = Set(
-                ([session.game.launchAppId] + session.game.launchOptions.map(\.appId))
-                    .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-                    .filter { !$0.isEmpty }
-            )
-            let sameGameCandidates = activeCandidates.filter { candidate in
-                guard remoteSessionIsLaunchable(candidate) else { return false }
-                if candidate.id == session.id { return true }
-                guard let appId = candidate.appId else { return false }
-                return gameAppIds.contains(appId)
-            }
-            let candidatePool = compatibleCandidates + sameGameCandidates.filter { candidate in
-                !compatibleCandidates.contains(where: { $0.id == candidate.id })
-            }
-            let readyCandidate = candidatePool.first {
-                $0.id == session.id && ($0.status == 2 || $0.status == 3) && $0.serverIp?.isEmpty == false
-            } ?? candidatePool.first {
-                guard let appId = $0.appId else { return false }
-                return gameAppIds.contains(appId) && ($0.status == 2 || $0.status == 3) && $0.serverIp?.isEmpty == false
-            }
-            let launchingCandidate = candidatePool.first {
-                $0.id == session.id && remoteSessionIsLaunchable($0)
-            } ?? candidatePool.first {
-                guard let appId = $0.appId else { return false }
-                return gameAppIds.contains(appId) && remoteSessionIsLaunchable($0)
-            }
-
-            let candidate: RemoteSessionCandidate
-            if let readyCandidate {
-                candidate = readyCandidate
-            } else if let launchingCandidate {
-                let pollingSettings = streamSettingsForResuming(
-                    launchingCandidate,
-                    base: requestedStreamSettings,
-                    session: refreshed,
-                    retainedSessionID: retainedSessionID
-                )
-                var latest = ActiveSession(
-                    id: launchingCandidate.id,
-                    game: session.game,
-                    startedAt: .now,
-                    status: launchingCandidate.status,
-                    queuePosition: nil,
-                    seatSetupStep: nil,
-                    serverIp: launchingCandidate.serverIp,
-                    mediaIp: nil,
-                    mediaPort: 0,
-                    signalingServer: nil,
-                    signalingUrl: nil,
-                    iceServers: [],
-                    zone: cachedVpcId,
-                    streamingBaseUrl: baseUrl,
-                    clientId: UUID().uuidString,
-                    deviceId: deviceId,
-                    adState: nil
-                )
-                activeSession = latest
-                for attempt in 0..<45 {
-                    if isReadyForStreamer(latest) {
-                        break
-                    }
-                    logger.info(
-                        "Reopen polling active candidate id=\(latest.id, privacy: .public) status=\(latest.status) attempt=\(attempt + 1) signalingServer=\(latest.signalingServer ?? "nil", privacy: .public) signalingUrl=\(latest.signalingUrl ?? "nil", privacy: .public) mediaIp=\(latest.mediaIp ?? "nil", privacy: .public) mediaPort=\(latest.mediaPort)"
-                    )
-                    try await Task.sleep(for: .seconds(1))
-                    latest = try await api.pollSession(session: refreshed, activeSession: latest, settings: pollingSettings)
-                    activeSession = mergeQueueSessionState(previous: activeSession ?? latest, next: latest)
-                }
-                guard isReadyForStreamer(latest), let serverIp = latest.serverIp, !serverIp.isEmpty else {
-                    activeSession = latest
-                    lastError = "Session is still preparing its stream endpoint. Try reopening again in a moment."
-                    sessionError = lastError
-                    return
-                }
-                candidate = RemoteSessionCandidate(
-                    id: latest.id,
-                    appId: launchingCandidate.appId,
-                    status: latest.status,
-                    serverIp: serverIp,
-                    streamSettingsSignature: launchingCandidate.streamSettingsSignature,
-                    resolution: launchingCandidate.resolution ?? latest.negotiatedStreamProfile?.resolution,
-                    fps: launchingCandidate.fps ?? latest.negotiatedStreamProfile?.fps
-                )
-            } else {
-                activeSession = nil
-                activeStreamSettings = nil
-                syncTrackedSessionSurface()
-                lastError = "No active session for this game is available to reconnect."
-                sessionError = lastError
-                return
-            }
-
-            let streamSettings = streamSettingsForResuming(
-                candidate,
-                base: requestedStreamSettings,
-                session: refreshed,
-                retainedSessionID: retainedSessionID
-            )
-
-            let claimed = try await api.claimSession(
-                session: refreshed,
-                candidate: candidate,
-                game: session.game,
-                streamingBaseUrl: baseUrl,
-                vpcId: cachedVpcId,
-                settings: streamSettings,
-                deviceId: deviceId,
-                touchProvisionedOverride: session.touchProvisioned
-            )
-            streamHandoff.didClaim(allocationID: claimed.id)
+            // The allocation's own details are authoritative. A zone listing can be
+            // temporarily empty during hand-over; that must not discard the saved seat.
+            let claimed = try await streamHandoff.reconnect(session, refresh: { allocation in
+                try await api.pollSession(session: refreshed, activeSession: allocation, settings: requestedSettings)
+            }, claim: { allocation in
+                guard generation == authGeneration, activeSession?.id == session.id else { throw CancellationError() }
+                let candidate = RemoteSessionCandidate(id: allocation.id,
+                    appId: allocation.game.launchAppId, status: allocation.status,
+                    serverIp: allocation.serverIp, streamSettingsSignature: nil,
+                    resolution: allocation.negotiatedStreamProfile?.resolution,
+                    fps: allocation.negotiatedStreamProfile?.fps)
+                return try await api.claimSession(session: refreshed, candidate: candidate,
+                    game: allocation.game, streamingBaseUrl: allocation.streamingBaseUrl,
+                    vpcId: allocation.zone, settings: requestedSettings,
+                    deviceId: persistentDeviceId(), touchProvisionedOverride: allocation.touchProvisioned)
+            })
+            try Task.checkCancellation()
+            guard generation == authGeneration, activeSession?.id == session.id else { throw CancellationError() }
             activeSession = claimed
-            activeStreamSettings = streamSettings
-            setStreamSession(claimed, reason: "reopenStreamer.claimed")
+            activeStreamSettings = requestedSettings
             lastError = nil
             sessionError = nil
+            if isReadyForStreamer(claimed) {
+                showStreamLoading = false
+                queueOverlayVisible = false
+                setStreamSession(claimed, reason: "reopenStreamer.claimed")
+            } else {
+                showStreamLoading = true
+                queueOverlayVisible = true
+                startSessionTasks()
+            }
         } catch where OpenNOWErrorPresenter.isCancellation(error) {
             return
         } catch {
-            logger.error(
-                "Reopen refresh failed id=\(session.id, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
-            )
+            guard generation == authGeneration, activeSession?.id == session.id else { return }
+            logger.error("Reopen refresh failed id=\(session.id, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
             lastError = "Failed to reconnect session: \(error.localizedDescription)"
             sessionError = lastError
+            syncTrackedSessionSurface()
         }
     }
 
@@ -9665,7 +9593,7 @@ final class OpenNOWStore: ObservableObject {
         }
         showStreamLoading = true
         queueOverlayVisible = false
-        startSessionTasks()
+        startSessionTasks(autoConnect: false)
         syncTrackedSessionSurface()
     }
 

@@ -887,6 +887,8 @@ private struct JumpBackStatusBanner: View {
     }
 
     private var subtitle: String {
+        if store.isLaunchingSession { return "Connecting…" }
+        if let error = store.sessionError { return error }
         if let session = store.activeSession {
             return subtitle(for: session.status, queuePosition: session.queuePosition)
         }
@@ -927,7 +929,8 @@ private struct JumpBackStatusBanner: View {
                             .lineLimit(1)
                         Text(subtitle)
                             .font(.caption2)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(store.sessionError == nil ? Color.secondary : Color.red)
+                            .lineLimit(2)
                     }
                     Spacer(minLength: 0)
                     Image(systemName: "chevron.up")
@@ -938,6 +941,7 @@ private struct JumpBackStatusBanner: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .disabled(store.isLaunchingSession)
 
             if store.activeSession != nil {
                 Button(role: .destructive) {

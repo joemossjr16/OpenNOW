@@ -5,6 +5,7 @@ import Foundation
 @MainActor
 final class NativeStreamSessionHandoff {
     private var restoredAllocationID: String?
+    private var reconnectingAllocations: Set<String> = []
 
     func restore(allocationID: String?) { restoredAllocationID = allocationID }
 
@@ -19,7 +20,24 @@ final class NativeStreamSessionHandoff {
     ) async throws -> ActiveSession {
         guard usesNativeNVST, restoredAllocationID == allocation.id,
               allocation.status == 2 || allocation.status == 3 else { return allocation }
-        let claimed = try await claim(allocation)
+        return try await reconnect(allocation, refresh: { $0 }, claim: claim)
+    }
+
+    func reconnect(
+        _ allocation: ActiveSession,
+        refresh: (ActiveSession) async throws -> ActiveSession,
+        claim: (ActiveSession) async throws -> ActiveSession
+    ) async throws -> ActiveSession {
+        guard reconnectingAllocations.insert(allocation.id).inserted else {
+            throw NSError(domain: "OpenNOW.Session", code: 409, userInfo: [
+                NSLocalizedDescriptionKey: "A reconnect is already in progress for this session."
+            ])
+        }
+        defer { reconnectingAllocations.remove(allocation.id) }
+        let refreshed = try await refresh(allocation)
+        try Task.checkCancellation()
+        guard refreshed.id == allocation.id else { throw CancellationError() }
+        let claimed = try await claim(refreshed)
         try Task.checkCancellation()
         guard claimed.id == allocation.id else {
             throw NSError(domain: "OpenNOW.Session", code: 0, userInfo: [

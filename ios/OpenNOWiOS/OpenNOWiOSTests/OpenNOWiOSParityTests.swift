@@ -1701,6 +1701,91 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(claims, 0)
     }
 
+    @MainActor
+    func testReconnectRejectsOverlappingClaimWhileRefreshingSavedAllocation() async throws {
+        let handoff = NativeStreamSessionHandoff()
+        var allocation = queueFixture(); allocation.status = 2
+        let entered = expectation(description: "Allocation details request is in flight")
+        var resume: CheckedContinuation<ActiveSession, Never>?
+        var claims = 0
+        let first = Task {
+            try await handoff.reconnect(allocation, refresh: { saved in
+                XCTAssertEqual(saved.id, allocation.id)
+                return await withCheckedContinuation { continuation in
+                    resume = continuation
+                    entered.fulfill()
+                }
+            }, claim: { fresh in
+                claims += 1
+                XCTAssertEqual(fresh.nativeRtspsEndpoints, ["rtsps://current.example:322"])
+                return fresh
+            })
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        do {
+            _ = try await handoff.reconnect(allocation, refresh: { $0 }, claim: { fresh in
+                claims += 1
+                return fresh
+            })
+            XCTFail("A banner tap must not run a second claim during restore")
+        } catch { XCTAssertEqual((error as NSError).code, 409) }
+        var updated = allocation; updated.nativeRtspsEndpoints = ["rtsps://current.example:322"]
+        resume?.resume(returning: updated)
+        let ready = try await first.value
+        XCTAssertEqual(ready.id, allocation.id)
+        XCTAssertEqual(claims, 1)
+    }
+
+    @MainActor
+    func testReconnectDetailsFailureKeepsSavedAllocationRetryable() async throws {
+        let handoff = NativeStreamSessionHandoff()
+        var allocation = queueFixture(); allocation.status = 3
+        handoff.restore(allocationID: allocation.id)
+        var claims = 0
+        do {
+            _ = try await handoff.reconnect(allocation, refresh: { _ in
+                throw NSError(domain: "OpenNOW.Session", code: 503)
+            }, claim: { fresh in
+                claims += 1
+                return fresh
+            })
+            XCTFail("Unavailable allocation details must not launch a stale endpoint")
+        } catch { XCTAssertEqual((error as NSError).code, 503) }
+        let ready = try await handoff.reconnect(allocation, refresh: { $0 }, claim: { fresh in
+            claims += 1
+            return fresh
+        })
+        XCTAssertEqual(ready.id, allocation.id)
+        XCTAssertEqual(claims, 1)
+    }
+
+    @MainActor
+    func testCancelledReconnectCannotClaimAfterDelayedDetailsReturn() async throws {
+        let handoff = NativeStreamSessionHandoff()
+        var allocation = queueFixture(); allocation.status = 3
+        let entered = expectation(description: "Details refresh started")
+        var resume: CheckedContinuation<ActiveSession, Never>?
+        var claims = 0
+        let cancelled = Task {
+            try await handoff.reconnect(allocation, refresh: { _ in
+                await withCheckedContinuation { continuation in
+                    resume = continuation
+                    entered.fulfill()
+                }
+            }, claim: { fresh in claims += 1; return fresh })
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        cancelled.cancel()
+        resume?.resume(returning: allocation)
+        do {
+            _ = try await cancelled.value
+            XCTFail("Cancelled reconnect must not claim or present a stream")
+        } catch { XCTAssertTrue(OpenNOWErrorPresenter.isCancellation(error)) }
+        XCTAssertEqual(claims, 0)
+        _ = try await handoff.reconnect(allocation, refresh: { $0 }, claim: { fresh in claims += 1; return fresh })
+        XCTAssertEqual(claims, 1, "Cancellation must release the reconnect gate for retry")
+    }
+
     func testClaimChecksProviderResultEvenWhenHTTPIsSuccessful() throws {
         XCTAssertNoThrow(try CloudMatchClaimResponse.validate(
             ["requestStatus": ["statusCode": 1]], httpStatus: 200))
