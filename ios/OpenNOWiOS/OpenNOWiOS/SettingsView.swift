@@ -857,6 +857,8 @@ struct SettingsView: View {
                     }
                 }
                 if store.settings.touch.controllerPreset.supportsControlModeSelection && store.settings.touch.controlMode == .splitTouchpad {
+                    Text("Drag the left half to move and the right half to look.")
+                        .font(.caption).foregroundStyle(.secondary)
                     settingsSlider(
                         "Touchpad Sensitivity",
                         value: $store.settings.touch.touchpadSensitivity,

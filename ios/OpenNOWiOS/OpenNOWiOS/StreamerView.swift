@@ -652,23 +652,7 @@ struct StreamerView: View {
                         .allowsHitTesting(true)
                 }
 
-                if coordinator.shouldShowVirtualController {
-                    NativeStreamVirtualControllerOverlay(
-                        inputBridge: coordinator.inputBridge,
-                        layout: coordinator.touchLayout,
-                        touchSettings: coordinator.liveSettings.touch,
-                        editing: coordinator.touchLayoutEditing,
-                        inputEnabled: coordinator.virtualControllerInputEnabled,
-                        onPositionChange: coordinator.setTouchLayoutPosition,
-                        onHide: { coordinator.setTouchControllerVisible(false) },
-                        onOpenHub: coordinator.toggleControlsPanel,
-                        onReset: coordinator.resetTouchLayout,
-                        onDoneEditing: coordinator.endTouchLayoutEditing
-                    )
-                    .padding(.horizontal, max(12, proxy.safeAreaInsets.leading + 12))
-                    .padding(.bottom, max(10, proxy.safeAreaInsets.bottom + 8))
-                    .transition(.opacity)
-                }
+                NativeStreamTouchControlsLayer(coordinator: coordinator)
 
                 VStack {
                     // Three stats positions, so the HUD can be moved off whichever corner the
@@ -1997,6 +1981,7 @@ private struct NativeStreamControlsPanel: View {
                     }
                 }
                 if coordinator.liveSettings.touch.controllerPreset.supportsControlModeSelection && coordinator.liveSettings.touch.controlMode == .splitTouchpad {
+                    NativeStreamInfoRow(title: "How to use", value: "Drag the left half to move and the right half to look.")
                     NativeStreamSliderRow(
                         title: "Touchpad sensitivity",
                         value: Binding(
@@ -2639,6 +2624,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     }
     @Published var controllerHUDInput: NativeStreamControllerHUDInput?
     @Published fileprivate var touchLayoutEditing = false
+    @Published private var touchControlsRestoreAvailable = false
     @Published fileprivate var statsDisplayStyle: StreamStatsStyle = .compact
     @Published fileprivate var statsMetrics: StreamStatsMetrics = .default
     /// A live copy of app settings the panel can edit mid-session. Persisted through
@@ -3149,6 +3135,12 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
             (!physicalControllerConnected || showTouchControlsWithPhysicalController || touchLayoutEditing)
     }
 
+    var shouldShowTouchControlsVisibilityButton: Bool {
+        guard !touchLayoutEditing else { return false }
+        return (shouldShowVirtualController && liveSettings.touch.controllerPreset == .standard)
+            || (touchControlsRestoreAvailable && !streamerPreferences.touchControllerVisible)
+    }
+
     var virtualControllerInputEnabled: Bool {
         streamerPreferences.touchControllerVisible &&
             (!physicalControllerConnected || showTouchControlsWithPhysicalController) &&
@@ -3469,7 +3461,10 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
     }
 
     func setTouchControllerVisible(_ visible: Bool) {
-        if !visible {
+        if visible {
+            touchControlsRestoreAvailable = false
+        } else {
+            if streamerPreferences.touchControllerVisible { touchControlsRestoreAvailable = true }
             touchLayoutEditing = false
         }
         var preferences = streamerPreferences
@@ -6741,13 +6736,60 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     }
 }
 
+/// Keeps the visibility button outside the controller overlay so hiding the gamepad
+/// never removes the control needed to show it again, including in immersive mode.
+struct NativeStreamTouchControlsLayer: View {
+    @ObservedObject var coordinator: NativeStreamCoordinator
+
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack {
+                if coordinator.shouldShowVirtualController {
+                    NativeStreamVirtualControllerOverlay(
+                        inputBridge: coordinator.inputBridge,
+                        layout: coordinator.touchLayout,
+                        touchSettings: coordinator.liveSettings.touch,
+                        editing: coordinator.touchLayoutEditing,
+                        inputEnabled: coordinator.virtualControllerInputEnabled,
+                        onPositionChange: coordinator.setTouchLayoutPosition,
+                        onOpenHub: coordinator.toggleControlsPanel,
+                        onReset: coordinator.resetTouchLayout,
+                        onDoneEditing: coordinator.endTouchLayoutEditing
+                    )
+                    .padding(.horizontal, max(12, proxy.safeAreaInsets.leading + 12))
+                    .padding(.bottom, max(10, proxy.safeAreaInsets.bottom + 8))
+                    .transition(.opacity)
+                }
+
+                if coordinator.shouldShowTouchControlsVisibilityButton {
+                    Button {
+                        coordinator.setTouchControllerVisible(!coordinator.streamerPreferences.touchControllerVisible)
+                    } label: {
+                        Label(coordinator.streamerPreferences.touchControllerVisible ? "Hide controls" : "Show controls",
+                            systemImage: coordinator.streamerPreferences.touchControllerVisible ? "eye.slash" : "eye")
+                            .font(.caption.weight(.semibold))
+                            .padding(.horizontal, 12)
+                            .frame(minHeight: 44)
+                            .background(.ultraThinMaterial, in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.white)
+                    .accessibilityIdentifier("touch-controls-visibility")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                    .padding(.bottom, max(8, proxy.safeAreaInsets.bottom + 4))
+                }
+            }
+            .frame(width: proxy.size.width, height: proxy.size.height)
+        }
+    }
+}
+
 private enum NativeStreamTouchControlGroup: String, CaseIterable {
     case topLeft
     case topCenter
     case topRight
     case leftStick
     case rightCluster
-    case bottomCenter
 
     var label: String {
         switch self {
@@ -6756,8 +6798,6 @@ private enum NativeStreamTouchControlGroup: String, CaseIterable {
         case .topRight: return "Right shoulder buttons"
         case .leftStick: return "Left stick and directional pad"
         case .rightCluster: return "Right stick and face buttons"
-        case .bottomCenter: return "Hide controls button"
-
         }
     }
 }
@@ -6770,7 +6810,6 @@ private struct NativeStreamVirtualControllerOverlay: View {
     let editing: Bool
     let inputEnabled: Bool
     let onPositionChange: (String, TouchControlPoint) -> Void
-    let onHide: () -> Void
     let onOpenHub: () -> Void
     let onReset: () -> Void
     let onDoneEditing: () -> Void
@@ -6803,153 +6842,123 @@ private struct NativeStreamVirtualControllerOverlay: View {
                             .zIndex(100)
                     }
                 } else {
-                controlGroup(
-                    .topLeft,
-                    point: layout.topLeft,
-                    containerSize: proxy.size,
-                    safeAreaInsets: proxy.safeAreaInsets
-                ) {
-                    HStack(spacing: 8) {
-                        NativeStreamVirtualHoldButton(
-                            label: "L1",
-                            size: buttonSize,
-                            pressed: { inputBridge.setVirtualButton(.leftShoulder, pressed: $0) }
-                        )
-                        NativeStreamVirtualHoldButton(
-                            label: "L2",
-                            size: buttonSize,
-                            pressed: { inputBridge.setVirtualTrigger(.left, value: $0 ? 1 : 0) }
-                        )
-                    }
-                }
-
-                controlGroup(
-                    .topCenter,
-                    point: layout.topCenter,
-                    containerSize: proxy.size,
-                    safeAreaInsets: proxy.safeAreaInsets
-                ) {
-                    HStack(spacing: 8) {
-                        NativeStreamVirtualHoldButton(
-                            label: "View",
-                            systemImage: "rectangle.on.rectangle",
-                            size: buttonSize,
-                            pressed: { inputBridge.setVirtualButton(.options, pressed: $0) }
-                        )
-                        NativeStreamVirtualHoldButton(
-                            label: "Menu",
-                            systemImage: "line.3.horizontal",
-                            size: buttonSize,
-                            pressed: { inputBridge.setVirtualButton(.menu, pressed: $0) }
-                        )
-                    }
-                }
-
-                controlGroup(
-                    .topRight,
-                    point: layout.topRight,
-                    containerSize: proxy.size,
-                    safeAreaInsets: proxy.safeAreaInsets
-                ) {
-                    HStack(spacing: 8) {
-                        NativeStreamVirtualHoldButton(
-                            label: "R2",
-                            size: buttonSize,
-                            pressed: { inputBridge.setVirtualTrigger(.right, value: $0 ? 1 : 0) }
-                        )
-                        NativeStreamVirtualHoldButton(
-                            label: "R1",
-                            size: buttonSize,
-                            pressed: { inputBridge.setVirtualButton(.rightShoulder, pressed: $0) }
-                        )
-                    }
-                }
-
-                controlGroup(
-                    .leftStick,
-                    point: layout.leftStick,
-                    containerSize: proxy.size,
-                    safeAreaInsets: proxy.safeAreaInsets
-                ) {
-                    HStack(alignment: .bottom, spacing: compact ? 5 : 10) {
-                        if touchSettings.controlMode == .virtualSticks {
-                            NativeStreamVirtualStickView(
-                                label: "L",
-                                size: stickSize,
-                                deadZone: touchSettings.joystickDeadZone,
-                                followsFinger: touchSettings.joystickMode == .dynamic,
-                                outlineStyle: touchSettings.style == .outline,
-                                changed: { x, y in inputBridge.setVirtualStick(.left, x: x, y: y) },
-                                pressed: { inputBridge.setVirtualButton(.leftStick, pressed: $0) }
+                    controlGroup(
+                        .topLeft,
+                        point: layout.topLeft,
+                        containerSize: proxy.size,
+                        safeAreaInsets: proxy.safeAreaInsets
+                    ) {
+                        HStack(spacing: 8) {
+                            NativeStreamVirtualHoldButton(
+                                label: "L1",
+                                size: buttonSize,
+                                pressed: { inputBridge.setVirtualButton(.leftShoulder, pressed: $0) }
                             )
-                        } else {
-                            Text("MOVE")
-                                .font(.caption2.bold())
-                                .padding(.horizontal, 8).padding(.vertical, 5)
-                                .background(.black.opacity(0.35), in: Capsule())
-                                .foregroundStyle(.white.opacity(0.75))
-                                .allowsHitTesting(false)
-                        }
-                        NativeStreamVirtualDPad(size: buttonSize * 0.72, inputBridge: inputBridge)
-                    }
-                }
-
-                controlGroup(
-                    .rightCluster,
-                    point: layout.rightCluster,
-                    containerSize: proxy.size,
-                    safeAreaInsets: proxy.safeAreaInsets
-                ) {
-                    HStack(alignment: .bottom, spacing: compact ? 5 : 10) {
-                        if touchSettings.controlMode == .virtualSticks {
-                            NativeStreamVirtualStickView(
-                                label: "R",
-                                size: stickSize,
-                                deadZone: touchSettings.joystickDeadZone,
-                                followsFinger: touchSettings.joystickMode == .dynamic,
-                                outlineStyle: touchSettings.style == .outline,
-                                changed: { x, y in inputBridge.setVirtualStick(.right, x: x, y: y) },
-                                pressed: { inputBridge.setVirtualButton(.rightStick, pressed: $0) }
+                            NativeStreamVirtualHoldButton(
+                                label: "L2",
+                                size: buttonSize,
+                                pressed: { inputBridge.setVirtualTrigger(.left, value: $0 ? 1 : 0) }
                             )
-                        } else {
-                            Text("LOOK")
-                                .font(.caption2.bold())
-                                .padding(.horizontal, 8).padding(.vertical, 5)
-                                .background(.black.opacity(0.35), in: Capsule())
-                                .foregroundStyle(.white.opacity(0.75))
-                                .allowsHitTesting(false)
                         }
-                        NativeStreamVirtualFaceButtons(size: buttonSize, inputBridge: inputBridge)
                     }
-                }
 
-                controlGroup(
-                    .bottomCenter,
-                    point: layout.bottomCenter,
-                    containerSize: proxy.size,
-                    safeAreaInsets: proxy.safeAreaInsets
-                ) {
-                    Button(action: onHide) {
-                        Label("Hide controls", systemImage: "eye.slash")
-                            .font(.caption.weight(.semibold))
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 8)
+                    controlGroup(
+                        .topCenter,
+                        point: layout.topCenter,
+                        containerSize: proxy.size,
+                        safeAreaInsets: proxy.safeAreaInsets
+                    ) {
+                        HStack(spacing: 8) {
+                            NativeStreamVirtualHoldButton(
+                                label: "View",
+                                systemImage: "rectangle.on.rectangle",
+                                size: buttonSize,
+                                pressed: { inputBridge.setVirtualButton(.options, pressed: $0) }
+                            )
+                            NativeStreamVirtualHoldButton(
+                                label: "Menu",
+                                systemImage: "line.3.horizontal",
+                                size: buttonSize,
+                                pressed: { inputBridge.setVirtualButton(.menu, pressed: $0) }
+                            )
+                        }
                     }
-                    .buttonStyle(.bordered)
-                    .tint(.white)
-                }
 
-                if editing {
-                    NativeStreamTouchLayoutEditorToolbar(
-                        onReset: onReset,
-                        onDone: onDoneEditing
-                    )
-                    .frame(maxWidth: min(max(proxy.size.width - 24, 1), 430))
-                    .position(x: proxy.size.width / 2, y: proxy.size.height * 0.48)
-                    .zIndex(100)
+                    controlGroup(
+                        .topRight,
+                        point: layout.topRight,
+                        containerSize: proxy.size,
+                        safeAreaInsets: proxy.safeAreaInsets
+                    ) {
+                        HStack(spacing: 8) {
+                            NativeStreamVirtualHoldButton(
+                                label: "R2",
+                                size: buttonSize,
+                                pressed: { inputBridge.setVirtualTrigger(.right, value: $0 ? 1 : 0) }
+                            )
+                            NativeStreamVirtualHoldButton(
+                                label: "R1",
+                                size: buttonSize,
+                                pressed: { inputBridge.setVirtualButton(.rightShoulder, pressed: $0) }
+                            )
+                        }
+                    }
+
+                    controlGroup(
+                        .leftStick,
+                        point: layout.leftStick,
+                        containerSize: proxy.size,
+                        safeAreaInsets: proxy.safeAreaInsets
+                    ) {
+                        HStack(alignment: .bottom, spacing: compact ? 5 : 10) {
+                            if touchSettings.controlMode == .virtualSticks {
+                                NativeStreamVirtualStickView(
+                                    label: "L",
+                                    size: stickSize,
+                                    deadZone: touchSettings.joystickDeadZone,
+                                    followsFinger: touchSettings.joystickMode == .dynamic,
+                                    outlineStyle: touchSettings.style == .outline,
+                                    changed: { x, y in inputBridge.setVirtualStick(.left, x: x, y: y) },
+                                    pressed: { inputBridge.setVirtualButton(.leftStick, pressed: $0) }
+                                )
+                            }
+                            NativeStreamVirtualDPad(size: buttonSize * 0.72, inputBridge: inputBridge)
+                        }
+                    }
+
+                    controlGroup(
+                        .rightCluster,
+                        point: layout.rightCluster,
+                        containerSize: proxy.size,
+                        safeAreaInsets: proxy.safeAreaInsets
+                    ) {
+                        HStack(alignment: .bottom, spacing: compact ? 5 : 10) {
+                            if touchSettings.controlMode == .virtualSticks {
+                                NativeStreamVirtualStickView(
+                                    label: "R",
+                                    size: stickSize,
+                                    deadZone: touchSettings.joystickDeadZone,
+                                    followsFinger: touchSettings.joystickMode == .dynamic,
+                                    outlineStyle: touchSettings.style == .outline,
+                                    changed: { x, y in inputBridge.setVirtualStick(.right, x: x, y: y) },
+                                    pressed: { inputBridge.setVirtualButton(.rightStick, pressed: $0) }
+                                )
+                            }
+                            NativeStreamVirtualFaceButtons(size: buttonSize, inputBridge: inputBridge)
+                        }
+                    }
+
+                    if editing {
+                        NativeStreamTouchLayoutEditorToolbar(
+                            onReset: onReset,
+                            onDone: onDoneEditing
+                        )
+                        .frame(maxWidth: min(max(proxy.size.width - 24, 1), 430))
+                        .position(x: proxy.size.width / 2, y: proxy.size.height * 0.48)
+                        .zIndex(100)
                     }
                 }
-                }
+            }
         }
         .onAppear { inputBridge.setVirtualControllerEnabled(inputEnabled) }
         .onChangeCompat(of: inputEnabled) { inputBridge.setVirtualControllerEnabled($0) }
@@ -7191,7 +7200,7 @@ private struct NativeStreamVirtualDPad: View {
             }
             GridRow {
                 directionButton("chevron.left", .dpadLeft)
-                Color.white.opacity(0.13).frame(width: size, height: size)
+                Color.clear.frame(width: size, height: size)
                 directionButton("chevron.right", .dpadRight)
             }
             GridRow {
@@ -7200,7 +7209,6 @@ private struct NativeStreamVirtualDPad: View {
                 Color.clear.frame(width: size, height: size)
             }
         }
-        .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Directional pad")
     }

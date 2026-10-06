@@ -3219,6 +3219,53 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(result.1, -0.04, accuracy: 0.0001)
     }
 
+    @MainActor
+    func testSplitTouchControlsCanHideAndRestoreWithoutOpeningHUD() async throws {
+        var settings = AppSettings.default
+        settings.touch.controlMode = .splitTouchpad
+        settings.hideStreamButtons = true
+        settings.streamTutorialCompleted = true
+        settings.streamerPreferences.touchControllerVisible = true
+        var saved: [Bool] = []
+        let coordinator = makeTouchControlsCoordinator(settings: settings) {
+            saved.append($0.touchControllerVisible)
+        }
+        XCTAssertTrue(coordinator.shouldShowVirtualController)
+        XCTAssertTrue(coordinator.shouldShowTouchControlsVisibilityButton)
+        for _ in 0..<3 {
+            coordinator.setTouchControllerVisible(false)
+            XCTAssertFalse(coordinator.shouldShowVirtualController)
+            XCTAssertFalse(coordinator.virtualControllerInputEnabled)
+            XCTAssertTrue(coordinator.shouldShowTouchControlsVisibilityButton, "Hiding must leave a Show controls button")
+            coordinator.setTouchControllerVisible(false)
+            XCTAssertTrue(coordinator.shouldShowTouchControlsVisibilityButton, "Repeated hide requests must retain the restore path")
+            coordinator.setTouchControllerVisible(true)
+            XCTAssertTrue(coordinator.shouldShowVirtualController)
+            XCTAssertTrue(coordinator.virtualControllerInputEnabled)
+            XCTAssertTrue(coordinator.shouldShowTouchControlsVisibilityButton)
+            XCTAssertFalse(coordinator.controlsPanelVisible, "Restoring must not require opening the stream HUD")
+        }
+        XCTAssertEqual(saved, [false, false, true, false, false, true, false, false, true])
+        settings.streamerPreferences.touchControllerVisible = false
+        let initiallyHidden = makeTouchControlsCoordinator(settings: settings)
+        XCTAssertFalse(initiallyHidden.shouldShowTouchControlsVisibilityButton, "Do not add a button when the controller was disabled before the stream")
+    }
+
+    @MainActor
+    private func makeTouchControlsCoordinator(settings: AppSettings,
+        onPreferencesChange: @escaping (StreamerPreferences) -> Void = { _ in }) -> NativeStreamCoordinator {
+        NativeStreamCoordinator(
+            session: Self.makeActiveSession(game: Self.makeGame(title: "Touch controls", controls: []), status: 3),
+            settings: settings, membershipTier: "ULTIMATE", sessionHistory: nil,
+            onTouchLayoutChange: { _, _ in }, onStreamerPreferencesChange: onPreferencesChange,
+            onStreamSharpeningChange: { _, _ in }, onFingerMouseEnabledChange: { _ in },
+            onPhoneRumbleFallbackChange: { _ in }, onStreamTutorialCompleted: {},
+            onControllerTouchPromptDismissed: {}, onStatsOverlayChange: { _ in },
+            onTransportStable: {}, onSelectedVideoProfileRetry: { _ in }, onRuntimeSample: { _ in },
+            onSettingsChange: { _ in }, onBuildBugReportDeck: { BugReportPreflightDeck() },
+            onSubmitBugReport: { _, _ in .failure(BugReportError.invalid("Test")) }, onClose: {}, onRetry: nil)
+    }
+
     func testSplitTouchpadUsesLandingPointAndClampsAtFullTravel() {
         var result = TouchpadStickMath.vector(dx: 30, dy: 0, travel: 60, sensitivity: 1, deadZone: 0)
         XCTAssertEqual(result.0, 0.5, accuracy: 0.0001)
