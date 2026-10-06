@@ -7338,6 +7338,7 @@ struct NativeStreamVirtualHoldButton: View {
     let size: CGFloat
     var tint: Color = .white
     var width: CGFloat? = nil
+    var height: CGFloat? = nil
     var outlineStyle = false
     let pressed: (Bool) -> Void
 
@@ -7353,7 +7354,7 @@ struct NativeStreamVirtualHoldButton: View {
         }
         .font(outlineStyle ? .system(size: size * 0.25, weight: .medium) : .caption.weight(.bold))
         .foregroundStyle(tint)
-        .frame(width: width ?? size, height: size)
+        .frame(width: width ?? size, height: height ?? size)
         .background {
             Capsule().fill(outlineStyle ? AnyShapeStyle(Color.black.opacity(isPressed ? 0.35 : 0.12)) : AnyShapeStyle(.ultraThinMaterial))
         }
@@ -7751,6 +7752,7 @@ struct NativeStreamVirtualStickView: View {
     var followsFinger: Bool = false
     var outlineStyle: Bool = false
     var gripDots = false
+    var concentricRings = false
     let changed: (CGFloat, CGFloat) -> Void
     let pressed: (Bool) -> Void
 
@@ -7763,10 +7765,15 @@ struct NativeStreamVirtualStickView: View {
             Circle()
                 .fill(outlineStyle ? AnyShapeStyle(Color.black.opacity(0.18)) : AnyShapeStyle(.ultraThinMaterial))
                 .overlay(Circle().stroke(Color.white.opacity(outlineStyle ? 0.42 : 0.22), lineWidth: outlineStyle ? 1.5 : 1))
+            if concentricRings {
+                Circle()
+                    .stroke(Color.white.opacity(0.42), lineWidth: 1.5)
+                    .frame(width: size * 0.68, height: size * 0.68)
+            }
             Circle()
                 .fill(Color.white.opacity(gripDots ? 0.70 : outlineStyle ? 0.14 : 0.30))
                 .overlay(Circle().strokeBorder(Color.white.opacity(outlineStyle ? 0.55 : 0), lineWidth: 1.5))
-                .frame(width: size * 0.48, height: size * 0.48)
+                .frame(width: size * (concentricRings ? 0.40 : 0.48), height: size * (concentricRings ? 0.40 : 0.48))
                 .overlay {
                     if gripDots {
                         Image(systemName: "circle.grid.3x3.fill").font(.system(size: size * 0.15)).foregroundStyle(.black.opacity(0.45))

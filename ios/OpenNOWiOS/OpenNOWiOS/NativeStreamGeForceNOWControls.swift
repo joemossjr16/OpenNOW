@@ -119,14 +119,15 @@ struct NativeStreamGeForceNOWControls: View {
             NativeStreamVirtualStickView(
                 label: control == .leftStick ? "Left" : "Right", size: stickSize,
                 deadZone: settings.joystickDeadZone, followsFinger: settings.joystickMode == .dynamic,
-                outlineStyle: true, gripDots: true,
+                outlineStyle: true, gripDots: true, concentricRings: true,
                 changed: { x, y in inputBridge.setVirtualStick(control == .leftStick ? .left : .right, x: x, y: y) },
                 pressed: { _ in }
             )
         default:
             NativeStreamVirtualHoldButton(
                 label: control.label, systemImage: control.symbol, size: buttonSize,
-                width: control == .back || control == .start ? buttonSize * 1.15 : nil,
+                width: control == .back || control == .start ? buttonSize : nil,
+                height: control == .back || control == .start ? buttonSize * 0.5 : nil,
                 outlineStyle: true,
                 pressed: { pressed in
                     if control == .lt || control == .rt {
