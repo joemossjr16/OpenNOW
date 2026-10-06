@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		95DDF31E58CDEF17D4EA1762 /* RemoteSessionDiscovery.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5576A443FAC8D9F58E3931E6 /* RemoteSessionDiscovery.swift */; };
 		4A9F701B95F642B4B396FF48 /* StreamSessionsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 12734E3A4AF1481E9CA7E9E4; };
 		DC2C1BC3FB56423B96FF2C69 /* StreamSessionHistory.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6BEF4FE1193044C9B24243CB; };
 		8E278E5098934E5AB52375FC /* NativeStreamGeForceNOWControls.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A1DC3C28C7F44DC86ADCDC8; };
@@ -206,6 +207,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		5576A443FAC8D9F58E3931E6 /* RemoteSessionDiscovery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteSessionDiscovery.swift; sourceTree = "<group>"; };
 		12734E3A4AF1481E9CA7E9E4 /* StreamSessionsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamSessionsView.swift; sourceTree = "<group>"; };
 		6BEF4FE1193044C9B24243CB /* StreamSessionHistory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamSessionHistory.swift; sourceTree = "<group>"; };
 		5A1DC3C28C7F44DC86ADCDC8 /* NativeStreamGeForceNOWControls.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeStreamGeForceNOWControls.swift; sourceTree = "<group>"; };
@@ -410,6 +412,7 @@
 				C5AED86C88ABC9CF127D2EC2 /* NativeStreamPresentation.swift */,
 				D7EAAADE36D7168904D2F92F /* NVST/Licenses */,
 				B077A38C81C6BC6E59A0A997 /* NativeStreamNVSTConfiguration.swift */,
+				5576A443FAC8D9F58E3931E6 /* RemoteSessionDiscovery.swift */,
 				E8EB51AE2654616A0453827E /* NVST/BifrostFree/GeronimoInputProtocol.swift */,
 				D25073CC313C89A817BDDB42 /* NVST/BifrostFree/NvstAnnexB.swift */,
 				9E6FADCAF110F3487476F693 /* NVST/BifrostFree/NvstAudioSurroundInfo.swift */,
@@ -726,6 +729,7 @@
 				861B9542E73D0DA498B9AD7E /* NativeStreamPiP.swift in Sources */,
 				E162081677B89815538C5BE6 /* NativeStreamPresentation.swift in Sources */,
 				39C10CC1F62415F05F8FE3BC /* NativeStreamNVSTConfiguration.swift in Sources */,
+				95DDF31E58CDEF17D4EA1762 /* RemoteSessionDiscovery.swift in Sources */,
 				04937EADD6D6B625A79E37F9 /* NVST/BifrostFree/GeronimoInputProtocol.swift in Sources */,
 				CC8788EDE2AFD6C637BDA897 /* NVST/BifrostFree/NvstAnnexB.swift in Sources */,
 				E2D6635C23ABFEB1341C19DD /* NVST/BifrostFree/NvstAudioSurroundInfo.swift in Sources */,

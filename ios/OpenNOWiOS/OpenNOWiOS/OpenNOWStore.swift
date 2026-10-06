@@ -4743,11 +4743,8 @@ private actor GFNAPIClient {
             ),
             sessionSettings: settings
         )
-        guard response.statusCode == 200 else { return [] }
-        let json = try parseJSON(data)
-        let requestStatus = json["requestStatus"] as? [String: Any]
-        guard (requestStatus?["statusCode"] as? Int) == 1 else { return [] }
-        let sessions = json["sessions"] as? [[String: Any]] ?? []
+        let json = (try? parseJSON(data)) ?? [:]
+        let sessions = try CloudMatchActiveSessionsResponse.entries(json, httpStatus: response.statusCode)
         return sessions.compactMap { item in
             let status = item["status"] as? Int ?? 0
             guard status == 1 || status == 2 || status == 3 else { return nil }
@@ -6509,6 +6506,7 @@ final class OpenNOWStore: ObservableObject {
 
     private let api = GFNAPIClient()
     private let streamHandoff = NativeStreamSessionHandoff()
+    private let remoteSessionDiscovery = RemoteSessionDiscovery()
     private let logger = Logger(subsystem: "OpenNOWiOS", category: "Session")
     private var debugEvents: [DebugLifecycleEvent] = []
     private let defaults = UserDefaults.standard
@@ -7225,6 +7223,7 @@ final class OpenNOWStore: ObservableObject {
             self.backgroundRefreshingAccountUserId = nil
             self.accountRefreshTask = nil
         }
+        updateRemoteSessionDiscovery()
     }
 
     private func cancelAccountRefresh() {
@@ -7263,6 +7262,7 @@ final class OpenNOWStore: ObservableObject {
         catalogError = nil
         sessionError = nil
         lastFailure = nil
+        remoteSessionDiscovery.stop()
         syncTrackedSessionSurface()
     }
 
@@ -8035,10 +8035,14 @@ final class OpenNOWStore: ObservableObject {
         return result
     }
 
-    func refreshRemoteSessions() async {
+    func refreshRemoteSessions(reportFailure: Bool = true) async {
         guard let session = authSession else { return }
+        let userId = session.user.userId
+        let generation = authGeneration
         do {
             let refreshed = try await api.refreshSession(session)
+            try Task.checkCancellation()
+            guard accountIsCurrent(userId, generation: generation) else { return }
             authSession = refreshed
             persistAuthSession(refreshed)
             let streamSettings = nativeLaunchSettings(for: activeStreamSettings ?? settings, context: "refreshRemoteSessions")
@@ -8049,14 +8053,35 @@ final class OpenNOWStore: ObservableObject {
                 settings: streamSettings,
                 deviceId: persistentDeviceId()
             )
-            resumableSessions = remoteSessions.filter {
+            try Task.checkCancellation()
+            guard accountIsCurrent(userId, generation: generation) else { return }
+            let discovered = remoteSessions.filter {
                 remoteSessionIsLaunchable($0) && remoteSessionIsAllowed($0)
             }
+            if resumableSessions != discovered { resumableSessions = discovered }
             remoteSessionsSnapshotLoaded = true
+        } catch where OpenNOWErrorPresenter.isCancellation(error) {
+            return
         } catch {
+            guard accountIsCurrent(userId, generation: generation) else { return }
             remoteSessionsSnapshotLoaded = false
-            report(error, context: .session)
+            if reportFailure { report(error, context: .session) }
+            else { logger.warning("Remote session discovery failed: \(error.localizedDescription, privacy: .public)") }
         }
+    }
+
+    private func updateRemoteSessionDiscovery() {
+        guard currentScenePhase == .active, authSession != nil, streamSession == nil else {
+            remoteSessionDiscovery.stop()
+            return
+        }
+        remoteSessionDiscovery.start(canRefresh: { [weak self] in
+            guard let self else { return false }
+            return !self.isBootstrapping && !self.isLaunchingSession
+                && !self.queueOverlayVisible && !self.isLoadingGames && self.accountRefreshTask == nil
+        }, refresh: { [weak self] in
+            await self?.refreshRemoteSessions(reportFailure: false)
+        })
     }
 
     func endRemoteSession(candidate: RemoteSessionCandidate) async {
@@ -8659,6 +8684,7 @@ final class OpenNOWStore: ObservableObject {
             refreshSessionPollBackgroundTask()
         }
         syncTrackedSessionSurface()
+        updateRemoteSessionDiscovery()
     }
 
     func persistSettings() {
@@ -9751,6 +9777,7 @@ final class OpenNOWStore: ObservableObject {
             beginSessionReport(for: session)
         }
         syncTrackedSessionSurface()
+        updateRemoteSessionDiscovery()
     }
 
     #if os(tvOS)

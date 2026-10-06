@@ -1319,7 +1319,7 @@ final class OpenNOWiOSParityTests: XCTestCase {
         }
         let presenter = NativeStreamPresentationController(content: AnyView(
             Color.black.background(NativeStreamPresentationPreferences(
-                pointerCaptureRequested: true, statusBarHidden: true))))
+                pointerCaptureRequested: true))))
         window.rootViewController = presenter
         window.makeKeyAndVisible()
         defer { presenter.tearDown(); window.rootViewController = priorController }
@@ -1329,17 +1329,21 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertTrue(presenter.host.prefersStatusBarHidden)
         try await waitForStatusBar(hidden: true)
 
-        // Revealing controls updates the existing presented host, without dismissal.
+        // Revealing controls releases pointer lock but keeps the system bar hidden.
         presenter.host.rootView = AnyView(Color.black.background(NativeStreamPresentationPreferences(
-            pointerCaptureRequested: false, statusBarHidden: false)))
+            pointerCaptureRequested: false)))
         try await Task.sleep(nanoseconds: 300_000_000)
         XCTAssertTrue(presenter.presentedViewController === presenter.host)
         XCTAssertFalse(presenter.host.prefersPointerLocked)
-        XCTAssertFalse(presenter.host.prefersStatusBarHidden)
-        try await waitForStatusBar(hidden: false)
+        XCTAssertTrue(presenter.host.prefersStatusBarHidden)
+        try await waitForStatusBar(hidden: true)
 
         presenter.host.rootView = AnyView(Color.black.background(NativeStreamPresentationPreferences(
-            pointerCaptureRequested: true, statusBarHidden: true)))
+            pointerCaptureRequested: true)))
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertTrue(presenter.host.prefersStatusBarHidden)
+        try await waitForStatusBar(hidden: true)
+        presenter.host.rootView = AnyView(Color.black)
         try await Task.sleep(nanoseconds: 300_000_000)
         XCTAssertTrue(presenter.host.prefersStatusBarHidden)
         try await waitForStatusBar(hidden: true)
@@ -1699,6 +1703,65 @@ final class OpenNOWiOSParityTests: XCTestCase {
         handoff.didClaim(allocationID: allocation.id)
         _ = try await handoff.prepare(allocation, usesNativeNVST: true, claim: claim)
         XCTAssertEqual(claims, 0)
+    }
+
+    func testAccountSessionDiscoveryDistinguishesEmptySuccessFromListingFailure() throws {
+        let remote: [String: Any] = ["sessionId": "other-device", "status": 2,
+            "monitorSettings": [["widthInPixels": 2560, "heightInPixels": 1080, "framesPerSecond": 120]]]
+        let entries = try CloudMatchActiveSessionsResponse.entries(
+            ["requestStatus": ["statusCode": 1], "sessions": [remote]], httpStatus: 200)
+        XCTAssertEqual(entries.count, 1)
+        XCTAssertEqual(entries.first?["sessionId"] as? String, "other-device")
+        XCTAssertEqual(try CloudMatchActiveSessionsResponse.entries(
+            ["requestStatus": ["statusCode": 1], "sessions": []], httpStatus: 200).count, 0)
+        XCTAssertThrowsError(try CloudMatchActiveSessionsResponse.entries(
+            ["requestStatus": ["statusCode": 4, "statusDescription": "LIST_UNAVAILABLE"], "sessions": []], httpStatus: 200)) { error in
+            XCTAssertEqual((error as NSError).code, 4)
+            XCTAssertEqual(error.localizedDescription, "LIST_UNAVAILABLE")
+        }
+        XCTAssertThrowsError(try CloudMatchActiveSessionsResponse.entries(
+            ["requestStatus": ["statusCode": 1], "sessions": []], httpStatus: 503)) { error in
+            XCTAssertEqual((error as NSError).code, 503)
+        }
+        XCTAssertThrowsError(try CloudMatchActiveSessionsResponse.entries([:], httpStatus: 200))
+        XCTAssertThrowsError(try CloudMatchActiveSessionsResponse.entries(
+            ["requestStatus": ["statusCode": 1]], httpStatus: 200))
+    }
+
+    @MainActor
+    func testAccountSessionDiscoveryRefreshesOnActivationWithoutDuplicatingItsLoop() async {
+        let discovery = RemoteSessionDiscovery(interval: .seconds(60))
+        let first = expectation(description: "Refresh on first activation")
+        let returned = expectation(description: "Refresh again after returning to foreground")
+        var requests = 0
+        discovery.start(canRefresh: { true }, refresh: { requests += 1; first.fulfill() })
+        discovery.start(canRefresh: { true }, refresh: { XCTFail("Duplicate activation must not create a second loop") })
+        await fulfillment(of: [first], timeout: 2)
+        XCTAssertEqual(requests, 1)
+        discovery.stop()
+        discovery.start(canRefresh: { true }, refresh: { requests += 1; returned.fulfill() })
+        await fulfillment(of: [returned], timeout: 2)
+        discovery.stop()
+        XCTAssertEqual(requests, 2)
+    }
+
+    @MainActor
+    func testAccountSessionDiscoveryWaitsDuringStreamAndResumesWhenBrowsing() async throws {
+        let discovery = RemoteSessionDiscovery(interval: .milliseconds(10))
+        let refreshed = expectation(description: "Discover another device's session when browsing")
+        var streaming = true
+        var requests = 0
+        discovery.start(canRefresh: { !streaming }, refresh: {
+            requests += 1
+            discovery.stop()
+            refreshed.fulfill()
+        })
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertEqual(requests, 0, "Account discovery must not send requests during gameplay")
+        streaming = false
+        await fulfillment(of: [refreshed], timeout: 2)
+        XCTAssertEqual(requests, 1)
+        discovery.stop()
     }
 
     @MainActor
