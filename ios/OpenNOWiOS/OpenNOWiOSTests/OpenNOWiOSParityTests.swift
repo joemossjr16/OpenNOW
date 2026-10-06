@@ -483,6 +483,75 @@ final class OpenNOWiOSParityTests: XCTestCase {
         }
     }
 
+    func testNativeTransferKeepsReceivingDeviceRequestDespiteReducedRemoteListing() {
+        let candidate = RemoteSessionCandidate(id: "other-device", appId: "game", status: 3,
+            serverIp: "example.invalid", streamSettingsSignature: nil,
+            resolution: "1680x720", fps: 60)
+        for (resolution, aspect) in [("1600x1200", "4:3"), ("2560x1080", "21:9")] {
+            var requested = AppSettings.default
+            requested.experimentalNativeNVSTEnabled = true
+            requested.streamPreset = .custom
+            requested.preferredResolution = resolution
+            requested.preferredAspectRatio = aspect
+            requested.preferredFPS = 120
+            requested.maxBitrateMbps = 100
+            requested.hdrEnabled = true
+            requested.streamStatsMetrics.bitrate = true
+            for retainedID: String? in [nil, "expired-local", candidate.id] {
+                let resumed = StreamSettingsResolver.settingsForResuming(candidate, base: requested,
+                    retainedSessionID: retainedID, membershipTier: "ULTIMATE")
+                XCTAssertEqual(resumed, requested,
+                    "NVST must announce the receiving device's request, not a reduced account listing")
+            }
+        }
+    }
+
+    func testNativeResumeAnnouncesSelectedResolutionAndFPSDespiteServer720p60Profile() {
+        var session = Self.makeActiveSession(game: Self.makeGame(title: "Control", controls: []), status: 3)
+        session.negotiatedStreamProfile = NegotiatedStreamProfile(resolution: "1680x720", fps: 60)
+        for (width, height, aspect) in [(1600, 1200, "4:3"), (2560, 1080, "21:9")] {
+            var settings = AppSettings.default
+            settings.experimentalNativeNVSTEnabled = true
+            settings.streamPreset = .custom
+            settings.preferredResolution = "\(width)x\(height)"
+            settings.preferredAspectRatio = aspect
+            settings.preferredFPS = 120
+            settings.maxBitrateMbps = 100
+            let profile = NativeStreamCoordinator.effectiveProfile(for: session,
+                settings: settings, membershipTier: "ULTIMATE")
+            XCTAssertEqual(profile.width, width)
+            XCTAssertEqual(profile.height, height)
+            XCTAssertEqual(profile.fps, 120)
+            XCTAssertEqual(profile.maxBitrateKbps, 100_000)
+            let announce = NvstRtspSdp.buildAnnounceSdp(.init(
+                resolution: profile.resolutionString, fps: profile.fps))
+            XCTAssertTrue(announce.contains("a=x-nv-video[0].clientViewportWd:\(width)"))
+            XCTAssertTrue(announce.contains("a=x-nv-video[0].clientViewportHt:\(height)"))
+            XCTAssertTrue(announce.contains("a=x-nv-video[0].maxFPS:120"))
+            XCTAssertFalse(announce.contains("a=x-nv-video[0].maxFPS:60"))
+            let freeProfile = NativeStreamCoordinator.effectiveProfile(for: session,
+                settings: settings, membershipTier: "FREE")
+            XCTAssertEqual(freeProfile.fps, 60, "Selected requests must still respect membership limits")
+        }
+    }
+
+    func testWebRTCResumeStillUsesServerNegotiatedVideoProfile() {
+        var session = Self.makeActiveSession(game: Self.makeGame(title: "Control", controls: []), status: 3)
+        session.negotiatedStreamProfile = NegotiatedStreamProfile(resolution: "1680x720", fps: 60)
+        var settings = AppSettings.default
+        settings.experimentalNativeNVSTEnabled = false
+        settings.preferredResolution = "2560x1080"
+        settings.preferredAspectRatio = "21:9"
+        settings.preferredFPS = 120
+        settings.maxBitrateMbps = 100
+        let profile = NativeStreamCoordinator.effectiveProfile(for: session,
+            settings: settings, membershipTier: "ULTIMATE")
+        XCTAssertEqual(profile.width, 1680)
+        XCTAssertEqual(profile.height, 720)
+        XCTAssertEqual(profile.fps, 60)
+        XCTAssertEqual(profile.maxBitrateKbps, 100_000)
+    }
+
     @MainActor
     func testIPadSettingsCategoriesCanReturnToHomeRepeatedly() async throws {
         try await verifySettingsCategoriesCanReturnToHome(compact: false)

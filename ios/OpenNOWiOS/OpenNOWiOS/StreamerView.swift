@@ -5244,6 +5244,9 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
 
     nonisolated static func effectiveProfile(for session: ActiveSession, settings: AppSettings, membershipTier: String? = nil) -> StreamVideoProfile {
         var profile = StreamSettingsResolver.profile(for: settings, membershipTier: membershipTier)
+        // NVST's ANNOUNCE owns the client viewport/FPS. Reusing CloudMatch's reduced
+        // monitor snapshot here turns a selected high-resolution request into 720p60.
+        if settings.experimentalNativeNVSTEnabled { return profile }
         if let resolution = session.negotiatedStreamProfile?.resolution,
            let parsed = parseResolution(resolution) {
             profile = StreamVideoProfile(

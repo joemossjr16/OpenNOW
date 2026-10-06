@@ -2034,15 +2034,16 @@ enum StreamSettingsResolver {
         return updated
     }
 
-    /// A listing can describe a temporarily reduced stream. Reclaiming our own allocation
-    /// must repeat its saved request; only an allocation without that snapshot adopts the listing.
+    /// NVST announces the selected client profile, including when transferring a session.
+    /// A server listing may carry a reduced or previous client's profile. WebRTC adopts that
+    /// profile only when we do not have a retained request for this allocation.
     static func settingsForResuming(
         _ candidate: RemoteSessionCandidate,
         base: AppSettings,
         retainedSessionID: String?,
         membershipTier: String?
     ) -> AppSettings {
-        if candidate.id == retainedSessionID { return base }
+        if base.experimentalNativeNVSTEnabled || candidate.id == retainedSessionID { return base }
         var adopted = base
         if let resolution = candidate.resolution?.trimmingCharacters(in: .whitespacesAndNewlines) {
             let parts = resolution.split(separator: "x", maxSplits: 1)
