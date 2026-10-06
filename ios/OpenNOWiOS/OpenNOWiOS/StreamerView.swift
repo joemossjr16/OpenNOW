@@ -6260,6 +6260,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     private var upscalingEnabled = false
     private var suspendUpscalingUntil: CFTimeInterval = 0
     private var effectsGeneration: UInt64 = 0
+    private var lastSubmissionQueue: NativeStreamSubmissionQueue?
     var presentationRates: NativeStreamPresentationRates? {
         presentations.rates(now:CACurrentMediaTime())
     }
@@ -6416,7 +6417,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         let upscaleSize = shouldUpscale
             ? NativeStreamVideoEffectsPolicy.upscaleSize(source: frameSize, destination: destination.size)
             : nil
-        let ticket = metal4Enabled ? submissionTimeline?.next() : nil
+        let ticket = submissionTimeline?.next()
         let presentationTracker = presentations
         let mailbox = frames
         let useDirectHDRPath = NativeStreamVideoEffectsPolicy.canUseDirectHDRPath(
@@ -6427,8 +6428,9 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
            useDirectHDRPath,
            let metal4 = metal4HDRStorage as? NativeStreamMetal4HDRRenderer {
             let admission = gpuAdmission
+            let waitForPrevious = NativeStreamSubmissionQueue.metal4HDR.requiresWait(from: lastSubmissionQueue)
             if metal4.submit(buffer:pixelBuffer,target:drawable.texture,destination:destination,drawable:drawable,ticket:ticket,
-                presented: { time in
+                waitForPrevious: waitForPrevious, presented: { time in
                     presentationTracker.recordPresentation(at:time)
                 }, completion: { [weak self] duration,error in
                     admission.signal()
@@ -6439,6 +6441,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                     }
                 }) {
                 if let ticket { submissionTimeline?.accept(ticket) }
+                lastSubmissionQueue = .metal4HDR
                 rendererBackend = "Metal 4 · direct 10-bit HDR"
                 if upscalingEnabled {
                     metal4UpscalingStatus = shouldUpscale
@@ -6450,8 +6453,12 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                 return
             }
         }
-        // Cross-queue ordering also covers live switching to effects/legacy.
-        if let ticket, ticket.previous > 0 { commandBuffer.encodeWaitForEvent(ticket.event,value:ticket.previous) }
+        // The event orders renderer-queue switches. Same-queue submissions are
+        // already ordered and must remain free to overlap across frames.
+        let legacyWaitForPrevious = NativeStreamSubmissionQueue.metal3.requiresWait(from: lastSubmissionQueue)
+        if legacyWaitForPrevious, let ticket, ticket.previous > 0 {
+            commandBuffer.encodeWaitForEvent(ticket.event,value:ticket.previous)
+        }
         let effectsToken = effectsGeneration
         let preferMetal4Effects: Bool
         if #available(iOS 26.0, *) {
@@ -6486,6 +6493,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                     drawable: drawable, ticket: ticket,
                     presented: presentedMetal4, completion: completeMetal4) {
                 if let ticket { submissionTimeline?.accept(ticket) }
+                lastSubmissionQueue = .metal4Effects
                 rendererBackend = (hdrTransfer == .pq ? "Metal 4 · native PQ conversion"
                     : hdrTransfer == .hlg ? "Metal 4 · native HLG conversion" : "Metal 4 · native SDR conversion")
                 metal4UpscalingStatus = shouldUpscale ? effects.status : nil
@@ -6527,6 +6535,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                     target: drawable.texture, drawable: drawable, ticket: ticket,
                     presented: presentedMetal4, completion: completeMetal4) {
                     if let ticket { submissionTimeline?.accept(ticket) }
+                    lastSubmissionQueue = .metal4Effects
                     rendererBackend = "Metal 4 · effects"
                     if shouldUpscale { metal4UpscalingStatus = effects.status } else { metal4UpscalingStatus = nil }
 
@@ -6586,6 +6595,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         submitted = true
         commandBuffer.commit()
         if let ticket { submissionTimeline?.accept(ticket) }
+        lastSubmissionQueue = .metal3
     }
 
     private func finishEffects(failed: Bool) {

@@ -632,6 +632,15 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertFalse(NativeStreamMetal4FrameSlotPolicy.isComplete(2))
     }
 
+    func testGPUQueueDependencyWaitsOnlyWhenRendererQueueChanges() {
+        XCTAssertFalse(NativeStreamSubmissionQueue.metal4HDR.requiresWait(from: .metal4HDR))
+        XCTAssertFalse(NativeStreamSubmissionQueue.metal3.requiresWait(from: .metal3))
+        XCTAssertTrue(NativeStreamSubmissionQueue.metal4HDR.requiresWait(from: .metal3))
+        XCTAssertTrue(NativeStreamSubmissionQueue.metal3.requiresWait(from: .metal4HDR))
+        XCTAssertTrue(NativeStreamSubmissionQueue.metal4Effects.requiresWait(from: .metal4HDR))
+        XCTAssertTrue(NativeStreamSubmissionQueue.metal4HDR.requiresWait(from: nil))
+    }
+
     func testVideoEffectsSettingsMigrateOffAndRoundTripWithoutChangingStream() throws {
         let old = try JSONDecoder().decode(AppSettings.self, from: Data("{}".utf8))
         XCTAssertFalse(old.metalFXUpscalingEnabled)

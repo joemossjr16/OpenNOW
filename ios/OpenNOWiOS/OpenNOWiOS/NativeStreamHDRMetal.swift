@@ -8,6 +8,12 @@ enum NativeStreamMetal4FrameSlotPolicy {
     static func isComplete(_ count: Int) -> Bool { count == inFlightCount }
 }
 
+enum NativeStreamSubmissionQueue: Equatable {
+    case metal4HDR, metal4Effects, metal3
+
+    func requiresWait(from previous: Self?) -> Bool { previous != self }
+}
+
 /// Shared interpretation for rendering and actual-output status.
 enum NativeStreamTenBitSurface {
     static func chroma(_ format: OSType) -> String? {
@@ -186,7 +192,7 @@ final class NativeStreamMetalDrawableResidency {
 }
 
 /// Direct Metal 4 streaming: explicit allocators, argument tables,
-/// residency, commit feedback and drawable synchronization. Two bounded slots;
+/// residency, commit feedback and drawable synchronization. Three bounded slots;
 /// reuse begins only after GPU feedback, retaining every IOSurface until then.
 @available(iOS 26.0, macOS 26.0, *)
 final class NativeStreamMetal4HDRRenderer {
@@ -240,6 +246,7 @@ final class NativeStreamMetal4HDRRenderer {
     /// can use the unchanged legacy renderer and the same timeline ticket.
     func submit(buffer: CVPixelBuffer, target: any MTLTexture, destination: CGRect,
                 drawable: (any MTLDrawable)? = nil, ticket: NativeStreamMetalFrameTimeline.Ticket? = nil,
+                waitForPrevious: Bool = true,
                 presented: (@Sendable (Double) -> Void)? = nil, presentAt: CFTimeInterval? = nil,
                 completion: @escaping @Sendable (Double,NSError?) -> Void) -> Bool {
         guard let input = NativeStreamHDRMetalProgram.Input(buffer:buffer,cache:cache,target:target,destination:destination)
@@ -264,20 +271,13 @@ final class NativeStreamMetal4HDRRenderer {
         guard let encoder = slot.command.makeRenderCommandEncoder(descriptor:pass) else {
             slot.command.endCommandBuffer(); release(index); return false
         }
-        // Decoder pools expose reused IOSurface memory through new texture views.
-        // Metal 4 does not infer alias hazards. Invalidate aliased plane reads at
-        // the consumer boundary; retention alone does not establish visibility.
-        encoder.barrier(afterQueueStages: .all, beforeStages: .fragment,
-                        visibilityOptions: [.device, .resourceAlias])
+        // VideoToolbox delivers completed pixel buffers. Retaining `input` until
+        // GPU feedback prevents surface reuse while these plane views are read.
         encoder.setRenderPipelineState(pipeline)
         encoder.setViewport(MTLViewport(originX:destination.minX,originY:destination.minY,
             width:destination.width,height:destination.height,znear:0,zfar:1))
         encoder.setArgumentTable(slot.arguments,stages:.fragment)
         encoder.drawPrimitives(primitiveType:.triangleStrip,vertexStart:0,vertexCount:4)
-        // Store tile results before handing this drawable to the compositor,
-        // which consumes another view of the same IOSurface allocation.
-        encoder.barrier(afterStages: [.fragment, .tile], beforeQueueStages: .all,
-                        visibilityOptions: [.device, .resourceAlias])
         encoder.endEncoding(); slot.command.endCommandBuffer()
         let options = MTL4CommitOptions()
         options.addFeedbackHandler { [self,input,slot,target,drawable] feedback in
@@ -287,7 +287,7 @@ final class NativeStreamMetal4HDRRenderer {
             release(index)
             completion(max(feedback.gpuEndTime-feedback.gpuStartTime,0),error)
         }
-        if let ticket, ticket.previous > 0 { queue.waitForEvent(ticket.event,value:ticket.previous) }
+        if waitForPrevious, let ticket, ticket.previous > 0 { queue.waitForEvent(ticket.event,value:ticket.previous) }
         if let drawable {
             #if !targetEnvironment(simulator)
             if let presented { drawable.addPresentedHandler { value in
@@ -317,6 +317,7 @@ final class NativeStreamMetal4HDRRenderer {
     func setDrawableResidency(_ residency: any MTLResidencySet) {}
     func submit(buffer: CVPixelBuffer, target: any MTLTexture, destination: CGRect,
                 drawable: (any MTLDrawable)? = nil, ticket: NativeStreamMetalFrameTimeline.Ticket? = nil,
+                waitForPrevious: Bool = true,
                 presented: (@Sendable (Double) -> Void)? = nil, presentAt: CFTimeInterval? = nil,
                 completion: @escaping @Sendable (Double,NSError?) -> Void) -> Bool { false }
 }
