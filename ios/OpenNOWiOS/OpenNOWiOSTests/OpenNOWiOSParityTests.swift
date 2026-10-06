@@ -5176,6 +5176,66 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertNil(SessionControlRouting.baseURL(host: "np-ams-01.cloudmatchbeta.nvidiagrid.net.attacker.test", port: 443))
     }
 
+    func testNativeResumeUsesAssignedControlServerWithoutRedirectingMediaDetails() {
+        var allocation = queueFixture()
+        allocation.status = 3
+        allocation.serverIp = "66-22-149-36.cloudmatchbeta.nvidiagrid.net"
+        allocation.sessionControlBaseUrl = "https://np-dal-06.cloudmatchbeta.nvidiagrid.net"
+        let rigBase = "https://66-22-149-36.cloudmatchbeta.nvidiagrid.net"
+        XCTAssertEqual(SessionControlRouting.resumeBase(streamingBaseUrl: allocation.streamingBaseUrl,
+            rigBaseUrl: rigBase, refreshedControlBaseUrl: nil,
+            retainedControlBaseUrl: allocation.sessionControlBaseUrl, usesNativeNVST: true),
+            "https://np-dal-06.cloudmatchbeta.nvidiagrid.net")
+        XCTAssertEqual(SessionControlRouting.readyDetailsBase(for: allocation), rigBase)
+        XCTAssertEqual(SessionControlRouting.resumeBase(streamingBaseUrl: allocation.streamingBaseUrl,
+            rigBaseUrl: rigBase, refreshedControlBaseUrl: "https://np-dal-05.cloudmatchbeta.nvidiagrid.net",
+            retainedControlBaseUrl: allocation.sessionControlBaseUrl, usesNativeNVST: true),
+            "https://np-dal-05.cloudmatchbeta.nvidiagrid.net")
+        XCTAssertEqual(SessionControlRouting.resumeBase(streamingBaseUrl: allocation.streamingBaseUrl,
+            rigBaseUrl: rigBase, refreshedControlBaseUrl: allocation.sessionControlBaseUrl,
+            retainedControlBaseUrl: nil, usesNativeNVST: false), rigBase)
+    }
+
+    func testNativeResumeRejectsUntrustedControlRoutesAndPreservesProviderFallback() {
+        let launchBase = "https://np-dal-05.cloudmatchbeta.nvidiagrid.net"
+        let rigBase = "https://66-22-149-36.cloudmatchbeta.nvidiagrid.net"
+        let validControl = "https://np-dal-06.cloudmatchbeta.nvidiagrid.net"
+        for invalidControl in ["http://np-dal-06.cloudmatchbeta.nvidiagrid.net",
+            "https://np-dal-06.cloudmatchbeta.nvidiagrid.net:8443",
+            "https://np-dal-06.cloudmatchbeta.nvidiagrid.net.attacker.test",
+            "https://user:password@np-dal-06.cloudmatchbeta.nvidiagrid.net",
+            validControl + "/v2/session", validControl + "?redirect=1", validControl + "#fragment",
+            rigBase] {
+            XCTAssertEqual(SessionControlRouting.resumeBase(streamingBaseUrl: launchBase,
+                rigBaseUrl: rigBase, refreshedControlBaseUrl: invalidControl,
+                retainedControlBaseUrl: nil, usesNativeNVST: true), rigBase)
+            XCTAssertEqual(SessionControlRouting.resumeBase(streamingBaseUrl: launchBase,
+                rigBaseUrl: rigBase, refreshedControlBaseUrl: invalidControl,
+                retainedControlBaseUrl: validControl, usesNativeNVST: true), validControl)
+        }
+        XCTAssertEqual(SessionControlRouting.resumeBase(streamingBaseUrl: launchBase,
+            rigBaseUrl: rigBase, refreshedControlBaseUrl: nil,
+            retainedControlBaseUrl: nil, usesNativeNVST: true), rigBase)
+        XCTAssertEqual(SessionControlRouting.resumeBase(streamingBaseUrl: "https://provider.example.invalid",
+            rigBaseUrl: "https://rig.example.invalid", refreshedControlBaseUrl: validControl,
+            retainedControlBaseUrl: validControl, usesNativeNVST: true), "https://rig.example.invalid")
+    }
+
+    func testRemoteSessionCandidateRetainsControlRouteAndDecodesLegacyState() throws {
+        let legacy = Data(#"{"id":"session","status":3,"serverIp":"66-22-149-36.cloudmatchbeta.nvidiagrid.net","resolution":"1280x720","fps":120}"#.utf8)
+        var candidate = try JSONDecoder().decode(RemoteSessionCandidate.self, from: legacy)
+        XCTAssertNil(candidate.sessionControlBaseUrl)
+        candidate.sessionControlBaseUrl = "https://np-dal-06.cloudmatchbeta.nvidiagrid.net"
+        let restored = try JSONDecoder().decode(RemoteSessionCandidate.self,
+            from: JSONEncoder().encode(candidate))
+        XCTAssertEqual(restored, candidate)
+        XCTAssertEqual(SessionControlRouting.resumeBase(
+            streamingBaseUrl: "https://np-dal-05.cloudmatchbeta.nvidiagrid.net",
+            rigBaseUrl: "https://\(restored.serverIp!)", refreshedControlBaseUrl: nil,
+            retainedControlBaseUrl: restored.sessionControlBaseUrl, usesNativeNVST: true),
+            candidate.sessionControlBaseUrl)
+    }
+
     private func queueFixture() -> ActiveSession {
         ActiveSession(id: "queue", game: Self.makeGame(title: "Queue Test", controls: []),
             startedAt: .now, status: 1, queuePosition: 1, seatSetupStep: nil,

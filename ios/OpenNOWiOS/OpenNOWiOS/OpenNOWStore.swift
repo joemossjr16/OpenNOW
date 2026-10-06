@@ -574,6 +574,7 @@ struct RemoteSessionCandidate: Identifiable, Codable, Equatable {
     let fps: Int?
     var colorQuality: StreamColorQuality? = nil
     var hdrEnabled: Bool? = nil
+    var sessionControlBaseUrl: String? = nil
 }
 
 struct StorageAddon: Codable, Equatable {
@@ -2568,7 +2569,7 @@ private func validEndpointHost(_ host: String?) -> String? {
     return normalized
 }
 
-/// CloudMatch's control address is a queue endpoint, never a media/signaling address.
+/// CloudMatch control requests belong to the assigned zone; ready connection details belong to the rig.
 enum SessionControlRouting {
     static func isZoneHostname(_ value: String) -> Bool {
         guard let host = normalizedEndpointHost(from: value)?.lowercased() else { return false }
@@ -2607,21 +2608,35 @@ enum SessionControlRouting {
         return url.absoluteString
     }
 
-    static func pollBase(for session: ActiveSession) -> String {
-        guard let launchHost = URL(string: session.streamingBaseUrl)?.host?.lowercased(),
+    private static func validatedControlBase(_ controlBase: String?, streamingBaseUrl: String) -> String? {
+        guard let launchHost = URL(string: streamingBaseUrl)?.host?.lowercased(),
               launchHost.hasSuffix(".cloudmatchbeta.nvidiagrid.net")
                 || launchHost.hasSuffix(".cloudmatch.nvidiagrid.net"),
-              let controlBase = session.sessionControlBaseUrl,
+              let controlBase,
               let controlURL = URL(string: controlBase),
               controlURL.scheme == "https",
               controlURL.port == nil || controlURL.port == 443,
+              controlURL.user == nil, controlURL.password == nil,
               controlURL.path.isEmpty || controlURL.path == "/",
               controlURL.query == nil,
-              controlURL.fragment == nil,
-              let validated = baseURL(host: controlURL.host, port: controlURL.port) else {
-            return session.streamingBaseUrl
-        }
-        return validated
+              controlURL.fragment == nil else { return nil }
+        return baseURL(host: controlURL.host, port: controlURL.port)
+    }
+
+    static func pollBase(for session: ActiveSession) -> String {
+        validatedControlBase(session.sessionControlBaseUrl, streamingBaseUrl: session.streamingBaseUrl)
+            ?? session.streamingBaseUrl
+    }
+
+    static func resumeBase(streamingBaseUrl: String, rigBaseUrl: String,
+                           refreshedControlBaseUrl: String?, retainedControlBaseUrl: String?,
+                           usesNativeNVST: Bool) -> String {
+        guard usesNativeNVST else { return rigBaseUrl }
+        // Hydrating ready metadata from the rig must not redirect RESUME away from
+        // sessionControlInfo. Partial rig responses can omit that assigned control address.
+        return validatedControlBase(refreshedControlBaseUrl, streamingBaseUrl: streamingBaseUrl)
+            ?? validatedControlBase(retainedControlBaseUrl, streamingBaseUrl: streamingBaseUrl)
+            ?? rigBaseUrl
     }
 }
 
@@ -4746,6 +4761,7 @@ private actor GFNAPIClient {
                 in: sessionRequestData?["metaData"] as? [[String: Any]]
             )
             let negotiatedProfile = Self.extractNegotiatedStreamProfile(sessionObj: item)
+            let control = item["sessionControlInfo"] as? [String: Any]
             return RemoteSessionCandidate(
                 id: sessionId,
                 appId: appId,
@@ -4755,7 +4771,9 @@ private actor GFNAPIClient {
                 resolution: negotiatedProfile?.resolution,
                 fps: negotiatedProfile?.fps,
                 colorQuality: negotiatedProfile?.colorQuality,
-                hdrEnabled: Self.toBoolean((item["finalizedStreamingFeatures"] as? [String: Any])?["trueHdr"])
+                hdrEnabled: Self.toBoolean((item["finalizedStreamingFeatures"] as? [String: Any])?["trueHdr"]),
+                sessionControlBaseUrl: SessionControlRouting.baseURL(
+                    host: control?["ip"] as? String, port: control?["port"] as? Int)
             )
         }
     }
@@ -4790,6 +4808,7 @@ private actor GFNAPIClient {
             vpcId: vpcId
         )
 
+        var retainedControlBaseUrl = candidate.sessionControlBaseUrl
         if SessionControlRouting.isZoneHostname(effectiveServerIp) {
             do {
                 let preflightURL = URL(string: "https://\(effectiveServerIp)/v2/session/\(candidate.id)")!
@@ -4807,10 +4826,14 @@ private actor GFNAPIClient {
                 )
                 if prefetchResponse.statusCode == 200,
                    let prefetchJSON = try? parseJSON(prefetchData),
-                   let prefetchSession = prefetchJSON["session"] as? [String: Any],
-                   let realIp = Self.extractServerIp(sessionObj: prefetchSession),
-                   !realIp.isEmpty {
-                    effectiveServerIp = realIp
+                   let prefetchSession = prefetchJSON["session"] as? [String: Any] {
+                    let control = prefetchSession["sessionControlInfo"] as? [String: Any]
+                    retainedControlBaseUrl = SessionControlRouting.baseURL(
+                        host: control?["ip"] as? String, port: control?["port"] as? Int)
+                        ?? retainedControlBaseUrl
+                    if let realIp = Self.extractServerIp(sessionObj: prefetchSession), !realIp.isEmpty {
+                        effectiveServerIp = realIp
+                    }
                 }
             } catch {
             }
@@ -4838,13 +4861,21 @@ private actor GFNAPIClient {
         } catch {
         }
 
+        let validationControl = validationSessionObj["sessionControlInfo"] as? [String: Any]
+        let refreshedControlBaseUrl = SessionControlRouting.baseURL(
+            host: validationControl?["ip"] as? String, port: validationControl?["port"] as? Int)
+        let resumeBase = SessionControlRouting.resumeBase(streamingBaseUrl: zoneBase,
+            rigBaseUrl: "https://\(effectiveServerIp)",
+            refreshedControlBaseUrl: refreshedControlBaseUrl,
+            retainedControlBaseUrl: retainedControlBaseUrl,
+            usesNativeNVST: settings.experimentalNativeNVSTEnabled)
         var claimJSON: [String: Any] = [:]
         if preClaimStatus != 1 {
             let sessionQuery = URLQueryItemEncoder.encode([
                 "keyboardLayout": StreamSettingsResolver.normalizedKeyboardLayout(settings.keyboardLayout),
                 "languageCode": StreamSettingsResolver.normalizedGameLanguage(settings.gameLanguage)
             ])
-            let claimURL = URL(string: "https://\(effectiveServerIp)/v2/session/\(candidate.id)?\(sessionQuery)")!
+            let claimURL = URL(string: "\(resumeBase)/v2/session/\(candidate.id)?\(sessionQuery)")!
             let claimBody = Self.buildClaimBody(
                 sessionId: candidate.id,
                 appId: candidate.appId ?? game.launchAppId ?? "0",
@@ -4912,7 +4943,7 @@ private actor GFNAPIClient {
             ?? (validationSessionObj["sessionControlInfo"] as? [String: Any])
         active.sessionControlBaseUrl = SessionControlRouting.baseURL(
             host: claimedControl?["ip"] as? String, port: claimedControl?["port"] as? Int
-        )
+        ) ?? refreshedControlBaseUrl ?? retainedControlBaseUrl
 
         for _ in 0..<45 {
             let polled = try await pollSession(session: session, activeSession: active, settings: settings)
@@ -9404,7 +9435,8 @@ final class OpenNOWStore: ObservableObject {
                 serverIp: allocation.serverIp,
                 streamSettingsSignature: nil,
                 resolution: allocation.negotiatedStreamProfile?.resolution,
-                fps: allocation.negotiatedStreamProfile?.fps)
+                fps: allocation.negotiatedStreamProfile?.fps,
+                sessionControlBaseUrl: allocation.sessionControlBaseUrl)
             let claimed = try await api.claimSession(session: refreshed, candidate: candidate,
                 game: allocation.game, streamingBaseUrl: allocation.streamingBaseUrl,
                 vpcId: allocation.zone, settings: streamSettings,
@@ -9459,7 +9491,8 @@ final class OpenNOWStore: ObservableObject {
                     appId: allocation.game.launchAppId, status: allocation.status,
                     serverIp: allocation.serverIp, streamSettingsSignature: nil,
                     resolution: allocation.negotiatedStreamProfile?.resolution,
-                    fps: allocation.negotiatedStreamProfile?.fps)
+                    fps: allocation.negotiatedStreamProfile?.fps,
+                    sessionControlBaseUrl: allocation.sessionControlBaseUrl)
                 return try await api.claimSession(session: refreshed, candidate: candidate,
                     game: allocation.game, streamingBaseUrl: allocation.streamingBaseUrl,
                     vpcId: allocation.zone, settings: requestedSettings,
