@@ -7767,16 +7767,30 @@ struct NativeStreamVirtualStickView: View {
                 .overlay(Circle().stroke(Color.white.opacity(outlineStyle ? 0.42 : 0.22), lineWidth: outlineStyle ? 1.5 : 1))
             if concentricRings {
                 Circle()
-                    .stroke(Color.white.opacity(0.42), lineWidth: 1.5)
+                    .stroke(Color(white: 0.25).opacity(0.70), lineWidth: 1.5)
                     .frame(width: size * 0.68, height: size * 0.68)
             }
             Circle()
                 .fill(Color.white.opacity(gripDots ? 0.70 : outlineStyle ? 0.14 : 0.30))
-                .overlay(Circle().strokeBorder(Color.white.opacity(outlineStyle ? 0.55 : 0), lineWidth: 1.5))
-                .frame(width: size * (concentricRings ? 0.40 : 0.48), height: size * (concentricRings ? 0.40 : 0.48))
+                .overlay(Circle().strokeBorder(Color.white.opacity(outlineStyle && !gripDots ? 0.55 : 0), lineWidth: 1.5))
+                .frame(width: size * (concentricRings ? 0.41 : 0.48), height: size * (concentricRings ? 0.41 : 0.48))
                 .overlay {
                     if gripDots {
-                        Image(systemName: "circle.grid.3x3.fill").font(.system(size: size * 0.15)).foregroundStyle(.black.opacity(0.45))
+                        Canvas { context, bounds in
+                            let step = bounds.width / 5
+                            let diameter = step * 0.30
+                            for row in 0..<5 {
+                                for column in 0..<5 {
+                                    // Round off the pattern by leaving the four corners empty.
+                                    guard !((row == 0 || row == 4) && (column == 0 || column == 4)) else { continue }
+                                    let dot = CGRect(x: (CGFloat(column) + 0.5) * step - diameter / 2,
+                                        y: (CGFloat(row) + 0.5) * step - diameter / 2,
+                                        width: diameter, height: diameter)
+                                    context.fill(Path(ellipseIn: dot), with: .color(.black.opacity(0.40)))
+                                }
+                            }
+                        }
+                        .frame(width: size * 0.18, height: size * 0.18)
                     } else {
                         Text(label).font(.caption2.bold()).foregroundStyle(.white)
                     }
