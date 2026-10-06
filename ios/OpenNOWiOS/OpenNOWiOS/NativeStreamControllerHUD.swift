@@ -66,7 +66,7 @@ enum NativeStreamControllerButtonNames {
 import SwiftUI
 
 final class NativeStreamControllerButtonLearner: ObservableObject {
-    @Published var status = "Choose Learn, then press a back button."
+    @Published var status = ""
     @Published var listening = false
     private var restorations: [() -> Void] = []
     private var timeout: Task<Void, Never>?
@@ -95,7 +95,7 @@ final class NativeStreamControllerButtonLearner: ObservableObject {
             do { try await Task.sleep(nanoseconds: 10_000_000_000) } catch { return }
             guard let self else { return }
             self.stop()
-            self.status = "No button detected. If the back button is unassigned in GameSir, map it to an unused input there and try again."
+            self.status = "No button detected. Assign the back button to an unused controller input and try again."
         }
     }
     func stop() {
@@ -103,6 +103,7 @@ final class NativeStreamControllerButtonLearner: ObservableObject {
         restorations.forEach { $0() }; restorations.removeAll()
         listening = false
         NativeStreamControllerShortcutCapture.learning = false
+        status = ""
     }
 }
 
@@ -111,41 +112,34 @@ struct NativeStreamControllerShortcutsView: View {
     @StateObject private var learner = NativeStreamControllerButtonLearner()
     @Environment(\.scenePhase) private var scenePhase
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Controller Shortcuts").font(.headline)
+        Form {
             shortcut("Back button 1", first: true)
             shortcut("Back button 2", first: false)
-            Text(learner.status).font(.footnote).foregroundStyle(.secondary)
-            if learner.listening { Button("Cancel Learning") { learner.stop() } }
-            Text("If a back button mirrors a front button, this shortcut applies to both. Use an unused input in the GameSir mapping for a dedicated shortcut.")
-                .font(.footnote).foregroundStyle(.secondary)
-            Text("HUD: D-pad or left stick moves; A selects; B goes back; left/right adjusts sliders.")
-                .font(.footnote).foregroundStyle(.secondary)
+            if !learner.status.isEmpty {
+                Section {
+                    Text(learner.status).foregroundStyle(.secondary)
+                    if learner.listening { Button("Cancel Learning") { learner.stop() } }
+                }
+            }
+            Section {
+                DisclosureGroup("How shortcuts work") {
+                    Text("Choose Learn Button, then press the button on your controller.")
+                    Text("Mirrored buttons share a shortcut. Assign an unused controller input to keep it separate.")
+                    Text("In the stream HUD, use the D-pad or left stick to move, A to select, B to go back, and left/right to adjust sliders.")
+                }
+                .foregroundStyle(.secondary)
+            }
         }
+        .navigationTitle("Controller Shortcuts")
+        .navigationBarTitleDisplayMode(.inline)
         .buttonStyle(.borderless)
         .onDisappear { learner.stop() }
         .onChange(of: scenePhase) { phase in if phase != .active { learner.stop() } }
     }
     private func shortcut(_ title: String, first: Bool) -> some View {
         let name = first ? settings.controllerShortcuts.firstButton : settings.controllerShortcuts.secondButton
-        return VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text(title).font(.subheadline.bold())
-                Spacer()
-                Button("Learn") {
-                    learner.start { detected in
-                        if first { settings.controllerShortcuts.firstButton = detected }
-                        else { settings.controllerShortcuts.secondButton = detected }
-                        if first && settings.controllerShortcuts.secondButton == detected { settings.controllerShortcuts.secondButton = "" }
-                        if !first && settings.controllerShortcuts.firstButton == detected { settings.controllerShortcuts.firstButton = "" }
-                    }
-                }.disabled(learner.listening)
-                Button("Clear") {
-                    if first { settings.controllerShortcuts.firstButton = "" }
-                    else { settings.controllerShortcuts.secondButton = "" }
-                }.disabled(name.isEmpty || learner.listening)
-            }
-            Text(name.isEmpty ? "No button assigned" : name).font(.caption).foregroundStyle(.secondary)
+        return Section {
+            LabeledContent("Assigned button", value: name.isEmpty ? "None" : name)
             Picker("Action", selection: Binding(get: {
                 first ? settings.controllerShortcuts.firstAction : settings.controllerShortcuts.secondAction
             }, set: { action in
@@ -154,6 +148,23 @@ struct NativeStreamControllerShortcutsView: View {
             })) {
                 ForEach(NativeStreamControllerShortcutAction.allCases) { Text($0.label).tag($0) }
             }
+            HStack {
+                Button("Learn Button") {
+                    learner.start { detected in
+                        if first { settings.controllerShortcuts.firstButton = detected }
+                        else { settings.controllerShortcuts.secondButton = detected }
+                        if first && settings.controllerShortcuts.secondButton == detected { settings.controllerShortcuts.secondButton = "" }
+                        if !first && settings.controllerShortcuts.firstButton == detected { settings.controllerShortcuts.firstButton = "" }
+                    }
+                }.disabled(learner.listening)
+                Spacer()
+                Button("Clear", role: .destructive) {
+                    if first { settings.controllerShortcuts.firstButton = "" }
+                    else { settings.controllerShortcuts.secondButton = "" }
+                }.disabled(name.isEmpty || learner.listening)
+            }
+        } header: {
+            Text(title)
         }
     }
 }

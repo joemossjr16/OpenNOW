@@ -1662,12 +1662,8 @@ private struct NativeStreamControlsPanel: View {
         }
         .sheet(isPresented: $controllerMappingsPresented) {
             NavigationStack {
-                ScrollView {
-                    NativeStreamControllerShortcutsView(settings: Binding(get: { coordinator.liveSettings },
-                        set: { next in coordinator.updateLiveSettings { $0.controllerShortcuts = next.controllerShortcuts } }))
-                        .padding()
-                }
-                .navigationTitle("Controller Shortcuts")
+                NativeStreamControllerShortcutsView(settings: Binding(get: { coordinator.liveSettings },
+                    set: { next in coordinator.updateLiveSettings { $0.controllerShortcuts = next.controllerShortcuts } }))
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { controllerMappingsPresented = false } } }
             }
         }
@@ -1813,7 +1809,7 @@ private struct NativeStreamControlsPanel: View {
                     value: Binding(get: { coordinator.liveSettings.controllerRumbleStrength },
                         set: { value in coordinator.updateLiveSettings { $0.controllerRumbleStrength = value } }),
                     range: NativeStreamControllerRumbleGain.range, step: 0.64, format: NativeStreamControllerRumbleGain.label)
-                Text("Applies immediately and saves. 0% is Off; 50% applies 32× gain and 100% applies 64× gain.")
+                Text("Changes apply immediately and are saved. Set to 0% to turn controller vibration off.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
