@@ -1868,6 +1868,81 @@ final class OpenNOWiOSParityTests: XCTestCase {
             ["requestStatus": ["statusCode": 1]], httpStatus: 200))
     }
 
+    func testPausedAndResumingAllocationsRemainDiscoverable() throws {
+        let statuses = [1, 2, 3, 4, 5, 6, 7, 0, 99]
+        let entries = try CloudMatchActiveSessionsResponse.entries([
+            "requestStatus": ["statusCode": 1],
+            "sessions": statuses.map { ["status": $0] }
+        ], httpStatus: 200)
+        let resumable = entries.compactMap { $0["status"] as? Int }
+            .filter { CloudMatchSessionState(rawValue: $0)?.canResume == true }
+        XCTAssertEqual(resumable, [1, 2, 3, 4, 5, 6])
+        for status in [4, 5] {
+            let state = try XCTUnwrap(CloudMatchSessionState(rawValue: status))
+            XCTAssertTrue(state.isPaused)
+            XCTAssertEqual(state.loadingDescription, "Session paused")
+        }
+        XCTAssertEqual(CloudMatchSessionState.resuming.loadingDescription, "Resuming session")
+        XCTAssertEqual(CloudMatchSessionState.finished.loadingDescription, "Session ended")
+        XCTAssertEqual(CloudMatchSessionState.unknown.loadingDescription, "Checking session status")
+    }
+
+    func testReadyControlStateSurvivesOlderRigLifecycleResponses() {
+        var control = queueFixture(); control.status = 3
+        control.negotiatedStreamProfile = NegotiatedStreamProfile(resolution: "1600x1200", fps: 120)
+        var rig = control
+        rig.negotiatedStreamProfile = NegotiatedStreamProfile(resolution: "1280x720", fps: 60)
+        for status in [0, 1, 4, 5, 6, 7] {
+            rig.status = status
+            XCTAssertEqual(SessionControlRouting.readySnapshot(control: control, rig: rig), control)
+        }
+        for status in [2, 3] {
+            rig.status = status
+            XCTAssertEqual(SessionControlRouting.readySnapshot(control: control, rig: rig), rig)
+        }
+        XCTAssertEqual(SessionControlRouting.readySnapshot(control: control,
+            rig: queueFixture(id: "different-allocation")), control)
+    }
+
+    func testFinishedAllocationRecoveryDoesNotTreatPausedOrProviderFailuresAsEnded() throws {
+        for status in [1, 2, 3, 4, 5, 6, 99] {
+            XCTAssertNoThrow(try CloudMatchSessionResponse.validateAllocationState(status))
+        }
+        XCTAssertThrowsError(try CloudMatchSessionResponse.validateAllocationState(7)) { error in
+            XCTAssertTrue(CloudMatchSessionResponse.isUnavailableAllocation(error))
+            XCTAssertFalse(CloudMatchSessionResponse.isMissingAllocation(error))
+        }
+        let providerFailure = NSError(domain: "OpenNOW.Session", code: 7)
+        XCTAssertFalse(CloudMatchSessionResponse.isUnavailableAllocation(providerFailure))
+        var ended = queueFixture(); ended.status = 7
+        let paused = RemoteSessionCandidate(id: "paused", appId: ended.game.launchAppId,
+            status: 5, serverIp: nil, streamSettingsSignature: nil, resolution: nil, fps: nil)
+        XCTAssertEqual(CloudMatchSessionResponse.replacement(for: ended, in: [paused]), paused)
+    }
+
+    @MainActor
+    func testReconnectRejectsFinishedAllocationBeforeSendingClaim() async throws {
+        let handoff = NativeStreamSessionHandoff()
+        var allocation = queueFixture(); allocation.status = 3
+        var claims = 0
+        do {
+            _ = try await handoff.reconnect(allocation, refresh: { saved in
+                var finished = saved; finished.status = 7; return finished
+            }, claim: { saved in claims += 1; return saved })
+            XCTFail("A finished allocation cannot be resumed")
+        } catch {
+            XCTAssertTrue(CloudMatchSessionResponse.isUnavailableAllocation(error))
+        }
+        XCTAssertEqual(claims, 0)
+        let resumed = try await handoff.reconnect(allocation, refresh: { saved in
+            var paused = saved; paused.status = 5; return paused
+        }, claim: { saved in
+            claims += 1; var ready = saved; ready.status = 2; return ready
+        })
+        XCTAssertEqual(resumed.status, 2)
+        XCTAssertEqual(claims, 1)
+    }
+
     @MainActor
     func testAccountSessionDiscoveryRefreshesOnActivationWithoutDuplicatingItsLoop() async {
         let discovery = RemoteSessionDiscovery(interval: .seconds(60))
@@ -5236,8 +5311,8 @@ final class OpenNOWiOSParityTests: XCTestCase {
             candidate.sessionControlBaseUrl)
     }
 
-    private func queueFixture() -> ActiveSession {
-        ActiveSession(id: "queue", game: Self.makeGame(title: "Queue Test", controls: []),
+    private func queueFixture(id: String = "queue") -> ActiveSession {
+        ActiveSession(id: id, game: Self.makeGame(title: "Queue Test", controls: []),
             startedAt: .now, status: 1, queuePosition: 1, seatSetupStep: nil,
             serverIp: nil, mediaIp: nil, mediaPort: 0, signalingServer: nil,
             signalingUrl: nil, iceServers: [], zone: "NP-PDX-01",

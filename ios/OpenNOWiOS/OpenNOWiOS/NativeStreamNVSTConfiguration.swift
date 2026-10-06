@@ -37,6 +37,7 @@ final class NativeStreamSessionHandoff {
         let refreshed = try await refresh(allocation)
         try Task.checkCancellation()
         guard refreshed.id == allocation.id else { throw CancellationError() }
+        try CloudMatchSessionResponse.validateAllocationState(refreshed.status)
         let claimed = try await claim(refreshed)
         try Task.checkCancellation()
         guard claimed.id == allocation.id else {
@@ -44,6 +45,7 @@ final class NativeStreamSessionHandoff {
                 NSLocalizedDescriptionKey: "Resume returned a different session id."
             ])
         }
+        try CloudMatchSessionResponse.validateAllocationState(claimed.status)
         didClaim(allocationID: claimed.id)
         return claimed
     }

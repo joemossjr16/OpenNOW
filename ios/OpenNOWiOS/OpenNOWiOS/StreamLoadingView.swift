@@ -18,13 +18,10 @@ struct StreamLoadingView: View {
       }
     }
     guard let session = store.activeSession else {
-      return store.isLaunchingSession ? "Starting session" : "Waiting in queue"
+      return store.isLaunchingSession ? "Starting session" : "Checking session status"
     }
-    switch session.status {
-    case 2: return "Setting up gaming rig"
-    case 3: return "Launching stream"
-    default: return store.isLaunchingSession ? "Starting session" : "Waiting in queue"
-    }
+    if QueueSessionPhase.isQueued(session) { return "Waiting in queue" }
+    return (CloudMatchSessionState(rawValue: session.status) ?? .unknown).loadingDescription
   }
 
   var body: some View {

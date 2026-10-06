@@ -177,8 +177,11 @@ struct SessionView: View {
                 return queue == 1 ? "Next in queue" : "Queue #\(queue)"
             }
             return "Queued"
+        case 4, 5: return "Paused"
+        case 6: return "Resuming"
+        case 7: return "Ended"
         default:
-            return "Status \(session.status)"
+            return "Checking session status"
         }
     }
 
@@ -190,8 +193,11 @@ struct SessionView: View {
             return "Connecting"
         case 1:
             return "Queued"
+        case 4, 5: return "Paused"
+        case 6: return "Resuming"
+        case 7: return "Ended"
         default:
-            return "Status \(candidate.status)"
+            return "Checking session status"
         }
     }
 }

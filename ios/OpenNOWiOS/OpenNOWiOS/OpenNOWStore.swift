@@ -2608,6 +2608,15 @@ enum SessionControlRouting {
         return url.absoluteString
     }
 
+    static func readySnapshot(control: ActiveSession, rig: ActiveSession) -> ActiveSession {
+        // A previous transport can still be paused/finished on the rig while the
+        // control owner provisions a new resume. Only hydrate a ready rig snapshot.
+        guard control.id == rig.id,
+              CloudMatchSessionState(rawValue: control.status)?.isReady == true,
+              CloudMatchSessionState(rawValue: rig.status)?.isReady == true else { return control }
+        return rig
+    }
+
     private static func validatedControlBase(_ controlBase: String?, streamingBaseUrl: String) -> String? {
         guard let launchHost = URL(string: streamingBaseUrl)?.host?.lowercased(),
               launchHost.hasSuffix(".cloudmatchbeta.nvidiagrid.net")
@@ -4508,8 +4517,9 @@ private actor GFNAPIClient {
         // sessionControlInfo; a ready rig's connection metadata is owned by that rig.
         if let directBase = SessionControlRouting.readyDetailsBase(for: polled), directBase != primaryBase {
             do {
-                return try await pollSession(session: session, activeSession: polled,
-                                             base: directBase, settings: settings)
+                let rig = try await pollSession(session: session, activeSession: polled,
+                                                base: directBase, settings: settings)
+                return SessionControlRouting.readySnapshot(control: polled, rig: rig)
             } catch where OpenNOWErrorPresenter.isCancellation(error) {
                 throw error
             } catch where (error as NSError).domain == "OpenNOW.Queue" {
@@ -4554,6 +4564,7 @@ private actor GFNAPIClient {
 
         let sessionObj = json["session"] as? [String: Any] ?? [:]
         let status = sessionObj["status"] as? Int ?? activeSession.status
+        try CloudMatchSessionResponse.validateAllocationState(status)
         let queue = Self.extractQueuePosition(sessionObj: sessionObj)
         let seatSetupStep = Self.extractSeatSetupStep(sessionObj: sessionObj)
         let serverIp = Self.extractServerIp(sessionObj: sessionObj) ?? activeSession.serverIp
@@ -4751,7 +4762,7 @@ private actor GFNAPIClient {
         let sessions = try CloudMatchActiveSessionsResponse.entries(json, httpStatus: response.statusCode)
         return sessions.compactMap { item in
             let status = item["status"] as? Int ?? 0
-            guard status == 1 || status == 2 || status == 3 else { return nil }
+            guard CloudMatchSessionState(rawValue: status)?.canResume == true else { return nil }
             guard let sessionId = item["sessionId"] as? String else { return nil }
             let sessionRequestData = item["sessionRequestData"] as? [String: Any]
             let appId = sessionRequestData?["appId"].flatMap { "\($0)" }
@@ -4945,6 +4956,7 @@ private actor GFNAPIClient {
             host: claimedControl?["ip"] as? String, port: claimedControl?["port"] as? Int
         ) ?? refreshedControlBaseUrl ?? retainedControlBaseUrl
 
+        try CloudMatchSessionResponse.validateAllocationState(active.status)
         for _ in 0..<45 {
             let polled = try await pollSession(session: session, activeSession: active, settings: settings)
             active = polled
@@ -8205,7 +8217,7 @@ final class OpenNOWStore: ObservableObject {
     var primaryRemoteJumpBackSession: RemoteSessionCandidate? {
         let activeId = activeSession?.id
         return resumableSessions.first {
-            $0.id != activeId && ($0.status == 1 || $0.status == 2 || $0.status == 3)
+            $0.id != activeId && CloudMatchSessionState(rawValue: $0.status)?.canResume == true
         }
     }
 
@@ -8337,7 +8349,9 @@ final class OpenNOWStore: ObservableObject {
     var canReopenStreamer: Bool {
         guard supportsEmbeddedStreamer else { return false }
         guard let active = activeSession else { return false }
-        return streamSession == nil && isReadyForStreamer(active)
+        let state = CloudMatchSessionState(rawValue: active.status)
+        return streamSession == nil && (isReadyForStreamer(active)
+            || state?.isPaused == true || state == .resuming)
     }
 
     var effectiveAdState: SessionAdState? {
@@ -9160,7 +9174,7 @@ final class OpenNOWStore: ObservableObject {
     }
 
     private func remoteSessionIsLaunchable(_ candidate: RemoteSessionCandidate) -> Bool {
-        candidate.status == 1 || candidate.status == 2 || candidate.status == 3
+        CloudMatchSessionState(rawValue: candidate.status)?.canResume == true
     }
 
     private func startSessionTasks(autoConnect: Bool = true) {
@@ -9348,8 +9362,8 @@ final class OpenNOWStore: ObservableObject {
                     self.recordDebugEvent("queue", "Provider ended queue request")
                     await NotificationManager.shared.cancelSessionNotifications()
                     break
-                } catch where CloudMatchSessionResponse.isMissingAllocation(error) {
-                    _ = await self.discardMissingSession(active, generation: generation)
+                } catch where CloudMatchSessionResponse.isUnavailableAllocation(error) {
+                    _ = await self.discardUnavailableSession(active, generation: generation)
                     break
                 } catch {
                     consecutivePollFailures += 1
@@ -9515,8 +9529,8 @@ final class OpenNOWStore: ObservableObject {
             }
         } catch where OpenNOWErrorPresenter.isCancellation(error) {
             return
-        } catch where CloudMatchSessionResponse.isMissingAllocation(error) {
-            let replacement = await discardMissingSession(session, generation: generation)
+        } catch where CloudMatchSessionResponse.isUnavailableAllocation(error) {
+            let replacement = await discardUnavailableSession(session, generation: generation)
             guard !Task.isCancelled, generation == authGeneration, activeSession == nil else { return }
             if let replacement {
                 await resumeSession(candidate: replacement)
@@ -9532,9 +9546,9 @@ final class OpenNOWStore: ObservableObject {
         }
     }
 
-    /// A provider-confirmed missing allocation is local history, not a retryable seat.
+    /// A provider-confirmed missing or finished allocation is local history, not a retryable seat.
     /// Refresh first; never substitute a cached listing after a failed account request.
-    private func discardMissingSession(_ allocation: ActiveSession, generation: UUID) async -> RemoteSessionCandidate? {
+    private func discardUnavailableSession(_ allocation: ActiveSession, generation: UUID) async -> RemoteSessionCandidate? {
         guard streamSession == nil, generation == authGeneration,
               activeSession?.id == allocation.id else { return nil }
         await refreshRemoteSessions(reportFailure: false)
@@ -9548,7 +9562,7 @@ final class OpenNOWStore: ObservableObject {
         queueOverlayVisible = false
         sessionError = nil
         lastError = nil
-        clearLocalSessionState(reason: "session.providerConfirmedMissing")
+        clearLocalSessionState(reason: "session.providerConfirmedUnavailable")
         return replacement
     }
 

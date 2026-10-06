@@ -1,8 +1,37 @@
 import Foundation
 
+/// CloudMatch lifecycle values shared by account discovery, resume and loading UI.
+enum CloudMatchSessionState: Int {
+    case unknown = 0
+    case initializing = 1
+    case ready = 2
+    case streaming = 3
+    case pausedUnintentional = 4
+    case pausedIntentional = 5
+    case resuming = 6
+    case finished = 7
+
+    var canResume: Bool { self != .unknown && self != .finished }
+    var isPaused: Bool { self == .pausedUnintentional || self == .pausedIntentional }
+    var isReady: Bool { self == .ready || self == .streaming }
+
+    var loadingDescription: String {
+        switch self {
+        case .initializing: return "Preparing session"
+        case .ready: return "Setting up gaming rig"
+        case .streaming: return "Launching stream"
+        case .pausedUnintentional, .pausedIntentional: return "Session paused"
+        case .resuming: return "Resuming session"
+        case .finished: return "Session ended"
+        case .unknown: return "Checking session status"
+        }
+    }
+}
+
 /// Keep the provider result on errors: HTTP 404 alone cannot prove an allocation ended.
 enum CloudMatchSessionResponse {
     private static let statusKey = "CloudMatchStatusCode"
+    private static let finishedKey = "CloudMatchAllocationFinished"
 
     static func validate(_ json: [String: Any], httpStatus: Int) throws {
         let status = json["requestStatus"] as? [String: Any]
@@ -22,10 +51,24 @@ enum CloudMatchSessionResponse {
             && (error.code == 404 || error.code == 22)
     }
 
+    static func validateAllocationState(_ status: Int?) throws {
+        guard status == CloudMatchSessionState.finished.rawValue else { return }
+        throw NSError(domain: "OpenNOW.Session", code: 7, userInfo: [
+            finishedKey: true,
+            NSLocalizedDescriptionKey: "This cloud session has ended. Choose an available session or start the game again."
+        ])
+    }
+
+    static func isUnavailableAllocation(_ error: Error) -> Bool {
+        let value = error as NSError
+        return isMissingAllocation(error)
+            || (value.domain == "OpenNOW.Session" && value.userInfo[finishedKey] as? Bool == true)
+    }
+
     static func replacement(for allocation: ActiveSession, in sessions: [RemoteSessionCandidate]) -> RemoteSessionCandidate? {
         let matches = sessions.filter {
             $0.id != allocation.id && $0.appId == allocation.game.launchAppId
-                && (1...3).contains($0.status)
+                && CloudMatchSessionState(rawValue: $0.status)?.canResume == true
         }
         return matches.count == 1 ? matches.first : nil
     }

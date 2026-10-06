@@ -1142,6 +1142,9 @@ struct HomeView: View {
             return store.streamSession == nil ? "Ready to return" : "Streaming"
         case 2:
             return "Connecting"
+        case 4, 5: return "Resume session"
+        case 6: return "Resuming session"
+        case 7: return "Session ended"
         default:
             if let queue = session.queuePosition {
                 return queue == 1 ? "Next in queue" : "Queue #\(queue)"
