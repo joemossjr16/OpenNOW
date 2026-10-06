@@ -11,6 +11,18 @@ struct CachedAccountSnapshot: Codable, Equatable {
     let vpcId: String
 }
 
+enum AccountIdentityRefresh {
+    /// Identity responses often omit membership. Retain the last known tier only
+    /// for the same account; an explicit tier still replaces it.
+    static func profile(userId: String, displayName: String, email: String?,
+                        membershipTier: String?, previous: UserProfile?) -> UserProfile {
+        let reportedTier = membershipTier?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let retainedTier = previous?.userId == userId ? previous?.membershipTier : nil
+        return UserProfile(userId: userId, displayName: displayName, email: email,
+            membershipTier: reportedTier.flatMap { $0.isEmpty ? nil : $0 } ?? retainedTier ?? "FREE")
+    }
+}
+
 enum OpenNOWErrorPresenter {
     /// Whether this error is a cancellation rather than a failure.
     ///

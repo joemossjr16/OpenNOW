@@ -3959,7 +3959,7 @@ private actor GFNAPIClient {
         )
         var retainedTokens = newTokens
         retainedTokens.authClientId = existing.tokens.authClientId
-        let user = (try? await fetchUser(tokens: retainedTokens)) ?? existing.user
+        let user = (try? await fetchUser(tokens: retainedTokens, previous: existing.user)) ?? existing.user
         return AuthSession(provider: existing.provider, tokens: retainedTokens, user: user)
     }
 
@@ -4008,7 +4008,7 @@ private actor GFNAPIClient {
         )
         var retainedTokens = newTokens
         retainedTokens.authClientId = existing.tokens.authClientId
-        let user = (try? await fetchUser(tokens: retainedTokens)) ?? existing.user
+        let user = (try? await fetchUser(tokens: retainedTokens, previous: existing.user)) ?? existing.user
         return AuthSession(provider: existing.provider, tokens: retainedTokens, user: user)
     }
 
@@ -4799,13 +4799,13 @@ private actor GFNAPIClient {
         streamingBaseUrl: String,
         vpcId: String,
         settings: AppSettings,
+        streamProfile: StreamVideoProfile,
         deviceId: String,
         touchProvisionedOverride: Bool? = nil
     ) async throws -> ActiveSession {
         let token = session.tokens.idToken ?? session.tokens.accessToken
         let clientId = UUID().uuidString
         let claimDeviceId = deviceId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? UUID().uuidString : deviceId
-        let streamProfile = StreamSettingsResolver.profile(for: settings, membershipTier: session.user.membershipTier)
         // Claiming repeats the session request body. During recovery, retain the input device
         // profile chosen when this allocation was created instead of letting a transient hot-plug
         // silently change a touch session into a controller session (or vice versa).
@@ -5593,7 +5593,7 @@ private actor GFNAPIClient {
         }
     }
 
-    private func fetchUser(tokens: AuthTokens) async throws -> UserProfile {
+    private func fetchUser(tokens: AuthTokens, previous: UserProfile? = nil) async throws -> UserProfile {
         let jwtPayload = Self.decodeJWTPayload(token: tokens.idToken ?? tokens.accessToken)
         if let sub = jwtPayload["sub"] as? String {
             let email = jwtPayload["email"] as? String
@@ -5602,7 +5602,8 @@ private actor GFNAPIClient {
                 .first
                 .map { String($0) }
             let displayName = (jwtPayload["preferred_username"] as? String) ?? emailDisplayName ?? "User"
-            return UserProfile(userId: sub, displayName: displayName, email: email, membershipTier: (jwtPayload["gfn_tier"] as? String) ?? "FREE")
+            return AccountIdentityRefresh.profile(userId: sub, displayName: displayName, email: email,
+                membershipTier: jwtPayload["gfn_tier"] as? String, previous: previous)
         }
 
         let (data, response) = try await request(
@@ -5627,7 +5628,8 @@ private actor GFNAPIClient {
             .first
             .map { String($0) }
         let displayName = (json["preferred_username"] as? String) ?? emailDisplayName ?? "User"
-        return UserProfile(userId: sub, displayName: displayName, email: email, membershipTier: "FREE")
+        return AccountIdentityRefresh.profile(userId: sub, displayName: displayName, email: email,
+            membershipTier: json["gfn_tier"] as? String, previous: previous)
     }
 
     private func requestClientToken(accessToken: String) async throws -> (token: String, expiresAt: TimeInterval) {
@@ -7688,6 +7690,7 @@ final class OpenNOWStore: ObservableObject {
                     streamingBaseUrl: baseUrl,
                     vpcId: cachedVpcId,
                     settings: launchSettings,
+                    streamProfile: requestedStreamProfile(for: launchSettings, session: refreshed),
                     deviceId: deviceId
                 )
                 streamHandoff.didClaim(allocationID: started.id)
@@ -7739,10 +7742,7 @@ final class OpenNOWStore: ObservableObject {
                         game: game,
                         vpcId: cachedVpcId,
                         settings: settings,
-                        streamProfile: StreamSettingsResolver.profile(
-                            for: settings,
-                            membershipTier: subscription?.membershipTier ?? user?.membershipTier
-                        ),
+                        streamProfile: requestedStreamProfile(for: settings, session: refreshed),
                         streamingBaseUrl: baseUrl,
                         launchAppIdOverride: launchAppId,
                         launcherName: effectiveLaunchOption?.storefront ?? "Auto",
@@ -8192,6 +8192,7 @@ final class OpenNOWStore: ObservableObject {
                 streamingBaseUrl: refreshed.provider.streamingServiceUrl,
                 vpcId: cachedVpcId,
                 settings: streamSettings,
+                streamProfile: requestedStreamProfile(for: streamSettings, session: refreshed),
                 deviceId: persistentDeviceId()
             )
             streamHandoff.didClaim(allocationID: claimed.id)
@@ -9142,15 +9143,17 @@ final class OpenNOWStore: ObservableObject {
         !StreamZonePolicy.isBlocked(candidate.serverIp)
     }
 
+    private func requestedStreamProfile(for settings: AppSettings, session: AuthSession) -> StreamVideoProfile {
+        StreamSettingsResolver.profile(for: settings,
+            membershipTier: subscription?.membershipTier ?? session.user.membershipTier)
+    }
+
     private func remoteSession(
         _ candidate: RemoteSessionCandidate,
         matchesStreamSettings settings: AppSettings,
         session: AuthSession
     ) -> Bool {
-        let profile = StreamSettingsResolver.profile(
-            for: settings,
-            membershipTier: subscription?.membershipTier ?? session.user.membershipTier
-        )
+        let profile = requestedStreamProfile(for: settings, session: session)
         let expectedSignature = StreamSettingsResolver.sessionSignature(for: settings, profile: profile)
         let expectedResolution = "\(profile.width)x\(profile.height)"
         guard candidate.streamSettingsSignature?.trimmingCharacters(in: .whitespacesAndNewlines) == expectedSignature else {
@@ -9472,6 +9475,7 @@ final class OpenNOWStore: ObservableObject {
             let claimed = try await api.claimSession(session: refreshed, candidate: candidate,
                 game: allocation.game, streamingBaseUrl: allocation.streamingBaseUrl,
                 vpcId: allocation.zone, settings: streamSettings,
+                streamProfile: requestedStreamProfile(for: streamSettings, session: refreshed),
                 deviceId: persistentDeviceId(), touchProvisionedOverride: allocation.touchProvisioned)
             try Task.checkCancellation()
             guard activeSession?.id == allocation.id else { throw CancellationError() }
@@ -9528,6 +9532,7 @@ final class OpenNOWStore: ObservableObject {
                 return try await api.claimSession(session: refreshed, candidate: candidate,
                     game: allocation.game, streamingBaseUrl: allocation.streamingBaseUrl,
                     vpcId: allocation.zone, settings: requestedSettings,
+                    streamProfile: requestedStreamProfile(for: requestedSettings, session: refreshed),
                     deviceId: persistentDeviceId(), touchProvisionedOverride: allocation.touchProvisioned)
             })
             try Task.checkCancellation()

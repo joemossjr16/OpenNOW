@@ -284,12 +284,18 @@ struct DiagnosticsTraceEntry: Identifiable, Equatable {
 actor DiagnosticsHTTPTraceStore {
     static let shared = DiagnosticsHTTPTraceStore()
 
+    private let resumeTraceURL: URL
     private var traceEntries: [DiagnosticsTraceEntry] = []
     private var entries: [String] = []
     private var storedBytes = 0
     private let maximumEntries = 180
     private let maximumStoredBytes = 700_000
     private let maximumBodyCharacters = 24_000
+
+    init(resumeTraceURL: URL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("opennow-last-session-resume.txt")) {
+        self.resumeTraceURL = resumeTraceURL
+    }
 
     func record(
         source: String,
@@ -342,6 +348,22 @@ actor DiagnosticsHTTPTraceStore {
             storedBytes -= entries.removeFirst().utf8.count
             if !traceEntries.isEmpty { traceEntries.removeFirst() }
         }
+        // Keep one bounded, already-redacted handover request available after
+        // app closure, when the in-memory API list is otherwise lost.
+        if Self.isSessionResume(request) {
+            try? Data(rendered.utf8).write(to: resumeTraceURL, options: .atomic)
+        }
+    }
+
+    private static func isSessionResume(_ request: URLRequest) -> Bool {
+        let path = request.url?.pathComponents.filter { $0 != "/" } ?? []
+        guard request.httpMethod == "PUT", path.count == 3,
+              path[0] == "v2", path[1] == "session",
+              let body = request.httpBody,
+              let json = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] else {
+            return false
+        }
+        return json["action"] as? Int == 2 && json["data"] as? String == "RESUME"
     }
 
     /// Newest first, because that is the one you came to look at.

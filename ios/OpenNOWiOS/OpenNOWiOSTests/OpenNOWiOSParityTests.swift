@@ -2389,6 +2389,78 @@ final class OpenNOWiOSParityTests: XCTestCase {
         }
     }
 
+    func testIdentityRefreshWithoutMembershipRetainsPaidStreamLimitsForSameAccount() {
+        let previous = UserProfile(userId: "paid-user", displayName: "Old name", email: nil,
+            membershipTier: "ULTIMATE")
+        for missingTier: String? in [nil, "", " "] {
+            let refreshed = AccountIdentityRefresh.profile(userId: previous.userId,
+                displayName: "Updated name", email: "player@example.com",
+                membershipTier: missingTier, previous: previous)
+            XCTAssertEqual(refreshed.membershipTier, "ULTIMATE")
+            XCTAssertEqual(refreshed.displayName, "Updated name")
+            XCTAssertEqual(refreshed.email, "player@example.com")
+            for (resolution, aspect) in [("1600x1200", "4:3"), ("2560x1080", "21:9")] {
+                var settings = AppSettings.default
+                settings.streamPreset = .custom
+                settings.preferredResolution = resolution
+                settings.preferredAspectRatio = aspect
+                settings.preferredFPS = 120
+                let profile = StreamSettingsResolver.profile(for: settings,
+                    membershipTier: refreshed.membershipTier)
+                XCTAssertEqual(profile.resolutionString, resolution)
+                XCTAssertEqual(profile.fps, 120)
+            }
+        }
+    }
+
+    func testIdentityRefreshHonorsExplicitMembershipDowngrade() {
+        let previous = UserProfile(userId: "paid-user", displayName: "Player", email: nil,
+            membershipTier: "ULTIMATE")
+        let refreshed = AccountIdentityRefresh.profile(userId: previous.userId,
+            displayName: previous.displayName, email: nil, membershipTier: "FREE", previous: previous)
+        XCTAssertEqual(refreshed.membershipTier, "FREE")
+        var settings = AppSettings.default
+        settings.preferredFPS = 120
+        XCTAssertEqual(StreamSettingsResolver.profile(for: settings,
+            membershipTier: refreshed.membershipTier).fps, 60)
+    }
+
+    func testLastResumeTracePersistsRedactedRequestAndSurvivesOtherRequests() async throws {
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: destination) }
+        let store = DiagnosticsHTTPTraceStore(resumeTraceURL: destination)
+        var request = URLRequest(url: URL(string: "https://resume.example/v2/session/test-seat")!)
+        request.httpMethod = "PUT"
+        request.setValue("Bearer secret-access-token", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "action": 2, "data": "RESUME", "sessionRequestData": [
+                "deviceHashId": "private-device", "clientRequestMonitorSettings": [[
+                    "widthInPixels": 1600, "heightInPixels": 1200, "framesPerSecond": 120]]]])
+        await store.record(source: "test", request: request,
+            response: HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil),
+            responseData: Data(#"{"session":{"monitorSettings":[{"widthInPixels":1280,"heightInPixels":720}]}}"#.utf8),
+            duration: 0.1, error: nil)
+        let saved = try String(contentsOf: destination, encoding: .utf8)
+        XCTAssertTrue(saved.contains("1600"))
+        XCTAssertTrue(saved.contains("1280"))
+        XCTAssertFalse(saved.contains("secret-access-token"))
+        XCTAssertFalse(saved.contains("private-device"))
+        request.httpMethod = "GET"
+        await store.record(source: "test", request: request, response: nil, responseData: nil,
+            duration: 0.1, error: nil)
+        XCTAssertEqual(try String(contentsOf: destination, encoding: .utf8), saved)
+    }
+
+    func testIdentityRefreshDoesNotCarryMembershipAcrossAccounts() {
+        let previous = UserProfile(userId: "paid-user", displayName: "Player", email: nil,
+            membershipTier: "ULTIMATE")
+        for oldProfile: UserProfile? in [nil, previous] {
+            let refreshed = AccountIdentityRefresh.profile(userId: "different-user",
+                displayName: "Other player", email: nil, membershipTier: nil, previous: oldProfile)
+            XCTAssertEqual(refreshed.membershipTier, "FREE")
+        }
+    }
+
     func testAccountSnapshotRoundTripsSubscriptionStorageAndConnections() throws {
         let storage = StorageAddon(
             type: "STORAGE",
