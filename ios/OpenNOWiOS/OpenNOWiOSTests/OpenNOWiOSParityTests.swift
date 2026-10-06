@@ -12,6 +12,44 @@ import MetalFX
 import CoreImage
 @testable import OpenNOWiOS
 
+@MainActor
+private final class GameDetailsPresentationTestDriver: ObservableObject {
+    @Published var selectedGame: CloudGame?
+    var activate: (() -> Void)?
+    var registry: GameDetailsTransitionRegistry?
+}
+
+private struct GameDetailsPresentationTestSource: View {
+    @Environment(\.gameDetailsTransition) private var transition
+    @ObservedObject var driver: GameDetailsPresentationTestDriver
+    let game: CloudGame
+    let sourceID: UUID
+
+    var body: some View {
+        Color.blue.frame(width: 160, height: 240)
+            .gameDetailsArtworkSource(id: sourceID)
+            .onAppear {
+                driver.registry = transition?.registry
+                driver.activate = {
+                    transition?.selectSource(GameDetailsTransitionOrigin(sourceID: sourceID, gameKey: catalogStableGameKey(game)))
+                    driver.selectedGame = game
+                }
+            }
+    }
+}
+
+private struct GameDetailsPresentationTestRoot: View {
+    @ObservedObject var driver: GameDetailsPresentationTestDriver
+    let store: OpenNOWStore
+    let game: CloudGame
+    let sourceID: UUID
+
+    var body: some View {
+        GameDetailsPresentationTestSource(driver: driver, game: game, sourceID: sourceID)
+            .presentGameDetailsSheet(selectedGame: $driver.selectedGame, store: store) { _, _ in }
+    }
+}
+
 final class OpenNOWiOSParityTests: XCTestCase {
     func testControllerShortcutsPersistWithoutChangingSavedRumbleGain() throws {
         let legacy = try JSONDecoder().decode(AppSettings.self, from: Data("{}".utf8))
@@ -84,6 +122,82 @@ final class OpenNOWiOSParityTests: XCTestCase {
         nav.handle(.activate)
         XCTAssertEqual(nav.selected, first)
         XCTAssertEqual(activations, 1, "Selecting after a page change must not activate a control")
+    }
+
+    @MainActor
+    func testGameDetailsUsesNativeZoomOnFirstPresentationAndClearsSourceAfterDismissal() async throws {
+        guard #available(iOS 18, *) else { throw XCTSkip("Native zoom requires iOS 18") }
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
+        let store = OpenNOWStore()
+        let driver = GameDetailsPresentationTestDriver()
+        let game = OpenNOWStore.debugStorePreviewGames[1]
+        let sourceID = UUID()
+        let host = UIHostingController(rootView: GameDetailsPresentationTestRoot(
+            driver: driver, store: store, game: game, sourceID: sourceID
+        ))
+        let window = UIWindow(windowScene: scene)
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true; window.rootViewController = nil; previousKeyWindow?.makeKeyAndVisible() }
+        try await Task.sleep(for: .milliseconds(500))
+        let activate = try XCTUnwrap(driver.activate)
+        activate()
+        try await Task.sleep(for: .milliseconds(900))
+        let presentation = try XCTUnwrap(host.presentedViewController)
+        XCTAssertNotNil(presentation.preferredTransition, "The first presentation must receive its native zoom transition")
+        XCTAssertEqual(driver.registry?.sourceID(for: game), sourceID)
+        driver.selectedGame = nil
+        // Native zoom dismissal completes asynchronously; wait for its lifecycle callback,
+        // rather than assuming the iPad's animation will finish at the iPhone's timing.
+        for _ in 0..<50 {
+            if host.presentedViewController == nil, driver.registry?.origin == nil { break }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        XCTAssertNil(host.presentedViewController)
+        XCTAssertNil(driver.registry?.origin)
+    }
+
+    func testHeroProgressKeepsCircularEndsThroughoutFill() {
+        let bounds = CGRect(x: 0, y: 0, width: 28, height: 6)
+        for (progress, width): (CGFloat, CGFloat) in [(0, 6), (0.5, 17), (1, 28)] {
+            let path = HeroPageProgressFill(progress: progress).path(in: bounds)
+            XCTAssertEqual(path.boundingRect.width, width, accuracy: 0.001)
+            XCTAssertEqual(path.boundingRect.height, 6, accuracy: 0.001)
+            XCTAssertTrue(path.contains(CGPoint(x: width - 3, y: 0.25)))
+            XCTAssertFalse(path.contains(CGPoint(x: width - 0.25, y: 0.25)), "The right end must remain rounded")
+            XCTAssertFalse(path.contains(CGPoint(x: 0.25, y: 0.25)), "The left end must remain rounded")
+        }
+    }
+
+    @MainActor
+    func testStorePlayUsesSavedLauncherAndOtherwiseAsksForChoice() {
+        let steam = GameLaunchOption(storefront: "STEAM", appId: "101", supportedControls: nil,
+            libraryStatus: "PLATFORM_SYNC", lastPlayedDate: "2026-10-03T14:00:00Z")
+        let epic = GameLaunchOption(storefront: "EPIC", appId: "202", supportedControls: nil,
+            libraryStatus: "NOT_OWNED")
+        let game = Self.makeGame(title: "Store Launch Choice Test", controls: [], options: [steam, epic])
+        let store = OpenNOWStore()
+        store.settings.defaultGameVariantIds.removeValue(forKey: game.id)
+        XCTAssertEqual(store.launchChoice(for: game), .chooseLauncher)
+        store.settings.defaultGameVariantIds[game.id] = epic.id
+        XCTAssertEqual(store.launchChoice(for: game), .launch(epic))
+        XCTAssertEqual(game.lastPlayedDate, steam.lastPlayedDate)
+        XCTAssertEqual(game.ownedStorefronts, ["STEAM"])
+    }
+
+    func testStoreLinksRequireHTTPSAndOldLauncherCacheStillDecodes() throws {
+        let old = Data(#"{"storefront":"STEAM","appId":"101","supportedControls":null}"#.utf8)
+        let decoded = try JSONDecoder().decode(GameLaunchOption.self, from: old)
+        XCTAssertNil(decoded.libraryStatus)
+        XCTAssertNil(decoded.lastPlayedDate)
+        XCTAssertNil(decoded.storeURL)
+
+        var option = decoded
+        option.storeURL = "https://store.steampowered.com/app/101"
+        XCTAssertNotNil(option.externalStoreURL)
+        option.storeURL = "http://store.steampowered.com/app/101"
+        XCTAssertNil(option.externalStoreURL)
     }
 
     func testQueueSelectorUsesAdvertisedRegionalRoute() {
@@ -336,7 +450,7 @@ final class OpenNOWiOSParityTests: XCTestCase {
                           "The requested settings category must actually be pushed: \(titles())")
             try await selectSidebarRow(0)
             NSLog("[SettingsNavigationTest] home selected")
-            XCTAssertTrue(titles().contains(where: ["OpenNOW", "Store"].contains) && !titles().contains(where: settingsTitles.contains),
+            XCTAssertTrue(titles().contains("Store") && !titles().contains(where: settingsTitles.contains),
                           "Home navigation must replace the settings stack: \(titles())")
         }
     }
@@ -404,6 +518,23 @@ final class OpenNOWiOSParityTests: XCTestCase {
             XCTAssertEqual(saved.controllerRumbleStrength, gain)
             XCTAssertFalse(saved.phoneRumbleFallback)
         }
+    }
+
+    func testLiveActivityProgressRemainsFiniteAndBoundedForRestoredState() {
+        for progress: Double? in [nil, .nan, .infinity, -.infinity, -5, 0, 0.5, 1, 5, .greatestFiniteMagnitude] {
+            for phase in [QueueActivityAttributes.ContentState.Phase.queued, .waiting, .ready] {
+                let fraction = QueueActivityProgress.barFraction(progress, phase: phase)
+                XCTAssertTrue(fraction.isFinite)
+                XCTAssertTrue((0...1).contains(fraction))
+            }
+        }
+        XCTAssertNil(QueueActivityProgress.normalized(.nan))
+        XCTAssertNil(QueueActivityProgress.normalized(.infinity))
+        XCTAssertEqual(QueueActivityProgress.normalized(-1), 0)
+        XCTAssertEqual(QueueActivityProgress.normalized(2), 1)
+        XCTAssertEqual(QueueActivityProgress.barFraction(0.5, phase: .queued), 0.5)
+        XCTAssertEqual(QueueActivityProgress.barFraction(nil, phase: .waiting), 0.75)
+        XCTAssertEqual(QueueActivityProgress.barFraction(nil, phase: .ready), 1)
     }
 
     func testMetal4RenderingIsOptInAndPersistsIndependentlyOfHDRAndMetalFX() throws {
@@ -4000,7 +4131,8 @@ final class OpenNOWiOSParityTests: XCTestCase {
         title: String,
         controls: [String],
         sectionId: String? = nil,
-        sectionTitle: String? = nil
+        sectionTitle: String? = nil,
+        options: [GameLaunchOption]? = nil
     ) -> CloudGame {
         CloudGame(
             id: title.lowercased(),
@@ -4010,7 +4142,7 @@ final class OpenNOWiOSParityTests: XCTestCase {
             icon: "",
             imageUrl: nil,
             launchAppId: "1",
-            launchOptions: [GameLaunchOption(storefront: "STEAM", appId: "1", supportedControls: controls)],
+            launchOptions: options ?? [GameLaunchOption(storefront: "STEAM", appId: "1", supportedControls: controls)],
             uuid: nil,
             summary: nil,
             longDescription: nil,
@@ -4378,6 +4510,7 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertTrue(
             nativeStreamShouldUseFilteredRenderer(
                 osMajorVersion: 26,
+                videoCodec: .h264,
                 streamSharpeningEnabled: false,
                 isSimulator: false
             )
@@ -4385,6 +4518,7 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertFalse(
             nativeStreamShouldUseFilteredRenderer(
                 osMajorVersion: 25,
+                videoCodec: .h264,
                 streamSharpeningEnabled: false,
                 isSimulator: false
             )
@@ -4392,10 +4526,28 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertTrue(
             nativeStreamShouldUseFilteredRenderer(
                 osMajorVersion: 25,
+                videoCodec: .h264,
                 streamSharpeningEnabled: true,
                 isSimulator: false
             )
         )
+    }
+
+    func testHEVCUsesFilteredRendererOnIOS18WithoutSharpening() {
+        XCTAssertTrue(nativeStreamShouldUseFilteredRenderer(
+            osMajorVersion: 18, videoCodec: .h265,
+            streamSharpeningEnabled: false, isSimulator: false
+        ))
+        XCTAssertTrue(nativeStreamShouldUseFilteredRenderer(
+            osMajorVersion: 18, videoCodec: .h265,
+            streamSharpeningEnabled: true, isSimulator: false
+        ))
+        for codec in [NativeStreamVideoCodec.h264, .av1] {
+            XCTAssertFalse(nativeStreamShouldUseFilteredRenderer(
+                osMajorVersion: 18, videoCodec: codec,
+                streamSharpeningEnabled: false, isSimulator: false
+            ))
+        }
     }
 
     func testNativeStreamTransportRecoveryMatchesAndroidMobileTiming() {
@@ -4489,6 +4641,66 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertNil(SessionControlRouting.baseURL(host: "media.example.invalid", port: 443))
         XCTAssertNil(SessionControlRouting.baseURL(host: "np-ams-01.cloudmatchbeta.nvidiagrid.net", port: 8443))
         XCTAssertNil(SessionControlRouting.baseURL(host: "np-ams-01.cloudmatchbeta.nvidiagrid.net.attacker.test", port: 443))
+    }
+
+    private func queueFixture() -> ActiveSession {
+        ActiveSession(id: "queue", game: Self.makeGame(title: "Queue Test", controls: []),
+            startedAt: .now, status: 1, queuePosition: 1, seatSetupStep: nil,
+            serverIp: nil, mediaIp: nil, mediaPort: 0, signalingServer: nil,
+            signalingUrl: nil, iceServers: [], zone: "NP-PDX-01",
+            streamingBaseUrl: "https://us-west.cloudmatchbeta.nvidiagrid.net",
+            clientId: "client", deviceId: "device", adState: nil)
+    }
+
+    func testPartialPollRetainsAssignedControlRouteThroughReadyTransition() {
+        var previous = queueFixture()
+        previous.sessionControlBaseUrl = "https://np-pdx-01.cloudmatchbeta.nvidiagrid.net"
+        var next = previous
+        next.sessionControlBaseUrl = nil
+        for status in [1, 2, 3] {
+            next.status = status
+            let merged = mergeQueueSessionState(previous: previous, next: next)
+            XCTAssertEqual(SessionControlRouting.pollBase(for: merged), previous.sessionControlBaseUrl)
+        }
+        next.sessionControlBaseUrl = "https://np-ams-01.cloudmatchbeta.nvidiagrid.net"
+        XCTAssertEqual(mergeQueueSessionState(previous: previous, next: next).sessionControlBaseUrl,
+                       next.sessionControlBaseUrl)
+    }
+
+    func testReadyAllocationHydratesFromRigWithoutRedirectingQueuedPolls() {
+        var session = queueFixture()
+        session.serverIp = "203.0.113.24"
+        XCTAssertNil(SessionControlRouting.readyDetailsBase(for: session))
+        session.status = 2
+        XCTAssertEqual(SessionControlRouting.readyDetailsBase(for: session), "https://203.0.113.24")
+        session.status = 3
+        XCTAssertEqual(SessionControlRouting.readyDetailsBase(for: session), "https://203.0.113.24")
+        session.serverIp = "np-pdx-01.cloudmatchbeta.nvidiagrid.net"
+        XCTAssertNil(SessionControlRouting.readyDetailsBase(for: session))
+    }
+
+    func testNextInQueueAndMissingSetupMetadataDoNotStartSetupTimeout() {
+        var session = queueFixture()
+        XCTAssertTrue(QueueSessionPhase.isQueued(session))
+        XCTAssertFalse(QueueSessionPhase.isSettingUp(session))
+        session.queuePosition = nil
+        XCTAssertFalse(QueueSessionPhase.isSettingUp(session))
+        session.seatSetupStep = 1
+        XCTAssertTrue(QueueSessionPhase.isQueued(session))
+        XCTAssertFalse(QueueSessionPhase.isSettingUp(session))
+        session.seatSetupStep = 3
+        XCTAssertTrue(QueueSessionPhase.isSettingUp(session))
+        session.status = 2
+        XCTAssertFalse(QueueSessionPhase.isSettingUp(session))
+    }
+
+    func testLibraryQueryUsesOwnedVariantFilterAndRegistryMissDetectionIsSpecific() throws {
+        let encoded = try JSONSerialization.data(withJSONObject: CatalogQueryPolicy.libraryFilter, options: .sortedKeys)
+        XCTAssertEqual(String(decoding: encoded, as: UTF8.self),
+                       #"{"variants":{"gfn":{"library":{"status":{"notEquals":"NOT_OWNED"}}}}}"#)
+        XCTAssertTrue(CatalogQueryPolicy.isRegistryMiss(#"{"errors":[{"message":"PersistedQueryNotFound"}]}"#))
+        XCTAssertTrue(CatalogQueryPolicy.isRegistryMiss("PERSISTED_QUERY_NOT_FOUND"))
+        XCTAssertFalse(CatalogQueryPolicy.isRegistryMiss("Unauthorized"))
     }
 
     func testAbandonedQueueIsTerminalEvenWhenProviderReturnsHTTP503() {
