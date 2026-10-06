@@ -1637,6 +1637,89 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(NativeStreamNVSTConfiguration.endpoints(sessionObj: ["connectionInfo": [["port": 322, "usage": 16, "resourcePath": "rtsps://new.example:322"]]], fallbackHost: "old.example"), ["rtsps://new.example:322"])
     }
 
+    @MainActor
+    func testRestoredNativeAllocationCompletesClaimBeforeUsingRefreshedEndpoint() async throws {
+        let handoff = NativeStreamSessionHandoff()
+        var old = queueFixture()
+        old.status = 3
+        old.nativeRtspsEndpoints = ["rtsps://old.example:322"]
+        handoff.restore(allocationID: old.id)
+        var claims = 0
+        let ready = try await handoff.prepare(old, usesNativeNVST: true) { allocation in
+            claims += 1
+            var updated = allocation
+            updated.serverIp = "new.example"
+            updated.nativeRtspsEndpoints = ["rtsps://new.example:322"]
+            return updated
+        }
+        XCTAssertEqual(claims, 1)
+        XCTAssertEqual(ready.nativeRtspsEndpoints, ["rtsps://new.example:322"])
+        _ = try await handoff.prepare(ready, usesNativeNVST: true) { allocation in
+            claims += 1
+            return allocation
+        }
+        XCTAssertEqual(claims, 1, "Polls after a successful restore must not repeat RESUME")
+    }
+
+    @MainActor
+    func testFailedRestoredNativeClaimRemainsPendingForRetry() async throws {
+        let handoff = NativeStreamSessionHandoff()
+        var old = queueFixture(); old.status = 2
+        handoff.restore(allocationID: old.id)
+        var claims = 0
+        do {
+            _ = try await handoff.prepare(old, usesNativeNVST: true) { _ in
+                claims += 1
+                throw NSError(domain: "OpenNOW.Session", code: 4)
+            }
+            XCTFail("Failed hand-over must not hand stale endpoints to NVST")
+        } catch { XCTAssertEqual((error as NSError).code, 4) }
+        _ = try await handoff.prepare(old, usesNativeNVST: true) { allocation in
+            claims += 1
+            return allocation
+        }
+        XCTAssertEqual(claims, 2)
+    }
+
+    @MainActor
+    func testNativeHandoffLeavesFreshQueuedWebRTCAndAlreadyClaimedAllocationsAlone() async throws {
+        let handoff = NativeStreamSessionHandoff()
+        var allocation = queueFixture(); allocation.status = 3
+        var claims = 0
+        let claim: (ActiveSession) async throws -> ActiveSession = {
+            claims += 1
+            return $0
+        }
+        _ = try await handoff.prepare(allocation, usesNativeNVST: true, claim: claim)
+        handoff.restore(allocationID: allocation.id)
+        allocation.status = 1
+        _ = try await handoff.prepare(allocation, usesNativeNVST: true, claim: claim)
+        allocation.status = 3
+        _ = try await handoff.prepare(allocation, usesNativeNVST: false, claim: claim)
+        handoff.didClaim(allocationID: allocation.id)
+        _ = try await handoff.prepare(allocation, usesNativeNVST: true, claim: claim)
+        XCTAssertEqual(claims, 0)
+    }
+
+    func testClaimChecksProviderResultEvenWhenHTTPIsSuccessful() throws {
+        XCTAssertNoThrow(try CloudMatchClaimResponse.validate(
+            ["requestStatus": ["statusCode": 1]], httpStatus: 200))
+        XCTAssertThrowsError(try CloudMatchClaimResponse.validate(
+            ["requestStatus": ["statusCode": 4, "statusDescription": "INTERNAL_ERROR_STATUS 8A8C0000"]],
+            httpStatus: 200)) { error in
+            XCTAssertEqual((error as NSError).code, 4)
+            XCTAssertEqual(error.localizedDescription, "INTERNAL_ERROR_STATUS 8A8C0000")
+        }
+        XCTAssertThrowsError(try CloudMatchClaimResponse.validate([:], httpStatus: 200))
+        XCTAssertThrowsError(try CloudMatchClaimResponse.validate(
+            ["requestStatus": ["statusCode": 1]], httpStatus: 503))
+        for httpStatus in [200, 400] {
+            XCTAssertNoThrow(try CloudMatchClaimResponse.validate(
+                ["requestStatus": ["statusCode": 34, "statusDescription": "SESSION_NOT_PAUSED"]],
+                httpStatus: httpStatus))
+        }
+    }
+
     func testNativeProvisioningPreservesQualityAndIdentityOnLaunchAndResume() throws {
         for action: Int? in [nil, 2] {
             var body: [String: Any] = ["sessionRequestData": [

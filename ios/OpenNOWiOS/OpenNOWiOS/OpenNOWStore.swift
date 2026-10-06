@@ -2654,6 +2654,22 @@ enum CloudMatchQueueStatus {
     }
 }
 
+enum CloudMatchClaimResponse {
+    static func validate(_ json: [String: Any], httpStatus: Int) throws {
+        let status = json["requestStatus"] as? [String: Any]
+        let code = status?["statusCode"] as? Int ?? 0
+        let description = status?["statusDescription"] as? String ?? "Session resume failed"
+        // The allocation may already be resuming when the hand-over arrives. Match the
+        // desktop client: poll its current details instead of treating this as acceptance.
+        if (httpStatus == 200 || httpStatus == 400),
+           code == 34 || description.contains("SESSION_NOT_PAUSED") { return }
+        guard httpStatus == 200, code == 1 else {
+            throw NSError(domain: "OpenNOW.Session", code: httpStatus == 200 ? code : httpStatus,
+                          userInfo: [NSLocalizedDescriptionKey: description])
+        }
+    }
+}
+
 func normalizeGameStore(_ store: String) -> String {
     store
         .uppercased()
@@ -4865,11 +4881,8 @@ private actor GFNAPIClient {
                 body: claimBody,
                 sessionSettings: settings
             )
-            guard claimResponse.statusCode == 200 else {
-                let text = String(data: claimData, encoding: .utf8) ?? "unknown"
-                throw NSError(domain: "OpenNOW.Session", code: claimResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: text])
-            }
-            claimJSON = (try? parseJSON(claimData)) ?? [:]
+            claimJSON = try parseJSON(claimData)
+            try CloudMatchClaimResponse.validate(claimJSON, httpStatus: claimResponse.statusCode)
         }
 
         let claimSessionObj = claimJSON["session"] as? [String: Any] ?? [:]
@@ -6495,6 +6508,7 @@ final class OpenNOWStore: ObservableObject {
     #endif
 
     private let api = GFNAPIClient()
+    private let streamHandoff = NativeStreamSessionHandoff()
     private let logger = Logger(subsystem: "OpenNOWiOS", category: "Session")
     private var debugEvents: [DebugLifecycleEvent] = []
     private let defaults = UserDefaults.standard
@@ -6583,6 +6597,7 @@ final class OpenNOWStore: ObservableObject {
         activeStreamSettings = activeSession == nil ? nil : Self.loadActiveStreamSettings(from: defaults)
         // Older builds persisted live controls only globally, leaving this snapshot stale.
         activeStreamSettings?.applyStreamerControls(from: settings)
+        streamHandoff.restore(allocationID: activeSession?.id)
         user = authSession?.user
         if let authSession {
             hydrateCachedCatalog(for: authSession)
@@ -7638,6 +7653,7 @@ final class OpenNOWStore: ObservableObject {
                     settings: launchSettings,
                     deviceId: deviceId
                 )
+                streamHandoff.didClaim(allocationID: started.id)
             } else if let launchingCandidate {
                 let pending = ActiveSession(
                     id: launchingCandidate.id,
@@ -8115,6 +8131,7 @@ final class OpenNOWStore: ObservableObject {
                 settings: streamSettings,
                 deviceId: persistentDeviceId()
             )
+            streamHandoff.didClaim(allocationID: claimed.id)
             activeSession = claimed
             activeStreamSettings = streamSettings
             adReportStateById = [:]
@@ -9190,7 +9207,7 @@ final class OpenNOWStore: ObservableObject {
                             self.sessionPollTask?.cancel()
                             continue
                         }
-                        let handoffSession = await self.prepareSessionForStreamer(polled)
+                        let handoffSession = try await self.prepareSessionForStreamer(polled)
                         self.logger.notice(
                             "Session ready for streamer handoff id=\(handoffSession.id, privacy: .public) status=\(handoffSession.status) readyStreak=\(readyPollStreak) readyHoldSeconds=\(Int(readyHoldElapsed)). Presenting iOS streamer."
                         )
@@ -9335,14 +9352,33 @@ final class OpenNOWStore: ObservableObject {
         return false
     }
 
-    private func prepareSessionForStreamer(_ session: ActiveSession) async -> ActiveSession {
+    private func prepareSessionForStreamer(_ allocation: ActiveSession) async throws -> ActiveSession {
+        let session = try await streamHandoff.prepare(allocation,
+            usesNativeNVST: currentStreamerSettings.experimentalNativeNVSTEnabled) { allocation in
+            guard let currentAuth = authSession else { throw CancellationError() }
+            let refreshed = try await api.refreshSession(currentAuth)
+            authSession = refreshed
+            persistAuthSession(refreshed)
+            let streamSettings = currentStreamerSettings
+            let candidate = RemoteSessionCandidate(id: allocation.id,
+                appId: allocation.game.launchAppId, status: allocation.status,
+                serverIp: allocation.serverIp,
+                streamSettingsSignature: nil,
+                resolution: allocation.negotiatedStreamProfile?.resolution,
+                fps: allocation.negotiatedStreamProfile?.fps)
+            let claimed = try await api.claimSession(session: refreshed, candidate: candidate,
+                game: allocation.game, streamingBaseUrl: allocation.streamingBaseUrl,
+                vpcId: allocation.zone, settings: streamSettings,
+                deviceId: persistentDeviceId(), touchProvisionedOverride: allocation.touchProvisioned)
+            try Task.checkCancellation()
+            guard activeSession?.id == allocation.id else { throw CancellationError() }
+            return claimed
+        }
         guard session.status == 2 else { return session }
         // Refresh auth token so it's valid for the upcoming signaling connection.
-        // Do NOT claim/migrate the session — the polled server has already handled
-        // this session throughout queue/setup and is ready to serve WebRTC offers.
-        // Migrating to a different server (via claimSession PUT) moves to a cold
-        // server that hasn't set up its WebRTC endpoint and won't offer in time.
-        // This matches desktop behavior: connect signaling directly to the polled server.
+        // Fresh allocations and WebRTC restores connect directly to the polled server.
+        // Claiming them again can migrate to a cold signaling endpoint. Only restored
+        // native allocations need the hand-over above.
         guard let currentAuth = authSession else { return session }
         do {
             let refreshed = try await api.refreshSession(currentAuth)
@@ -9492,6 +9528,7 @@ final class OpenNOWStore: ObservableObject {
                 deviceId: deviceId,
                 touchProvisionedOverride: session.touchProvisioned
             )
+            streamHandoff.didClaim(allocationID: claimed.id)
             activeSession = claimed
             activeStreamSettings = streamSettings
             setStreamSession(claimed, reason: "reopenStreamer.claimed")
