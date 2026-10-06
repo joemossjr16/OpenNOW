@@ -55,12 +55,21 @@ enum NativeStreamVideoEffectsPolicy {
         return CGSize(width: source.width * scale, height: source.height * scale)
     }
 
+    /// Keep preset resolution choices stable when the renderer skips a small upscale.
+    static func canSelectUpscaleResolution(source: CGSize, destination: CGSize) -> Bool {
+        source.width > 0 && source.height > 0
+            && destination.width > source.width * 1.02
+            && destination.height > source.height * 1.02
+            && destination.width <= source.width * 4
+            && destination.height <= source.height * 4
+    }
+
     static func upscaleSize(source: CGSize, destination: CGSize) -> CGSize? {
-        guard source.width > 0, source.height > 0,
-              destination.width > source.width * 1.02,
-              destination.height > source.height * 1.02,
-              destination.width <= source.width * 4,
-              destination.height <= source.height * 4 else { return nil }
+        guard canSelectUpscaleResolution(source: source, destination: destination),
+              // Near-native video does not justify conversion plus MetalFX.
+              // Keep it on the single-pass HDR path even when MetalFX is enabled.
+              destination.width >= source.width * 1.18,
+              destination.height >= source.height * 1.18 else { return nil }
         return CGSize(width: destination.width.rounded(), height: destination.height.rounded())
     }
 

@@ -604,25 +604,46 @@ final class OpenNOWiOSParityTests: XCTestCase {
         // must not be advertised as upscaling when both axes actually shrink.
         XCTAssertNil(NativeStreamVideoEffectsPolicy.upscaleSize(source: CGSize(width: 2560, height: 1600),
             destination: CGSize(width: 2064, height: 1290)))
-        XCTAssertEqual(NativeStreamVideoEffectsPolicy.upscaleSize(source: CGSize(width: 1920, height: 1200),
-            destination: CGSize(width: 2064, height: 1290)), CGSize(width: 2064, height: 1290))
-        XCTAssertEqual(NativeStreamVideoEffectsPolicy.upscaleSize(source: CGSize(width: 2560, height: 1080),
-            destination: CGSize(width: 2868, height: 1320)), CGSize(width: 2868, height: 1320))
+        XCTAssertNil(NativeStreamVideoEffectsPolicy.upscaleSize(source: CGSize(width: 1920, height: 1200),
+            destination: CGSize(width: 2064, height: 1290)))
+        XCTAssertNil(NativeStreamVideoEffectsPolicy.upscaleSize(source: CGSize(width: 2560, height: 1080),
+            destination: CGSize(width: 2868, height: 1320)))
         XCTAssertEqual(NativeStreamVideoEffectsPolicy.upscaleSize(source: CGSize(width: 1920, height: 1080),
             destination: CGSize(width: 2560, height: 1440)), CGSize(width: 2560, height: 1440))
     }
 
     func testMetalFXEnabledButIneligibleUsesSinglePassHDRRenderer() {
-        let source = CGSize(width: 2868, height: 1320)
-        let destination = CGSize(width: 2868, height: 1320)
-        let eligible = NativeStreamVideoEffectsPolicy.upscaleSize(source: source, destination: destination) != nil
-        XCTAssertFalse(eligible)
-        XCTAssertTrue(NativeStreamVideoEffectsPolicy.canUseDirectHDRPath(
-            upscalingEnabled: true, upscaleEligible: eligible, sharpeningAmount: 0))
+        let source = CGSize(width: 2560, height: 1080)
+        let display = CGSize(width: 2868, height: 1320)
+        // This is the reported stream, including the fitted letterboxed viewport.
+        // Equal source/output dimensions would miss the merge regression.
+        for stretch in [false, true] {
+            let destination = NativeStreamVideoEffectsPolicy.presentationSize(
+                source: source, display: display, stretch: stretch)
+            let eligible = NativeStreamVideoEffectsPolicy.upscaleSize(source: source, destination: destination) != nil
+            XCTAssertFalse(eligible)
+            XCTAssertTrue(NativeStreamVideoEffectsPolicy.canUseDirectHDRPath(
+                upscalingEnabled: true, upscaleEligible: eligible, sharpeningAmount: 0))
+            XCTAssertFalse(NativeStreamVideoEffectsPolicy.canUseDirectHDRPath(
+                upscalingEnabled: true, upscaleEligible: eligible, sharpeningAmount: 0.1))
+        }
         XCTAssertFalse(NativeStreamVideoEffectsPolicy.canUseDirectHDRPath(
             upscalingEnabled: true, upscaleEligible: true, sharpeningAmount: 0))
-        XCTAssertFalse(NativeStreamVideoEffectsPolicy.canUseDirectHDRPath(
-            upscalingEnabled: true, upscaleEligible: eligible, sharpeningAmount: 0.1))
+    }
+
+    func testMetalFXQualityKeepsNearNativeResolutionWithoutExtraRenderPass() throws {
+        let display = CGSize(width: 2868, height: 1320)
+        for stretch in [false, true] {
+            let resolution = try XCTUnwrap(StreamSettingsResolver.metalFXResolution(preset: .quality,
+                aspectRatio: "21:9", displaySize: display, stretch: stretch, membershipTier: "ULTIMATE"))
+            XCTAssertEqual(resolution.value, "2560x1080")
+            let source = StreamSettingsResolver.pixelSize(resolution.value)
+            let target = NativeStreamVideoEffectsPolicy.presentationSize(
+                source: source, display: display, stretch: stretch)
+            XCTAssertNil(NativeStreamVideoEffectsPolicy.upscaleSize(source: source, destination: target))
+            XCTAssertTrue(NativeStreamVideoEffectsPolicy.canUseDirectHDRPath(
+                upscalingEnabled: true, upscaleEligible: false, sharpeningAmount: 0))
+        }
     }
 
     func testMetal4FrameSlotPolicyMatchesTripleBufferedRenderers() {

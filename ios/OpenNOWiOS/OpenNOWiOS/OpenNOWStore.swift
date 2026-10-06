@@ -1829,7 +1829,7 @@ enum StreamSettingsResolver {
             guard isResolutionAvailable(choice, membershipTier: membershipTier) else { return false }
             let source = pixelSize(choice.value)
             let target = NativeStreamVideoEffectsPolicy.presentationSize(source: source, display: displaySize, stretch: stretch)
-            return NativeStreamVideoEffectsPolicy.upscaleSize(source: source, destination: target) != nil
+            return NativeStreamVideoEffectsPolicy.canSelectUpscaleResolution(source: source, destination: target)
         }.min { left, right in
             func distance(_ choice: StreamResolutionChoice) -> CGFloat {
                 let source = pixelSize(choice.value)
