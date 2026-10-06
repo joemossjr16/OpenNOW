@@ -2038,6 +2038,19 @@ enum StreamSettingsResolver {
         return updated
     }
 
+    /// Native resume renegotiates the device's current request. The saved snapshot
+    /// describes the previous connection and must not hide a selection made after leaving it.
+    /// WebRTC reconnects retain their allocation's video request and refresh live controls.
+    static func settingsForReconnect(current: AppSettings, retained: AppSettings?) -> AppSettings {
+        guard let retained else { return current }
+        if current.experimentalNativeNVSTEnabled || retained.experimentalNativeNVSTEnabled {
+            return current
+        }
+        var resumed = retained
+        resumed.applyStreamerControls(from: current)
+        return resumed
+    }
+
     /// NVST announces the selected client profile, including when transferring a session.
     /// A server listing may carry a reduced or previous client's profile. WebRTC adopts that
     /// profile only when we do not have a retained request for this allocation.
@@ -8176,7 +8189,8 @@ final class OpenNOWStore: ObservableObject {
             authSession = refreshed
             persistAuthSession(refreshed)
             let requestedSettings = nativeLaunchSettings(
-                for: candidate.id == retainedSessionID ? currentStreamerSettings : settings,
+                for: StreamSettingsResolver.settingsForReconnect(current: settings,
+                    retained: candidate.id == retainedSessionID ? activeStreamSettings : nil),
                 context: "resumeSession"
             )
             let streamSettings = streamSettingsForResuming(
@@ -9510,7 +9524,10 @@ final class OpenNOWStore: ObservableObject {
             return
         }
         let generation = authGeneration
-        let requestedSettings = currentStreamerSettings
+        let requestedSettings = nativeLaunchSettings(
+            for: StreamSettingsResolver.settingsForReconnect(current: settings, retained: activeStreamSettings),
+            context: "reopenCurrentSession"
+        )
         do {
             let refreshed = try await api.refreshSession(currentAuth)
             try Task.checkCancellation()

@@ -437,6 +437,67 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(repaired.currentStreamerSettings.preferredResolution, "2560x1080")
     }
 
+    func testNativeReconnectUsesNewDeviceSelectionInsteadOfPreviousConnectionSnapshot() throws {
+        var retained = AppSettings.default
+        retained.experimentalNativeNVSTEnabled = true
+        retained.streamPreset = .custom
+        retained.preferredAspectRatio = "4:3"
+        retained.preferredResolution = "1600x1200"
+        retained.preferredFPS = 120
+        retained.streamStatsMetrics.bitrate = true
+        retained.streamStatsMetrics.resolution = true
+        retained.streamStatsMetrics.codec = true
+        retained.streamStatsMetrics.location = true
+        retained.streamStatsMetrics.latency = true
+        retained.streamStatsMetrics.packetLoss = true
+        XCTAssertEqual(retained.streamStatsMetrics.enabledCount, 10)
+        let restored = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(retained))
+
+        for (resolution, aspect) in [("1920x1080", "16:9"), ("2560x1080", "21:9")] {
+            var current = retained
+            current.preferredAspectRatio = aspect
+            current.preferredResolution = resolution
+            current.maxBitrateMbps = 100
+            current.hdrEnabled = true
+            current.metal4Enabled = true
+            current.hideStreamButtons = true
+            current.streamStatsMetrics = StreamStatsMetrics()
+            current.streamStatsMetrics.bitrate = true
+            current.streamStatsMetrics.resolution = true
+            XCTAssertEqual(current.streamStatsMetrics.enabledCount, 6)
+            for snapshot: AppSettings? in [nil, restored] {
+                let resumed = StreamSettingsResolver.settingsForReconnect(current: current, retained: snapshot)
+                XCTAssertEqual(resumed, current)
+                let profile = StreamSettingsResolver.profile(for: resumed, membershipTier: "ULTIMATE")
+                XCTAssertEqual(profile.resolutionString, resolution)
+                XCTAssertEqual(profile.fps, 120)
+                XCTAssertEqual(profile.maxBitrateKbps, 100_000)
+                XCTAssertEqual(resumed.streamStatsMetrics.enabledCount, 6)
+            }
+        }
+    }
+
+    func testWebRTCReconnectKeepsAllocationVideoAndRefreshesHUDControls() {
+        var retained = AppSettings.default
+        retained.experimentalNativeNVSTEnabled = false
+        retained.preferredAspectRatio = "4:3"
+        retained.preferredResolution = "1600x1200"
+        retained.preferredFPS = 120
+        var current = retained
+        current.preferredAspectRatio = "16:9"
+        current.preferredResolution = "1920x1080"
+        current.preferredFPS = 60
+        current.hideStreamButtons = true
+        current.metal4Enabled = true
+        current.streamStatsMetrics.bitrate = true
+        let resumed = StreamSettingsResolver.settingsForReconnect(current: current, retained: retained)
+        XCTAssertEqual(resumed.preferredResolution, "1600x1200")
+        XCTAssertEqual(resumed.preferredFPS, 120)
+        XCTAssertEqual(resumed.streamStatsMetrics, current.streamStatsMetrics)
+        XCTAssertTrue(resumed.hideStreamButtons)
+        XCTAssertTrue(resumed.metal4Enabled)
+    }
+
     func testReconnectRetainsSelectedVideoProfileDespiteLowerRemoteListing() {
         var requested = AppSettings.default
         requested.preferredAspectRatio = "21:9"
