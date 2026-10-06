@@ -6247,6 +6247,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     var sharpeningAmount = 0.0
 
     private let commandQueue: MTLCommandQueue
+    private let metal4Presentation: NativeStreamMetal4Presentation
     private let ciContext: CIContext
     private let directHDR: NativeStreamHDRMetalRenderer?
     private var metal4HDRStorage: AnyObject?
@@ -6311,6 +6312,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
 
     private init(device: MTLDevice, commandQueue: MTLCommandQueue) {
         self.commandQueue = commandQueue
+        metal4Presentation = NativeStreamMetal4Presentation(queue: commandQueue)
         directHDR = NativeStreamHDRMetalRenderer(device: device)
         if #available(iOS 26.0, *), NativeStreamMetal4HDRRenderer.isSupported(device:device) {
             submissionTimeline = NativeStreamMetalFrameTimeline(device:device)
@@ -6344,10 +6346,6 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                 let effects = NativeStreamMetal4EffectsRenderer(device:device)
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
-                    if let layer = self.mtkView.layer as? CAMetalLayer {
-                        renderer?.setDrawableResidency(layer.residencySet)
-                        effects?.setDrawableResidency(layer.residencySet)
-                    }
                     self.metal4HDRStorage = renderer; self.metal4EffectsStorage = effects
                 }
             }
@@ -6420,21 +6418,45 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         let ticket = submissionTimeline?.next()
         let presentationTracker = presentations
         let mailbox = frames
+        let presentationFrame = metal4Enabled && !metal4Disabled
+            && (metal4HDRStorage != nil || metal4EffectsStorage != nil)
+            ? ticket.flatMap { metal4Presentation.prepare(target: drawable.texture, ticket: $0) } : nil
+        var queuedMetal4Presentation = false
+        defer {
+            if !queuedMetal4Presentation, let presentationFrame {
+                metal4Presentation.discard(presentationFrame)
+            }
+        }
+        let effectsToken = effectsGeneration
+        func presentMetal4(_ frame: NativeStreamMetal4Presentation.Frame) {
+            let admission = gpuAdmission
+            metal4Presentation.present(frame, drawable: drawable, presented: { time in
+                presentationTracker.recordPresentation(at: time)
+            }, completion: { [weak self] error in
+                admission.signal()
+                mailbox.complete()
+                if let error {
+                    NSLog("[OpenNOW] Metal 4 presentation failed code=%ld", error.code)
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self else { return }
+                        self.metal4Disabled = true
+                        if self.effectsGeneration == effectsToken { self.finishEffects(failed: true) }
+                    }
+                }
+            })
+            queuedMetal4Presentation = true
+        }
         let useDirectHDRPath = NativeStreamVideoEffectsPolicy.canUseDirectHDRPath(
             upscalingEnabled: shouldUpscale, upscaleEligible: upscaleSize != nil,
             sharpeningAmount: sharpeningAmount
         )
         if #available(iOS 26.0, *), metal4Enabled && !metal4Disabled, hdrTransfer == .pq,
            useDirectHDRPath,
-           let metal4 = metal4HDRStorage as? NativeStreamMetal4HDRRenderer {
-            let admission = gpuAdmission
+           let metal4 = metal4HDRStorage as? NativeStreamMetal4HDRRenderer,
+           let presentationFrame {
             let waitForPrevious = NativeStreamSubmissionQueue.metal4HDR.requiresWait(from: lastSubmissionQueue)
-            if metal4.submit(buffer:pixelBuffer,target:drawable.texture,destination:destination,drawable:drawable,ticket:ticket,
-                waitForPrevious: waitForPrevious, presented: { time in
-                    presentationTracker.recordPresentation(at:time)
-                }, completion: { [weak self] duration,error in
-                    admission.signal()
-                    mailbox.complete()
+            if metal4.submit(buffer:pixelBuffer,target:presentationFrame.texture,destination:destination,ticket:ticket,
+                waitForPrevious: waitForPrevious, completion: { [weak self] _,error in
                     if let error {
                         NSLog("[OpenNOW] Metal 4 HDR failed code=%ld", error.code)
                         DispatchQueue.main.async { [weak self] in self?.metal4Disabled = true }
@@ -6442,6 +6464,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                 }) {
                 if let ticket { submissionTimeline?.accept(ticket) }
                 lastSubmissionQueue = .metal4HDR
+                presentMetal4(presentationFrame)
                 rendererBackend = "Metal 4 · direct 10-bit HDR"
                 if upscalingEnabled {
                     metal4UpscalingStatus = shouldUpscale
@@ -6459,10 +6482,9 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         if legacyWaitForPrevious, let ticket, ticket.previous > 0 {
             commandBuffer.encodeWaitForEvent(ticket.event,value:ticket.previous)
         }
-        let effectsToken = effectsGeneration
         let preferMetal4Effects: Bool
         if #available(iOS 26.0, *) {
-            preferMetal4Effects = metal4Enabled && !metal4Disabled && metal4EffectsStorage != nil
+            preferMetal4Effects = presentationFrame != nil && metal4EffectsStorage != nil
         } else { preferMetal4Effects = false }
         let direct = !preferMetal4Effects && hdrTransfer != .hlg && !shouldUpscale && sharpeningAmount <= 0.001 && view.currentRenderPassDescriptor.map {
             directHDR?.encode(buffer: pixelBuffer, commandBuffer: commandBuffer,
@@ -6471,14 +6493,8 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         rendererBackend = direct ? "Metal · direct 10-bit HDR" : "Metal / Core Image"
         if !direct {
             #if !targetEnvironment(simulator)
-            let admission = gpuAdmission
-            let presentedMetal4: @Sendable (Double) -> Void = { time in
-                presentationTracker.recordPresentation(at: time)
-            }
-            let completeMetal4: @Sendable (Double, NSError?) -> Void = { [weak self, pixelBuffer] duration, error in
+            let completeMetal4: @Sendable (Double, NSError?) -> Void = { [weak self, pixelBuffer] _, error in
                 _ = pixelBuffer
-                admission.signal()
-                mailbox.complete()
                 if let error { NSLog("[OpenNOW] Metal 4 effects failed code=%ld", error.code) }
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.effectsGeneration == effectsToken else { return }
@@ -6488,13 +6504,14 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
             }
             if #available(iOS 26.0, *), metal4Enabled && !metal4Disabled,
                let effects = metal4EffectsStorage as? NativeStreamMetal4EffectsRenderer,
+               let presentationFrame,
                effects.submit(buffer: pixelBuffer, destination: destination, upscale: shouldUpscale,
-                    target: drawable.texture, sharpening:Float(sharpeningAmount),
-                    drawable: drawable, ticket: ticket,
+                    target: presentationFrame.texture, sharpening:Float(sharpeningAmount), ticket: ticket,
                     waitForPrevious: NativeStreamSubmissionQueue.metal4Effects.requiresWait(from: lastSubmissionQueue),
-                    presented: presentedMetal4, completion: completeMetal4) {
+                    completion: completeMetal4) {
                 if let ticket { submissionTimeline?.accept(ticket) }
                 lastSubmissionQueue = .metal4Effects
+                presentMetal4(presentationFrame)
                 rendererBackend = (hdrTransfer == .pq ? "Metal 4 · native PQ conversion"
                     : hdrTransfer == .hlg ? "Metal 4 · native HLG conversion" : "Metal 4 · native SDR conversion")
                 metal4UpscalingStatus = shouldUpscale ? effects.status : nil
@@ -6529,15 +6546,17 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                 )
             #if !targetEnvironment(simulator)
             if #available(iOS 26.0, *), metal4Enabled && !metal4Disabled,
-               let effects = metal4EffectsStorage as? NativeStreamMetal4EffectsRenderer {
+               let effects = metal4EffectsStorage as? NativeStreamMetal4EffectsRenderer,
+               let presentationFrame {
                 if effects.submit(image: filteredImage, destination: destination,
                     transfer: hdrTransfer == .pq ? 1 : hdrTransfer == .hlg ? 2 : 0,
                     upscale: shouldUpscale, context: ciContext, producer: commandBuffer,
-                    target: drawable.texture, drawable: drawable, ticket: ticket,
+                    target: presentationFrame.texture, ticket: ticket,
                     waitForPrevious: NativeStreamSubmissionQueue.metal4Effects.requiresWait(from: lastSubmissionQueue),
-                    presented: presentedMetal4, completion: completeMetal4) {
+                    completion: completeMetal4) {
                     if let ticket { submissionTimeline?.accept(ticket) }
                     lastSubmissionQueue = .metal4Effects
+                    presentMetal4(presentationFrame)
                     rendererBackend = "Metal 4 · effects"
                     if shouldUpscale { metal4UpscalingStatus = effects.status } else { metal4UpscalingStatus = nil }
 

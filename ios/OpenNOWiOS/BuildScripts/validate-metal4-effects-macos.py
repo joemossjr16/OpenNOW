@@ -3,7 +3,7 @@
 from pathlib import Path
 import os,subprocess,tempfile
 root=Path(__file__).resolve().parents[3]
-source="\n".join((root/"ios/OpenNOWiOS/OpenNOWiOS"/name).read_text() for name in ["NativeStreamVideoEffects.swift","NativeStreamHDRMetal.swift","NativeStreamMetal4Effects.swift"])
+source="\n".join((root/"ios/OpenNOWiOS/OpenNOWiOS"/name).read_text() for name in ["NativeStreamVideoEffects.swift","NativeStreamHDRMetal.swift","NativeStreamMetal4Effects.swift","NativeStreamMetal4Presentation.swift"])
 CHECK = r"""
 import QuartzCore
 @main struct EffectsCheck {
@@ -14,7 +14,6 @@ import QuartzCore
   let renderer = NativeStreamMetal4EffectsRenderer(device: device)!
   let layer=CAMetalLayer();layer.device=device;layer.pixelFormat = .bgr10a2Unorm
   layer.drawableSize=CGSize(width:128,height:64);layer.framebufferOnly=false
-  renderer.setDrawableResidency(layer.residencySet)
   func fixture(format:OSType,transfer:CFString,phase:Int = 0) -> CVPixelBuffer {
    var allocation: CVPixelBuffer?
    precondition(CVPixelBufferCreate(nil,64,32,format,
@@ -113,7 +112,6 @@ import QuartzCore
   // Change the contents of each recycled IOSurface on every reuse, on another GPU queue. Static
   // CPU fixtures cannot exercise decoder-like aliasing and frame-to-frame reuse.
   let direct = NativeStreamMetal4HDRRenderer(device:device)!
-  direct.setDrawableResidency(layer.residencySet)
   let compatible = NativeStreamHDRMetalRenderer(device:device)!
   var cache:CVMetalTextureCache?
   precondition(CVMetalTextureCacheCreate(nil,nil,device,nil,&cache)==kCVReturnSuccess)
@@ -171,30 +169,36 @@ import QuartzCore
   print("PASS: 120 alternating GPU-written pooled 4:4:4 HDR frames, direct/effects Metal 4 match compatible pixels")
 
 
-  // Exercise actual CAMetalLayer drawables with the layer-owned residency set,
-  // not only shared offscreen textures. Headless layers may exhaust drawables.
+  // Exercise the production private-texture → compatible drawable handoff.
+  // Headless layers may exhaust drawables; MTKView coverage lives in its own harness.
   layer.frame=CGRect(x:0,y:0,width:128,height:64)
   layer.colorspace=CGColorSpace(name:CGColorSpace.itur_2100_PQ)
   layer.wantsExtendedDynamicRangeContent=true
+  let presentation=NativeStreamMetal4Presentation(queue:queue)
+  let presentationTimeline=NativeStreamMetalFrameTimeline(device:device)!
   var drawableFrames=0
   for phase in 0..<12 {
    guard let drawable=layer.nextDrawable() else { break }
+   let ticket=presentationTimeline.next()
+   guard let frame=presentation.prepare(target:drawable.texture,ticket:ticket) else {fatalError("No copy slot")}
    let pair=AsyncStream<Bool>.makeStream()
-   let done:@Sendable(Double,NSError?)->Void={ _,error in
-    if let error { print(error) };pair.continuation.yield(error == nil);pair.continuation.finish()
-   }
+   let done:@Sendable(Double,NSError?)->Void={ _,error in precondition(error == nil) }
    let input=fixture(format:kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange,
      transfer:kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ,phase:phase.isMultiple(of:2) ? 0 : 180)
    let accepted=phase.isMultiple(of:2)
-    ? direct.submit(buffer:input,target:drawable.texture,destination:fit,drawable:drawable,completion:done)
+    ? direct.submit(buffer:input,target:frame.texture,destination:fit,ticket:ticket,completion:done)
     : renderer.submit(buffer:input,destination:CGRect(x:16,y:8,width:96,height:48),upscale:true,
-        target:drawable.texture,drawable:drawable,completion:done)
+        target:frame.texture,ticket:ticket,completion:done)
    precondition(accepted)
+   presentationTimeline.accept(ticket)
+   presentation.present(frame,drawable:drawable,presented:{ _ in }) { error in
+    pair.continuation.yield(error == nil);pair.continuation.finish()
+   }
    for await ok in pair.stream { precondition(ok) }
    drawableFrames+=1
   }
   precondition(drawableFrames>0,"No drawable available for Metal 4 presentation validation")
-  print("PASS: layer-resident direct Metal 4 HDR/MetalFX drawable presentation",drawableFrames,"frames")
+  print("PASS: private Metal 4 HDR/MetalFX frames use compatible drawable presentation",drawableFrames,"frames")
 
   let nativeDestination = CGRect(x:16,y:8,width:96,height:48)
   let timeline = NativeStreamMetalFrameTimeline(device:device)!
