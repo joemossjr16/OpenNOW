@@ -110,7 +110,7 @@ import QuartzCore
   } } } }
 
 
-  // Recycle two IOSurfaces, changing their planes on another GPU queue. Static
+  // Change the contents of each recycled IOSurface on every reuse, on another GPU queue. Static
   // CPU fixtures cannot exercise decoder-like aliasing and frame-to-frame reuse.
   let direct = NativeStreamMetal4HDRRenderer(device:device)!
   direct.setDrawableResidency(layer.residencySet)
@@ -130,7 +130,7 @@ import QuartzCore
   for frame in 0..<120 {
    let surface=pool[frame%pool.count]
    let donor=fixture(format:kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange,
-     transfer:kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ,phase:frame.isMultiple(of:2) ? 0 : 180)
+     transfer:kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ,phase:(frame / pool.count).isMultiple(of:2) ? 0 : 180)
    let producer=queue.makeCommandBuffer()!,blit=producer.makeBlitCommandEncoder()!
    var retained:[CVMetalTexture]=[]
    for index in 0..<2 {
@@ -142,11 +142,6 @@ import QuartzCore
    }
    blit.endEncoding();producer.commit();await producer.completed();precondition(producer.status == .completed)
    _=retained
-   let reference=queue.makeCommandBuffer()!,pass=MTLRenderPassDescriptor()
-   pass.colorAttachments[0].texture=goldTarget;pass.colorAttachments[0].loadAction = .clear
-   pass.colorAttachments[0].storeAction = .store;pass.colorAttachments[0].clearColor=MTLClearColorMake(0,0,0,1)
-   precondition(compatible.encode(buffer:surface,commandBuffer:reference,descriptor:pass,destination:fit))
-   reference.commit();await reference.completed();precondition(reference.status == .completed)
    var accepted=false
    for _ in 0..<500 {
     let pair=AsyncStream<Bool>.makeStream()
@@ -154,12 +149,18 @@ import QuartzCore
      if let error { print(error) };pair.continuation.yield(error == nil);pair.continuation.finish()
     }
     accepted=frame%3 == 0
-     ? direct.submit(buffer:surface,target:recycledTarget,destination:fit,completion:done)
-     : renderer.submit(buffer:surface,destination:fit,upscale:false,target:recycledTarget,completion:done)
+     ? direct.submit(buffer:surface,target:recycledTarget,destination:fit,waitForPrevious:false,completion:done)
+     : renderer.submit(buffer:surface,destination:fit,upscale:false,target:recycledTarget,waitForPrevious:false,completion:done)
     if accepted { for await ok in pair.stream { precondition(ok) };break }
     try await Task.sleep(nanoseconds:10_000_000)
    }
    precondition(accepted)
+   // Render the compatible reference afterward so it cannot mask stale Metal 4 reads.
+   let reference=queue.makeCommandBuffer()!,pass=MTLRenderPassDescriptor()
+   pass.colorAttachments[0].texture=goldTarget;pass.colorAttachments[0].loadAction = .clear
+   pass.colorAttachments[0].storeAction = .store;pass.colorAttachments[0].clearColor=MTLClearColorMake(0,0,0,1)
+   precondition(compatible.encode(buffer:surface,commandBuffer:reference,descriptor:pass,destination:fit))
+   reference.commit();await reference.completed();precondition(reference.status == .completed)
    let actual=pixels(recycledTarget),expected=pixels(goldTarget)
    for y in 18..<46 { for x in 34..<94 { for shift in [0,10,20] {
     let index=y*128+x

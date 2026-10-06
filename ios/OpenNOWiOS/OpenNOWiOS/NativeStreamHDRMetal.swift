@@ -175,6 +175,16 @@ final class NativeStreamMetalFrameTimeline {
 }
 
 #if !targetEnvironment(simulator)
+/// Decoder pools reuse IOSurfaces through independently cached texture views.
+/// Buffer retention protects their lifetime; alias visibility protects their contents.
+@available(iOS 26.0, macOS 26.0, *)
+enum NativeStreamMetalDecoderCoherency {
+    static func prepareReads(on encoder: any MTL4RenderCommandEncoder) {
+        encoder.barrier(afterQueueStages: .all, beforeStages: .fragment,
+                        visibilityOptions: [.device, .resourceAlias])
+    }
+}
+
 /// The layer tracks all allocations needed to render and present its drawables.
 /// Keep its unmodified set on the queue for the renderer's lifetime.
 @available(iOS 26.0, macOS 26.0, *)
@@ -271,8 +281,7 @@ final class NativeStreamMetal4HDRRenderer {
         guard let encoder = slot.command.makeRenderCommandEncoder(descriptor:pass) else {
             slot.command.endCommandBuffer(); release(index); return false
         }
-        // VideoToolbox delivers completed pixel buffers. Retaining `input` until
-        // GPU feedback prevents surface reuse while these plane views are read.
+        NativeStreamMetalDecoderCoherency.prepareReads(on: encoder)
         encoder.setRenderPipelineState(pipeline)
         encoder.setViewport(MTLViewport(originX:destination.minX,originY:destination.minY,
             width:destination.width,height:destination.height,znear:0,zfar:1))

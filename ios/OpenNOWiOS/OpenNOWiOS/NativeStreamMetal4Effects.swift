@@ -175,10 +175,7 @@ final class NativeStreamMetal4EffectsRenderer {
             guard let encoder = slot.command.makeRenderCommandEncoder(descriptor: conversionPass) else {
                 slot.command.endCommandBuffer(); resource.release(index); return false
             }
-            // Pooled decoder IOSurfaces can arrive with a different texture view
-            // over recycled memory. Explicitly make aliased reads coherent.
-            encoder.barrier(afterQueueStages: .blit, beforeStages: .fragment,
-                            visibilityOptions: [.device, .resourceAlias])
+            NativeStreamMetalDecoderCoherency.prepareReads(on: encoder)
             encoder.setRenderPipelineState(conversionPipeline)
             encoder.setViewport(MTLViewport(originX: 0, originY: 0, width: Double(key.width), height: Double(key.height), znear: 0, zfar: 1))
             encoder.setArgumentTable(slot.conversionArguments, stages: .fragment)
