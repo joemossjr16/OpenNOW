@@ -627,6 +627,13 @@ final class OpenNOWiOSParityTests: XCTestCase {
             upscalingEnabled: true, upscaleEligible: eligible, sharpeningAmount: 0.1))
     }
 
+    func testMetal4FrameSlotPolicyMatchesTripleBufferedRenderers() {
+        XCTAssertEqual(NativeStreamMetal4FrameSlotPolicy.inFlightCount, 3)
+        XCTAssertEqual(NativeStreamMetal4FrameSlotPolicy.indices, [0, 1, 2])
+        XCTAssertTrue(NativeStreamMetal4FrameSlotPolicy.isComplete(3))
+        XCTAssertFalse(NativeStreamMetal4FrameSlotPolicy.isComplete(2))
+    }
+
     func testVideoEffectsSettingsMigrateOffAndRoundTripWithoutChangingStream() throws {
         let old = try JSONDecoder().decode(AppSettings.self, from: Data("{}".utf8))
         XCTAssertFalse(old.metalFXUpscalingEnabled)

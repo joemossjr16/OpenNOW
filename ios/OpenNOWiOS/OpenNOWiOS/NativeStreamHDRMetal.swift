@@ -2,6 +2,12 @@ import Foundation
 import CoreVideo
 import Metal
 
+enum NativeStreamMetal4FrameSlotPolicy {
+    static let inFlightCount = 3
+    static var indices: [Int] { Array(0..<inFlightCount) }
+    static func isComplete(_ count: Int) -> Bool { count == inFlightCount }
+}
+
 /// Shared interpretation for rendering and actual-output status.
 enum NativeStreamTenBitSurface {
     static func chroma(_ format: OSType) -> String? {
@@ -201,7 +207,7 @@ final class NativeStreamMetal4HDRRenderer {
 
     private let slots: [Slot]
     private let lock = NSLock()
-    private var available = [0,1]
+    private var available = NativeStreamMetal4FrameSlotPolicy.indices
     static func isSupported(device: any MTLDevice) -> Bool { device.supportsFamily(.metal4) }
     init?(device: any MTLDevice) {
         guard Self.isSupported(device:device), let queue = device.makeMTL4CommandQueue() else { return nil }
@@ -217,7 +223,7 @@ final class NativeStreamMetal4HDRRenderer {
             descriptor.colorAttachments[0].pixelFormat = .bgr10a2Unorm
             pipeline = try compiler.makeRenderPipelineState(descriptor:descriptor)
             var slots: [Slot] = []
-            for _ in 0..<3 {
+            for _ in 0..<NativeStreamMetal4FrameSlotPolicy.inFlightCount {
                 let table = MTL4ArgumentTableDescriptor(); table.maxBufferBindCount = 1; table.maxTextureBindCount = 2
                 let residency = MTLResidencySetDescriptor(); residency.initialCapacity = 4
                 guard let allocator = device.makeCommandAllocator(), let command = device.makeCommandBuffer(),

@@ -31,7 +31,7 @@ final class NativeStreamMetal4EffectsRenderer {
     private final class Resources {
         let slots: [Slot]
         private let lock = NSLock()
-        private var available = [0,1]
+        private var available = NativeStreamMetal4FrameSlotPolicy.indices
         init(slots: [Slot]) { self.slots = slots }
         func take() -> Int? { lock.lock(); defer { lock.unlock() }; return available.popLast() }
         func release(_ index: Int) { lock.lock(); available.append(index); lock.unlock() }
@@ -277,7 +277,7 @@ final class NativeStreamMetal4EffectsRenderer {
         setupQueue.async { [weak self] in
             var slots: [Slot] = []
             do {
-                for _ in 0..<3 {
+                for _ in 0..<NativeStreamMetal4FrameSlotPolicy.inFlightCount {
                     var scaler: (any MTL4FXSpatialScaler)?
                     if key.upscale {
                         let descriptor = MTLFXSpatialScalerDescriptor()
@@ -309,7 +309,7 @@ final class NativeStreamMetal4EffectsRenderer {
                         residency: try device.makeResidencySet(descriptor: residency), uniforms: uniforms, input: input, output: output, sharpened: sharp, scaler: scaler))
                 }
             } catch { slots.removeAll() }
-            let result = slots.count == 2 ? Resources(slots: slots) : nil
+            let result = NativeStreamMetal4FrameSlotPolicy.isComplete(slots.count) ? Resources(slots: slots) : nil
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.preparing.remove(key)

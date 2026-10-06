@@ -92,20 +92,22 @@ CHECK = r'''
   } }
   let input = fixture(format:kCVPixelFormatType_444YpCbCr10BiPlanarFullRange,transfer:kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ)
   let output = target()
-  // Block the GPU with an event so two submissions remain genuinely in flight.
+  // Block the GPU with an event so all three slots remain in flight.
   let event = device.makeSharedEvent()!
   let pair = AsyncStream<Bool>.makeStream()
   let first = NativeStreamMetalFrameTimeline.Ticket(event:event,previous:1,value:2)
   let second = NativeStreamMetalFrameTimeline.Ticket(event:event,previous:2,value:3)
+  let third = NativeStreamMetalFrameTimeline.Ticket(event:event,previous:3,value:4)
   let completion: @Sendable (Double,NSError?) -> Void = { _,error in pair.continuation.yield(error == nil) }
   precondition(metal4.submit(buffer:input,target:output,destination:destination,ticket:first,completion:completion))
   precondition(metal4.submit(buffer:input,target:output,destination:destination,ticket:second,completion:completion))
+  precondition(metal4.submit(buffer:input,target:output,destination:destination,ticket:third,completion:completion))
   precondition(!metal4.submit(buffer:input,target:output,destination:destination,completion:completion),"Unbounded Metal 4 admission")
   event.signaledValue = 1
   var count = 0
-  for await success in pair.stream { precondition(success); count += 1; if count == 2 { break } }
+  for await success in pair.stream { precondition(success); count += 1; if count == 3 { break } }
   pair.continuation.finish()
-  print("PASS: two slots bound GPU work; a third is rejected; completion frees slots")
+  print("PASS: three slots bound GPU work; a fourth is rejected; completion frees slots")
 
   let timeline = NativeStreamMetalFrameTimeline(device:device)!
   for i in 0..<40 {
