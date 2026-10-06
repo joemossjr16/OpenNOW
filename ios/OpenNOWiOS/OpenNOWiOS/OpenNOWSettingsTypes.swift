@@ -109,21 +109,31 @@ enum TouchControlMode: String, Codable, CaseIterable, Identifiable {
 
 enum TouchControllerPreset: String, Codable, CaseIterable, Identifiable {
     case standard
-    case mobileGame
     case geForceNOW
 
     var id: String { rawValue }
     var label: String {
         switch self {
         case .standard: return "Standard"
-        case .mobileGame: return "Mobile Game"
         case .geForceNOW: return "GeForce NOW"
         }
     }
     var next: Self { Self.allCases[(Self.allCases.firstIndex(of: self)! + 1) % Self.allCases.count] }
     var usesIndependentControls: Bool { self != .standard }
-    var usesSplitTouchpad: Bool { self == .mobileGame }
     var supportsControlModeSelection: Bool { self == .standard }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let value = try container.decode(String.self)
+        // Retired preset selections must not invalidate the user's saved app settings.
+        if value == "mobileGame" {
+            self = .standard
+        } else if let preset = Self(rawValue: value) {
+            self = preset
+        } else {
+            throw DecodingError.dataCorruptedError(in: container, debugDescription: "Unknown touch controller preset: \(value)")
+        }
+    }
 }
 
 enum TouchAimMode: String, Codable, CaseIterable, Identifiable {
@@ -368,11 +378,6 @@ enum TouchpadStickMath {
         )
     }
 
-    /// Sprint engages only when the movement thumb reaches the marked upper rim of the circle.
-    static func shouldSprint(dx: CGFloat, dy: CGFloat, travel: CGFloat) -> Bool {
-        let radius = max(travel, 1)
-        return dy <= -radius * 0.84 && abs(dx) <= radius * 0.32
-    }
 }
 
 // MARK: - Session timer

@@ -1984,7 +1984,7 @@ private struct NativeStreamControlsPanel: View {
                     }
                 }
                 if !coordinator.liveSettings.touch.controllerPreset.supportsControlModeSelection {
-                    NativeStreamInfoRow(title: "Control layout", value: coordinator.liveSettings.touch.controllerPreset.usesSplitTouchpad ? "Split touchpad" : "Virtual sticks")
+                    NativeStreamInfoRow(title: "Control layout", value: "Virtual sticks")
                 } else {
                     NativeStreamActionRow(
                         title: "Control layout",
@@ -1996,7 +1996,7 @@ private struct NativeStreamControlsPanel: View {
                         }
                     }
                 }
-                if coordinator.liveSettings.touch.controllerPreset.usesSplitTouchpad || (coordinator.liveSettings.touch.controllerPreset.supportsControlModeSelection && coordinator.liveSettings.touch.controlMode == .splitTouchpad) {
+                if coordinator.liveSettings.touch.controllerPreset.supportsControlModeSelection && coordinator.liveSettings.touch.controlMode == .splitTouchpad {
                     NativeStreamSliderRow(
                         title: "Touchpad sensitivity",
                         value: Binding(
@@ -6748,21 +6748,6 @@ private enum NativeStreamTouchControlGroup: String, CaseIterable {
     case leftStick
     case rightCluster
     case bottomCenter
-    case leftShoulder
-    case leftTrigger
-    case view
-    case menu
-    case rightTrigger
-    case rightShoulder
-    case dpad
-    case sprint
-    case rightStick
-    case faceA
-    case faceB
-    case faceX
-    case faceY
-    case aimShoot
-    case mobileHide
 
     var label: String {
         switch self {
@@ -6772,21 +6757,7 @@ private enum NativeStreamTouchControlGroup: String, CaseIterable {
         case .leftStick: return "Left stick and directional pad"
         case .rightCluster: return "Right stick and face buttons"
         case .bottomCenter: return "Hide controls button"
-        case .leftShoulder: return "L1 button"
-        case .leftTrigger: return "L2 button"
-        case .view: return "View button"
-        case .menu: return "Menu button"
-        case .rightTrigger: return "R2 button"
-        case .rightShoulder: return "R1 button"
-        case .dpad: return "Directional pad"
-        case .sprint: return "Sprint button"
-        case .rightStick: return "Right stick button"
-        case .faceA: return "A button"
-        case .faceB: return "B button"
-        case .faceX: return "X button"
-        case .faceY: return "Y button"
-        case .aimShoot: return "Aim and fire button"
-        case .mobileHide: return "Hide controls button"
+
         }
     }
 }
@@ -6811,13 +6782,11 @@ private struct NativeStreamVirtualControllerOverlay: View {
             let stickSize = (compact ? 68.0 : 84.0) * layout.stickScale
 
             ZStack {
-                let mobileGame = touchSettings.controllerPreset == .mobileGame
-                if (mobileGame || (touchSettings.controllerPreset.supportsControlModeSelection && touchSettings.controlMode == .splitTouchpad)), !editing {
+                if touchSettings.controllerPreset.supportsControlModeSelection && touchSettings.controlMode == .splitTouchpad, !editing {
                     NativeStreamSplitTouchpadSurface(
                         inputBridge: inputBridge,
                         sensitivity: touchSettings.touchpadSensitivity,
-                        deadZone: touchSettings.joystickDeadZone,
-                        mobileGame: mobileGame
+                        deadZone: touchSettings.joystickDeadZone
                     )
                     .ignoresSafeArea()
                     .accessibilityLabel("Split touchpad: left side moves, right side looks")
@@ -6832,55 +6801,6 @@ private struct NativeStreamVirtualControllerOverlay: View {
                             .frame(maxWidth: min(max(proxy.size.width - 24, 1), 430))
                             .position(x: proxy.size.width / 2, y: proxy.size.height * 0.48)
                             .zIndex(100)
-                    }
-                } else if mobileGame {
-                    mobileControl(.leftShoulder, point: .init(x: 0.07, y: 0.12), containerSize: proxy.size, safeAreaInsets: proxy.safeAreaInsets) {
-                        NativeStreamVirtualHoldButton(label: "L1", size: buttonSize, pressed: { inputBridge.setVirtualButton(.leftShoulder, pressed: $0) })
-                    }
-                    mobileControl(.leftTrigger, point: .init(x: 0.17, y: 0.12), containerSize: proxy.size, safeAreaInsets: proxy.safeAreaInsets) {
-                        NativeStreamVirtualHoldButton(label: "L2", size: buttonSize, pressed: { inputBridge.setVirtualTrigger(.left, value: $0 ? 1 : 0) })
-                    }
-                    mobileControl(.view, point: .init(x: 0.44, y: 0.12), containerSize: proxy.size, safeAreaInsets: proxy.safeAreaInsets) {
-                        NativeStreamVirtualHoldButton(label: "View", systemImage: "rectangle.on.rectangle", size: buttonSize, pressed: { inputBridge.setVirtualButton(.options, pressed: $0) })
-                    }
-                    mobileControl(.menu, point: .init(x: 0.56, y: 0.12), containerSize: proxy.size, safeAreaInsets: proxy.safeAreaInsets) {
-                        NativeStreamVirtualHoldButton(label: "Menu", systemImage: "line.3.horizontal", size: buttonSize, pressed: { inputBridge.setVirtualButton(.menu, pressed: $0) })
-                    }
-                    mobileControl(.rightTrigger, point: .init(x: 0.83, y: 0.12), containerSize: proxy.size, safeAreaInsets: proxy.safeAreaInsets) {
-                        NativeStreamVirtualHoldButton(label: "R2", size: buttonSize, pressed: { inputBridge.setVirtualTrigger(.right, value: $0 ? 1 : 0) })
-                    }
-                    mobileControl(.rightShoulder, point: .init(x: 0.93, y: 0.12), containerSize: proxy.size, safeAreaInsets: proxy.safeAreaInsets) {
-                        NativeStreamVirtualHoldButton(label: "R1", size: buttonSize, pressed: { inputBridge.setVirtualButton(.rightShoulder, pressed: $0) })
-                    }
-                    mobileControl(.dpad, point: .init(x: 0.13, y: 0.77), containerSize: proxy.size, safeAreaInsets: proxy.safeAreaInsets) {
-                        NativeStreamVirtualDPad(size: buttonSize * 0.72, inputBridge: inputBridge)
-                    }
-                    mobileControl(.sprint, point: .init(x: 0.13, y: 0.61), containerSize: proxy.size, safeAreaInsets: proxy.safeAreaInsets) {
-                        NativeStreamVirtualHoldButton(label: "SPRINT", size: buttonSize * 1.1, pressed: { inputBridge.setVirtualButton(.leftStick, pressed: $0) })
-                    }
-                    mobileControl(.rightStick, point: .init(x: 0.72, y: 0.78), containerSize: proxy.size, safeAreaInsets: proxy.safeAreaInsets) {
-                        NativeStreamVirtualHoldButton(label: "R3", size: buttonSize, pressed: { inputBridge.setVirtualButton(.rightStick, pressed: $0) })
-                    }
-                    mobileControl(.faceX, point: .init(x: 0.87, y: 0.68), containerSize: proxy.size, safeAreaInsets: proxy.safeAreaInsets) {
-                        NativeStreamVirtualHoldButton(label: "X", size: buttonSize, tint: .blue, pressed: { inputBridge.setVirtualButton(.x, pressed: $0) })
-                    }
-                    mobileControl(.faceY, point: .init(x: 0.94, y: 0.77), containerSize: proxy.size, safeAreaInsets: proxy.safeAreaInsets) {
-                        NativeStreamVirtualHoldButton(label: "Y", size: buttonSize, tint: .yellow, pressed: { inputBridge.setVirtualButton(.y, pressed: $0) })
-                    }
-                    mobileControl(.faceB, point: .init(x: 0.87, y: 0.86), containerSize: proxy.size, safeAreaInsets: proxy.safeAreaInsets) {
-                        NativeStreamVirtualHoldButton(label: "B", size: buttonSize, tint: .red, pressed: { inputBridge.setVirtualButton(.b, pressed: $0) })
-                    }
-                    mobileControl(.faceA, point: .init(x: 0.80, y: 0.77), containerSize: proxy.size, safeAreaInsets: proxy.safeAreaInsets) {
-                        NativeStreamVirtualHoldButton(label: "A", size: buttonSize, tint: .green, pressed: { inputBridge.setVirtualButton(.a, pressed: $0) })
-                    }
-                    mobileControl(.aimShoot, point: .init(x: 0.70, y: 0.61), containerSize: proxy.size, safeAreaInsets: proxy.safeAreaInsets) {
-                        NativeStreamAimShootButton(inputBridge: inputBridge, size: buttonSize * 1.18)
-                    }
-                    mobileControl(.mobileHide, point: .init(x: 0.50, y: 0.92), containerSize: proxy.size, safeAreaInsets: proxy.safeAreaInsets) {
-                        Button(action: onHide) {
-                            Label("Hide controls", systemImage: "eye.slash").font(.caption.weight(.semibold))
-                                .padding(.horizontal, 12).padding(.vertical, 8)
-                        }.buttonStyle(.bordered).tint(.white)
                     }
                 } else {
                 controlGroup(
@@ -7060,20 +6980,6 @@ private struct NativeStreamVirtualControllerOverlay: View {
             content: content
         )
     }
-
-    private func mobileControl<Content: View>(
-        _ group: NativeStreamTouchControlGroup,
-        point fallback: TouchControlPoint,
-        containerSize: CGSize,
-        safeAreaInsets: EdgeInsets,
-        @ViewBuilder content: @escaping () -> Content
-    ) -> some View {
-        controlGroup(group, point: layout.independentPositions[group.rawValue]
-                     ?? TouchControlLayout.mobileGamePositions[group.rawValue]
-                     ?? fallback,
-                     containerSize: containerSize, safeAreaInsets: safeAreaInsets, content: content)
-    }
-
 
 }
 
@@ -7478,14 +7384,12 @@ private struct NativeStreamSplitTouchpadSurface: UIViewRepresentable {
     let inputBridge: NativeStreamInputBridge
     let sensitivity: Double
     let deadZone: Double
-    let mobileGame: Bool
 
     func makeUIView(context: Context) -> NativeStreamSplitTouchpadView {
         let view = NativeStreamSplitTouchpadView(frame: .zero)
         view.inputBridge = inputBridge
         view.sensitivity = sensitivity
         view.deadZone = deadZone
-        view.mobileGame = mobileGame
         return view
     }
 
@@ -7493,7 +7397,6 @@ private struct NativeStreamSplitTouchpadSurface: UIViewRepresentable {
         view.inputBridge = inputBridge
         view.sensitivity = sensitivity
         view.deadZone = deadZone
-        view.mobileGame = mobileGame
     }
 
     static func dismantleUIView(_ view: NativeStreamSplitTouchpadView, coordinator: ()) {
@@ -7507,19 +7410,8 @@ private final class NativeStreamSplitTouchpadView: UIView {
     weak var inputBridge: NativeStreamInputBridge?
     var sensitivity = 1.0
     var deadZone = 0.0
-    var mobileGame = false
-    private struct ActiveTouch {
-        var stick: NativeStreamVirtualGamepadStick
-        var origin: CGPoint
-        var sprinting = false
-    }
-    private var activeTouches: [ObjectIdentifier: ActiveTouch] = [:]
+    private var activeTouches: [ObjectIdentifier: (stick: NativeStreamVirtualGamepadStick, origin: CGPoint)] = [:]
     private var occupiedSticks: Set<NativeStreamVirtualGamepadStick> = []
-    private let movementIndicator = CAShapeLayer()
-    private let movementDot = CAShapeLayer()
-    private let aimIndicator = CAShapeLayer()
-    private let aimDot = CAShapeLayer()
-    private let sprintMarker = CAShapeLayer()
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -7527,33 +7419,9 @@ private final class NativeStreamSplitTouchpadView: UIView {
         backgroundColor = .clear
         isOpaque = false
         isAccessibilityElement = false
-        for shape in [movementIndicator, aimIndicator] {
-            shape.fillColor = UIColor.clear.cgColor
-            shape.strokeColor = UIColor.white.withAlphaComponent(0.8).cgColor
-            shape.lineWidth = 2
-            shape.opacity = 0
-            layer.addSublayer(shape)
-        }
-        for dot in [movementDot, aimDot] {
-            dot.fillColor = UIColor.white.cgColor
-            dot.opacity = 0
-            layer.addSublayer(dot)
-        }
-        sprintMarker.fillColor = UIColor.systemRed.cgColor
-        sprintMarker.opacity = 0
-        layer.addSublayer(sprintMarker)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        movementIndicator.frame = bounds
-        movementDot.frame = bounds
-        aimIndicator.frame = bounds
-        aimDot.frame = bounds
-        sprintMarker.frame = bounds
-    }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         for touch in touches {
@@ -7561,18 +7429,16 @@ private final class NativeStreamSplitTouchpadView: UIView {
             let stick: NativeStreamVirtualGamepadStick = point.x < bounds.midX ? .left : .right
             guard !occupiedSticks.contains(stick) else { continue }
             let id = ObjectIdentifier(touch)
-            activeTouches[id] = ActiveTouch(stick: stick, origin: point)
+            activeTouches[id] = (stick, point)
             occupiedSticks.insert(stick)
             inputBridge?.setVirtualStick(stick, x: 0, y: 0)
-            if mobileGame { updateIndicator(origin: point, point: point, stick: stick) }
         }
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         for touch in touches {
-            guard let stored = activeTouches[ObjectIdentifier(touch)] else { continue }
+            guard let active = activeTouches[ObjectIdentifier(touch)] else { continue }
             let point = touch.location(in: self)
-            var active = stored
             let vector = TouchpadStickMath.vector(
                 dx: point.x - active.origin.x,
                 dy: point.y - active.origin.y,
@@ -7581,22 +7447,6 @@ private final class NativeStreamSplitTouchpadView: UIView {
                 deadZone: deadZone
             )
             inputBridge?.setVirtualStick(active.stick, x: vector.0, y: vector.1)
-            if mobileGame {
-                let travel = min(max(bounds.width * 0.085, 54), 96)
-                if active.stick == .left {
-                    let nowSprinting = TouchpadStickMath.shouldSprint(
-                        dx: point.x - active.origin.x,
-                        dy: point.y - active.origin.y,
-                        travel: travel
-                    )
-                    if nowSprinting != active.sprinting {
-                        active.sprinting = nowSprinting
-                        activeTouches[ObjectIdentifier(touch)] = active
-                        inputBridge?.setVirtualButton(.leftStick, pressed: nowSprinting)
-                    }
-                }
-                updateIndicator(origin: active.origin, point: point, stick: active.stick)
-            }
         }
     }
 
@@ -7606,15 +7456,9 @@ private final class NativeStreamSplitTouchpadView: UIView {
     func cancelTouches() {
         for active in activeTouches.values {
             inputBridge?.setVirtualStick(active.stick, x: 0, y: 0)
-            if active.sprinting { inputBridge?.setVirtualButton(.leftStick, pressed: false) }
         }
         activeTouches.removeAll()
         occupiedSticks.removeAll()
-        movementIndicator.opacity = 0
-        movementDot.opacity = 0
-        aimIndicator.opacity = 0
-        aimDot.opacity = 0
-        sprintMarker.opacity = 0
     }
 
     private func finish(_ touches: Set<UITouch>) {
@@ -7622,134 +7466,12 @@ private final class NativeStreamSplitTouchpadView: UIView {
             guard let active = activeTouches.removeValue(forKey: ObjectIdentifier(touch)) else { continue }
             occupiedSticks.remove(active.stick)
             inputBridge?.setVirtualStick(active.stick, x: 0, y: 0)
-            if active.sprinting { inputBridge?.setVirtualButton(.leftStick, pressed: false) }
-        }
-        for stick in [NativeStreamVirtualGamepadStick.left, .right]
-        where !activeTouches.values.contains(where: { $0.stick == stick }) {
-            clearIndicator(for: stick)
-        }
-    }
-
-    private func updateIndicator(origin: CGPoint, point: CGPoint, stick: NativeStreamVirtualGamepadStick) {
-        let travel = min(max(bounds.width * 0.085, 54), 96)
-        let center = origin
-        let radius = stick == .left ? travel : min(max(bounds.width * 0.06, 42), 72)
-        let dx = point.x - origin.x
-        let dy = point.y - origin.y
-        let length = hypot(dx, dy)
-        let scale = length > radius && length > 0 ? radius / length : 1
-        let dot = CGPoint(x: origin.x + dx * scale, y: origin.y + dy * scale)
-        let path = UIBezierPath(ovalIn: CGRect(x: center.x - radius, y: center.y - radius, width: radius * 2, height: radius * 2))
-        path.move(to: origin)
-        path.addLine(to: dot)
-        let ring = stick == .left ? movementIndicator : aimIndicator
-        let puck = stick == .left ? movementDot : aimDot
-        ring.path = path.cgPath
-        ring.strokeColor = UIColor.white.withAlphaComponent(0.82).cgColor
-        ring.fillColor = UIColor.clear.cgColor
-        ring.opacity = 1
-        ring.zPosition = 10
-        puck.path = UIBezierPath(ovalIn: CGRect(x: dot.x - 6, y: dot.y - 6, width: 12, height: 12)).cgPath
-        puck.opacity = 1
-        sprintMarker.path = UIBezierPath(ovalIn: CGRect(x: center.x - 10, y: center.y - radius - 10, width: 20, height: 20)).cgPath
-        sprintMarker.opacity = stick == .left ? 1 : 0
-    }
-
-    private func clearIndicator(for stick: NativeStreamVirtualGamepadStick) {
-        if stick == .left {
-            movementIndicator.opacity = 0
-            movementDot.opacity = 0
-            sprintMarker.opacity = 0
-        } else {
-            aimIndicator.opacity = 0
-            aimDot.opacity = 0
         }
     }
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
         if window == nil { cancelTouches() }
-    }
-}
-
-private struct NativeStreamAimShootButton: UIViewRepresentable {
-    let inputBridge: NativeStreamInputBridge
-    let size: CGFloat
-
-    func makeUIView(context: Context) -> NativeStreamAimShootControl {
-        let control = NativeStreamAimShootControl(frame: .zero)
-        control.inputBridge = inputBridge
-        control.label.text = "AIM\n+\nFIRE"
-        control.frame = CGRect(x: 0, y: 0, width: size, height: size)
-        return control
-    }
-
-    func updateUIView(_ control: NativeStreamAimShootControl, context: Context) {
-        control.inputBridge = inputBridge
-        control.frame.size = CGSize(width: size, height: size)
-    }
-
-    static func dismantleUIView(_ control: NativeStreamAimShootControl, coordinator: ()) {
-        control.releaseTriggers()
-    }
-}
-
-private final class NativeStreamAimShootControl: UIControl {
-    weak var inputBridge: NativeStreamInputBridge?
-    let label = UILabel()
-    private var fireWork: DispatchWorkItem?
-    private var firing = false
-
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        isMultipleTouchEnabled = false
-        backgroundColor = UIColor.white.withAlphaComponent(0.16)
-        layer.cornerRadius = 40
-        layer.borderWidth = 1
-        layer.borderColor = UIColor.white.withAlphaComponent(0.45).cgColor
-        label.textColor = .white
-        label.font = .boldSystemFont(ofSize: 10)
-        label.textAlignment = .center
-        label.numberOfLines = 3
-        label.isUserInteractionEnabled = false
-        addSubview(label)
-        addTarget(self, action: #selector(begin), for: .touchDown)
-        addTarget(self, action: #selector(end), for: [.touchUpInside, .touchUpOutside, .touchCancel])
-    }
-
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        layer.cornerRadius = min(bounds.width, bounds.height) / 2
-        label.frame = bounds.insetBy(dx: 2, dy: 2)
-    }
-
-    @objc private func begin() {
-        releaseTriggers()
-        inputBridge?.setVirtualTrigger(.left, value: 1)
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, self.isTracking else { return }
-            self.firing = true
-            self.inputBridge?.setVirtualTrigger(.right, value: 1)
-        }
-        fireWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.09, execute: work)
-    }
-
-    @objc private func end() { releaseTriggers() }
-
-    func releaseTriggers() {
-        fireWork?.cancel()
-        fireWork = nil
-        inputBridge?.setVirtualTrigger(.left, value: 0)
-        if firing { inputBridge?.setVirtualTrigger(.right, value: 0) }
-        firing = false
-    }
-
-    override func didMoveToWindow() {
-        super.didMoveToWindow()
-        if window == nil { releaseTriggers() }
     }
 }
 

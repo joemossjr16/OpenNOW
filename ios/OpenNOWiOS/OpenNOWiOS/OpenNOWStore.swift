@@ -1692,17 +1692,6 @@ struct TouchControlLayout: Codable, Equatable {
         bottomCenter: .init(x: 0.50, y: 0.86)
     )
 
-    static let mobileGamePositions: [String: TouchControlPoint] = [
-        "leftShoulder": .init(x: 0.07, y: 0.12), "leftTrigger": .init(x: 0.17, y: 0.12),
-        "view": .init(x: 0.44, y: 0.12), "menu": .init(x: 0.56, y: 0.12),
-        "rightTrigger": .init(x: 0.83, y: 0.12), "rightShoulder": .init(x: 0.93, y: 0.12),
-        "dpad": .init(x: 0.13, y: 0.77), "sprint": .init(x: 0.13, y: 0.61),
-        "rightStick": .init(x: 0.72, y: 0.78), "faceX": .init(x: 0.87, y: 0.68),
-        "faceY": .init(x: 0.94, y: 0.77), "faceB": .init(x: 0.87, y: 0.86),
-        "faceA": .init(x: 0.80, y: 0.77), "aimShoot": .init(x: 0.70, y: 0.61),
-        "mobileHide": .init(x: 0.50, y: 0.92)
-    ]
-
     static let legacyStandard = TouchControlLayout(
         scale: 1,
         opacity: 0.58,

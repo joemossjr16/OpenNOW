@@ -846,13 +846,8 @@ struct SettingsView: View {
                         Text(preset.label).tag(preset)
                     }
                 }
-                if store.settings.touch.controllerPreset == .mobileGame {
-                    Text("Split movement and look touchpads, an aim-and-fire trigger, sprint at the movement rim, and individually movable controls.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
                 if !store.settings.touch.controllerPreset.supportsControlModeSelection {
-                    Text(store.settings.touch.controllerPreset.usesSplitTouchpad ? "Split touchpad" : "Virtual sticks")
+                    Text("Virtual sticks")
                         .foregroundStyle(.secondary)
                 } else {
                     Picker("Control layout", selection: $store.settings.touch.controlMode) {
@@ -861,7 +856,7 @@ struct SettingsView: View {
                         }
                     }
                 }
-                if store.settings.touch.controllerPreset.usesSplitTouchpad || (store.settings.touch.controllerPreset.supportsControlModeSelection && store.settings.touch.controlMode == .splitTouchpad) {
+                if store.settings.touch.controllerPreset.supportsControlModeSelection && store.settings.touch.controlMode == .splitTouchpad {
                     settingsSlider(
                         "Touchpad Sensitivity",
                         value: $store.settings.touch.touchpadSensitivity,

@@ -3237,16 +3237,23 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(result.0, 0, accuracy: 0.0001)
     }
 
-    func testMobileGameTouchPresetAndIndependentLayoutPositionsPersist() throws {
-        var settings = TouchSettings()
-        XCTAssertEqual(settings.controllerPreset, .standard)
-        settings.controllerPreset = .mobileGame
-        XCTAssertEqual(try JSONDecoder().decode(TouchSettings.self, from: JSONEncoder().encode(settings)), settings)
-
-        var layout = TouchControlLayout.standard
-        layout.independentPositions["faceA"] = TouchControlPoint(x: 0.73, y: 0.61)
-        XCTAssertEqual(try JSONDecoder().decode(TouchControlLayout.self, from: JSONEncoder().encode(layout)), layout)
-        XCTAssertEqual(TouchControlLayout.mobileGamePositions["aimShoot"], TouchControlPoint(x: 0.70, y: 0.61))
+    func testRetiredMobileGamePresetMigratesWithoutResettingSavedSettings() throws {
+        let saved = Data(#"{"controllerRumbleStrength":8,"metal4Enabled":true,"preferredResolution":"2560x1080","preferredAspectRatio":"21:9","touch":{"controllerPreset":"mobileGame","controlMode":"splitTouchpad","joystickDeadZone":0.17,"touchpadSensitivity":1.3,"leftOffsetX":24}}"#.utf8)
+        let settings = try JSONDecoder().decode(AppSettings.self, from: saved)
+        XCTAssertEqual(settings.touch.controllerPreset, .standard)
+        XCTAssertEqual(settings.touch.controlMode, .splitTouchpad)
+        XCTAssertEqual(settings.touch.joystickDeadZone, 0.17, accuracy: 0.0001)
+        XCTAssertEqual(settings.touch.touchpadSensitivity, 1.3, accuracy: 0.0001)
+        XCTAssertEqual(settings.touch.leftOffsetX, 24)
+        XCTAssertEqual(settings.controllerRumbleStrength, 8)
+        XCTAssertTrue(settings.metal4Enabled)
+        XCTAssertEqual(settings.preferredResolution, "2560x1080")
+        let encoded = try JSONEncoder().encode(settings)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        let touch = try XCTUnwrap(json["touch"] as? [String: Any])
+        XCTAssertEqual(touch["controllerPreset"] as? String, "standard")
+        XCTAssertEqual(try JSONDecoder().decode(AppSettings.self, from: encoded), settings)
+        XCTAssertEqual(TouchControllerPreset.allCases, [.standard, .geForceNOW])
     }
 
     func testGeForceNOWPresetKeepsSeparateControlsAndPersistsCustomPositions() throws {
@@ -3254,9 +3261,8 @@ final class OpenNOWiOSParityTests: XCTestCase {
         settings.controllerPreset = .geForceNOW
         XCTAssertEqual(try JSONDecoder().decode(TouchSettings.self, from: JSONEncoder().encode(settings)), settings)
         XCTAssertTrue(settings.controllerPreset.usesIndependentControls)
-        XCTAssertFalse(settings.controllerPreset.usesSplitTouchpad)
         XCTAssertFalse(settings.controllerPreset.supportsControlModeSelection)
-        XCTAssertEqual(TouchControllerPreset.standard.next.next, .geForceNOW)
+        XCTAssertEqual(TouchControllerPreset.standard.next, .geForceNOW)
         XCTAssertEqual(TouchControllerPreset.geForceNOW.next, .standard)
         XCTAssertEqual(GeForceNOWTouchControl.allCases.count, 19)
         XCTAssertEqual(Set(GeForceNOWTouchControl.allCases.map(\.id)).count, 19)
@@ -3384,13 +3390,6 @@ final class OpenNOWiOSParityTests: XCTestCase {
             let restored = try JSONDecoder().decode(StreamStatsMetrics.self, from: JSONEncoder().encode(metrics))
             XCTAssertEqual(restored, metrics)
         }
-    }
-
-    func testMobileGameSprintActivatesOnlyAtTheMarkedMovementRim() {
-        XCTAssertTrue(TouchpadStickMath.shouldSprint(dx: 0, dy: -60, travel: 60))
-        XCTAssertFalse(TouchpadStickMath.shouldSprint(dx: 60, dy: 0, travel: 60))
-        XCTAssertFalse(TouchpadStickMath.shouldSprint(dx: 30, dy: -60, travel: 60))
-        XCTAssertFalse(TouchpadStickMath.shouldSprint(dx: 0, dy: -40, travel: 60))
     }
 
     func testOlderTouchSettingsDefaultToVirtualSticks() throws {
