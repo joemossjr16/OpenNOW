@@ -6491,6 +6491,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                effects.submit(buffer: pixelBuffer, destination: destination, upscale: shouldUpscale,
                     target: drawable.texture, sharpening:Float(sharpeningAmount),
                     drawable: drawable, ticket: ticket,
+                    waitForPrevious: NativeStreamSubmissionQueue.metal4Effects.requiresWait(from: lastSubmissionQueue),
                     presented: presentedMetal4, completion: completeMetal4) {
                 if let ticket { submissionTimeline?.accept(ticket) }
                 lastSubmissionQueue = .metal4Effects
@@ -6533,6 +6534,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                     transfer: hdrTransfer == .pq ? 1 : hdrTransfer == .hlg ? 2 : 0,
                     upscale: shouldUpscale, context: ciContext, producer: commandBuffer,
                     target: drawable.texture, drawable: drawable, ticket: ticket,
+                    waitForPrevious: NativeStreamSubmissionQueue.metal4Effects.requiresWait(from: lastSubmissionQueue),
                     presented: presentedMetal4, completion: completeMetal4) {
                     if let ticket { submissionTimeline?.accept(ticket) }
                     lastSubmissionQueue = .metal4Effects

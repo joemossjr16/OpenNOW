@@ -95,17 +95,19 @@ final class NativeStreamMetal4EffectsRenderer {
     func submit(image: CIImage, destination: CGRect, transfer: Int, upscale: Bool,
                 context: CIContext, producer: any MTLCommandBuffer, target: any MTLTexture,
                 drawable: (any MTLDrawable)? = nil, ticket: NativeStreamMetalFrameTimeline.Ticket? = nil,
+                waitForPrevious: Bool = true,
                 presented: (@Sendable (Double) -> Void)? = nil,
                 presentAt: Double? = nil, completion: @escaping @Sendable (Double, NSError?) -> Void) -> Bool {
         submit(image: image, native: nil, destination: destination, transfer: transfer, upscale: upscale,
                context: context, producer: producer, sharpening: 0, target: target, drawable: drawable, ticket: ticket,
-               presented: presented, presentAt: presentAt, completion: completion)
+               waitForPrevious: waitForPrevious, presented: presented, presentAt: presentAt, completion: completion)
     }
     /// Zero-copy native SDR/PQ/HLG or a tagged linear RGB surface.
     /// Unknown color metadata/warm-up retains the compatible CI fallback.
     func submit(buffer: CVPixelBuffer, destination: CGRect, upscale: Bool, target: any MTLTexture,
                 sharpening: Float = 0, producer: (any MTLCommandBuffer)? = nil,
                 drawable: (any MTLDrawable)? = nil, ticket: NativeStreamMetalFrameTimeline.Ticket? = nil,
+                waitForPrevious: Bool = true,
                 presented: (@Sendable (Double) -> Void)? = nil, presentAt: Double? = nil,
                 completion: @escaping @Sendable (Double, NSError?) -> Void) -> Bool {
         guard let input = NativeStreamMetalVideoInput.Input(buffer: buffer, cache: textureCache, target: target) else { return false }
@@ -113,12 +115,13 @@ final class NativeStreamMetal4EffectsRenderer {
                       transfer: input.color.presentationTransfer, upscale: upscale,
                       context: nil, producer: producer, sharpening: sharpening,
                       target: target, drawable: drawable, ticket: ticket,
-                      presented: presented, presentAt: presentAt, completion: completion)
+                      waitForPrevious: waitForPrevious, presented: presented, presentAt: presentAt, completion: completion)
     }
     private func submit(image: CIImage?, native: NativeStreamMetalVideoInput.Input?,
                 destination: CGRect, transfer: Int, upscale: Bool,
                 context: CIContext?, producer: (any MTLCommandBuffer)?, sharpening: Float, target: any MTLTexture,
                 drawable: (any MTLDrawable)?, ticket: NativeStreamMetalFrameTimeline.Ticket?,
+                waitForPrevious: Bool,
                 presented: (@Sendable (Double) -> Void)?, presentAt: Double?,
                 completion: @escaping @Sendable (Double, NSError?) -> Void) -> Bool {
         guard drawable == nil || drawableResidency.isRegistered else { return false }
@@ -174,7 +177,7 @@ final class NativeStreamMetal4EffectsRenderer {
             }
             // Pooled decoder IOSurfaces can arrive with a different texture view
             // over recycled memory. Explicitly make aliased reads coherent.
-            encoder.barrier(afterQueueStages: .all, beforeStages: .fragment,
+            encoder.barrier(afterQueueStages: .blit, beforeStages: .fragment,
                             visibilityOptions: [.device, .resourceAlias])
             encoder.setRenderPipelineState(conversionPipeline)
             encoder.setViewport(MTLViewport(originX: 0, originY: 0, width: Double(key.width), height: Double(key.height), znear: 0, zfar: 1))
@@ -222,10 +225,6 @@ final class NativeStreamMetal4EffectsRenderer {
             width: destination.width, height: destination.height, znear: 0, zfar: 1))
         encoder.setArgumentTable(slot.arguments, stages: .fragment)
         encoder.drawPrimitives(primitiveType: .triangleStrip, vertexStart: 0, vertexCount: 4)
-        // Store tile results before handing this drawable to the compositor,
-        // which consumes another view of the same IOSurface allocation.
-        encoder.barrier(afterStages: [.fragment, .tile], beforeQueueStages: .all,
-                        visibilityOptions: [.device, .resourceAlias])
         encoder.endEncoding(); slot.command.endCommandBuffer()
         // A failed producer can skip its GPU signal. Only unblock after completion;
         // report the error to the consumer completion as well as recovering the event.
@@ -256,7 +255,8 @@ final class NativeStreamMetal4EffectsRenderer {
         } }
         if let producer {
             producer.commit(); queue.waitForEvent(producerEvent, value: producerValue)
-        } else if let ticket, ticket.previous > 0 { queue.waitForEvent(ticket.event, value: ticket.previous) }
+        }
+        if waitForPrevious, let ticket, ticket.previous > 0 { queue.waitForEvent(ticket.event, value: ticket.previous) }
         if let drawable { queue.waitForDrawable(drawable) }
         queue.commit([slot.command], options: options)
         if let ticket { queue.signalEvent(ticket.event, value: ticket.value) }
