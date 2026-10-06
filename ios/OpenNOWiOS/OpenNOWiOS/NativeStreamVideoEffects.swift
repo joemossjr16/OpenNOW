@@ -55,7 +55,7 @@ enum NativeStreamVideoEffectsPolicy {
         return CGSize(width: source.width * scale, height: source.height * scale)
     }
 
-    /// Keep preset resolution choices stable when the renderer skips a small upscale.
+    /// Share the supported enlargement range between presets and runtime MetalFX.
     static func canSelectUpscaleResolution(source: CGSize, destination: CGSize) -> Bool {
         source.width > 0 && source.height > 0
             && destination.width > source.width * 1.02
@@ -65,11 +65,7 @@ enum NativeStreamVideoEffectsPolicy {
     }
 
     static func upscaleSize(source: CGSize, destination: CGSize) -> CGSize? {
-        guard canSelectUpscaleResolution(source: source, destination: destination),
-              // Near-native video does not justify conversion plus MetalFX.
-              // Keep it on the single-pass HDR path even when MetalFX is enabled.
-              destination.width >= source.width * 1.18,
-              destination.height >= source.height * 1.18 else { return nil }
+        guard canSelectUpscaleResolution(source: source, destination: destination) else { return nil }
         return CGSize(width: destination.width.rounded(), height: destination.height.rounded())
     }
 

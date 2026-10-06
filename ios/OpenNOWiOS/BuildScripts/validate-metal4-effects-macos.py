@@ -14,9 +14,9 @@ import QuartzCore
   let renderer = NativeStreamMetal4EffectsRenderer(device: device)!
   let layer=CAMetalLayer();layer.device=device;layer.pixelFormat = .bgr10a2Unorm
   layer.drawableSize=CGSize(width:128,height:64);layer.framebufferOnly=false
-  func fixture(format:OSType,transfer:CFString,phase:Int = 0) -> CVPixelBuffer {
+  func fixture(format:OSType,transfer:CFString,phase:Int = 0, width:Int = 64, height:Int = 32) -> CVPixelBuffer {
    var allocation: CVPixelBuffer?
-   precondition(CVPixelBufferCreate(nil,64,32,format,
+   precondition(CVPixelBufferCreate(nil,width,height,format,
     [kCVPixelBufferIOSurfacePropertiesKey:[:],kCVPixelBufferMetalCompatibilityKey:true] as CFDictionary,&allocation) == kCVReturnSuccess)
    let result = allocation!
    CVPixelBufferLockBaseAddress(result,[])
@@ -35,8 +35,8 @@ import QuartzCore
    CVBufferSetAttachment(result,kCVImageBufferColorPrimariesKey,kCVImageBufferColorPrimaries_ITU_R_2020,.shouldPropagate)
    return result
   }
-  func target() -> any MTLTexture {
-   let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.bgr10a2Unorm,width:128,height:64,mipmapped:false)
+  func target(width:Int = 128, height:Int = 64) -> any MTLTexture {
+   let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.bgr10a2Unorm,width:width,height:height,mipmapped:false)
    descriptor.storageMode = .shared; descriptor.usage = [.renderTarget,.shaderRead]
    return device.makeTexture(descriptor:descriptor)!
   }
@@ -199,6 +199,59 @@ import QuartzCore
   }
   precondition(drawableFrames>0,"No drawable available for Metal 4 presentation validation")
   print("PASS: private Metal 4 HDR/MetalFX frames use compatible drawable presentation",drawableFrames,"frames")
+
+  // The reported phone geometry must really execute MetalFX, including its
+  // private-output → compatible-copy handoff, rather than passing via HDR alone.
+  let phone = CGSize(width:2868,height:1320), fullSource = CGSize(width:2560,height:1080)
+  let phoneTimeline = NativeStreamMetalFrameTimeline(device:device)!
+  for stretch in [false,true] {
+   let fitted = NativeStreamVideoEffectsPolicy.presentationSize(source:fullSource,display:phone,stretch:stretch)
+   let expectedSize = NativeStreamVideoEffectsPolicy.upscaleSize(source:fullSource,destination:fitted)!
+   precondition(expectedSize == CGSize(width:2868,height:stretch ? 1320 : 1210))
+   let destination = CGRect(x:0,y:(phone.height-fitted.height)/2,width:fitted.width,height:fitted.height)
+   let done = AsyncStream<Bool>.makeStream()
+   var captures:[(any MTLTexture,any MTLTexture)] = []
+   for phase in 0..<3 {
+    let surface = fixture(format:kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange,
+        transfer:kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ,phase:phase*20,width:2560,height:1080)
+    let output = target(width:2868,height:1320), reference = target(width:2868,height:1320)
+    let ticket = phoneTimeline.next()
+    var accepted = false
+    for _ in 0..<500 {
+     guard let frame = presentation.prepare(target:output,ticket:ticket) else {fatalError("No phone copy slot")}
+     let readback = frame.command.makeBlitCommandEncoder()!
+     readback.copy(from:frame.texture,sourceSlice:0,sourceLevel:0,sourceOrigin:MTLOrigin(),
+         sourceSize:MTLSize(width:2868,height:1320,depth:1),to:reference,
+         destinationSlice:0,destinationLevel:0,destinationOrigin:MTLOrigin())
+     readback.endEncoding()
+     accepted = renderer.submit(buffer:surface,destination:destination,upscale:true,target:frame.texture,
+         ticket:ticket,waitForPrevious:false) { _,error in precondition(error == nil) }
+     if accepted {
+      phoneTimeline.accept(ticket)
+      precondition(renderer.status == "Metal 4 · 2560×1080 → 2868×\(Int(expectedSize.height))",
+          "Near-native geometry skipped MetalFX")
+      presentation.present(frame,drawable:nil,presented:{ _ in }) { error in done.continuation.yield(error == nil) }
+      captures.append((output,reference)); break
+     }
+     presentation.discard(frame)
+     try await Task.sleep(nanoseconds:10_000_000)
+    }
+    precondition(accepted,renderer.status)
+   }
+   var finished = 0
+   for await success in done.stream { precondition(success); finished += 1; if finished == 3 { break } }
+   done.continuation.finish()
+   for (output,reference) in captures {
+    let actual = pixels(output)
+    precondition(actual == pixels(reference),"Display copy changed the upscaled frame")
+    let top = Int(destination.minY+destination.height*0.25)*2868+1434
+    let bottom = Int(destination.minY+destination.height*0.75)*2868+1434
+    precondition((actual[top]&1023) < (actual[bottom]&1023),"Upscaled image is blank or upside down")
+    if !stretch { precondition((actual[1434]&0x3fffffff)==0,"Fitted HDR border was not cleared") }
+   }
+   print("PASS: 2560×1080 native PQ MetalFX →",Int(expectedSize.width),Int(expectedSize.height),
+       "three private frames copied exactly; stretch",stretch)
+  }
 
   let nativeDestination = CGRect(x:16,y:8,width:96,height:48)
   let timeline = NativeStreamMetalFrameTimeline(device:device)!
