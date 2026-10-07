@@ -94,28 +94,28 @@ final class NativeStreamMetal4EffectsRenderer {
     /// Called on the display thread. False leaves the producer uncommitted for legacy fallback.
     func submit(image: CIImage, destination: CGRect, transfer: Int, upscale: Bool,
                 context: CIContext, producer: any MTLCommandBuffer, target: any MTLTexture,
-                method: StreamUpscalingMethod = .metalFX, sharpening: Float = 0,
+                method: StreamUpscalingMethod = .metalFX, sharpening: Float = 0, scalingDestination: CGSize? = nil,
                 ticket: NativeStreamMetalFrameTimeline.Ticket? = nil,
                 waitForPrevious: Bool = true, completion: @escaping @Sendable (Double, NSError?) -> Void) -> Bool {
-        submit(image: image, native: nil, destination: destination, transfer: transfer, upscale: upscale,
+        submit(image: image, native: nil, destination: destination, transfer: transfer, upscale: upscale, scalingDestination: scalingDestination,
                context: context, producer: producer, sharpening: sharpening, method: method, target: target, ticket: ticket,
                waitForPrevious: waitForPrevious, completion: completion)
     }
     /// Zero-copy native SDR/PQ/HLG or a tagged linear RGB surface.
     /// Unknown color metadata/warm-up retains the compatible CI fallback.
     func submit(buffer: CVPixelBuffer, destination: CGRect, upscale: Bool, target: any MTLTexture,
-                sharpening: Float = 0, method: StreamUpscalingMethod = .metalFX, producer: (any MTLCommandBuffer)? = nil,
+                sharpening: Float = 0, method: StreamUpscalingMethod = .metalFX, scalingDestination: CGSize? = nil, producer: (any MTLCommandBuffer)? = nil,
                 ticket: NativeStreamMetalFrameTimeline.Ticket? = nil,
                 waitForPrevious: Bool = true, completion: @escaping @Sendable (Double, NSError?) -> Void) -> Bool {
         guard let input = NativeStreamMetalVideoInput.Input(buffer: buffer, cache: textureCache, target: target) else { return false }
         return submit(image: nil, native: input, destination: destination,
-                      transfer: input.color.presentationTransfer, upscale: upscale,
+                      transfer: input.color.presentationTransfer, upscale: upscale, scalingDestination: scalingDestination,
                       context: nil, producer: producer, sharpening: sharpening, method: method,
                       target: target, ticket: ticket,
                       waitForPrevious: waitForPrevious, completion: completion)
     }
     private func submit(image: CIImage?, native: NativeStreamMetalVideoInput.Input?,
-                destination: CGRect, transfer: Int, upscale: Bool,
+                destination: CGRect, transfer: Int, upscale: Bool, scalingDestination: CGSize?,
                 context: CIContext?, producer: (any MTLCommandBuffer)?, sharpening: Float, method: StreamUpscalingMethod, target: any MTLTexture,
                 ticket: NativeStreamMetalFrameTimeline.Ticket?,
                 waitForPrevious: Bool, completion: @escaping @Sendable (Double, NSError?) -> Void) -> Bool {
@@ -125,7 +125,7 @@ final class NativeStreamMetal4EffectsRenderer {
               destination.width.isFinite, destination.height.isFinite, destination.width > 0, destination.height > 0,
               transfer >= 0, transfer <= 2,
               target.pixelFormat == (transfer == 0 ? .bgra8Unorm : .bgr10a2Unorm) else { return false }
-        let outputSize = upscale ? method.outputSize(source: size, destination: destination.size) : nil
+        let outputSize = upscale ? method.outputSize(source: size, destination: scalingDestination ?? destination.size) : nil
         let useNIS = outputSize != nil && method == .nis
         let key = Key(width: Int(size.width.rounded()), height: Int(size.height.rounded()),
             outputWidth: Int((outputSize?.width ?? size.width).rounded()),

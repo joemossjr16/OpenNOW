@@ -2,8 +2,36 @@ import CoreImage
 import Foundation
 import Metal
 
+enum StreamUpscalingTarget: String, Codable, CaseIterable, Identifiable {
+  case screen, oneAndHalf, double
+  var id: String { rawValue }
+  var label: String {
+    switch self {
+    case .screen: return "Screen resolution"
+    case .oneAndHalf: return "1.5× stream resolution"
+    case .double: return "2× stream resolution"
+    }
+  }
+  func size(source: CGSize, screen: CGSize) -> CGSize {
+    guard self != .screen else { return screen }
+    let factor: CGFloat = self == .oneAndHalf ? 1.5 : 2
+    return CGSize(width: (source.width * factor).rounded(), height: (source.height * factor).rounded())
+  }
+}
+
 struct StreamClientVideoOptions: Codable, Equatable {
   var adaptiveHDR = false
+  var upscalingTarget: StreamUpscalingTarget = .screen
+  init(adaptiveHDR: Bool = false, upscalingTarget: StreamUpscalingTarget = .screen) {
+    self.adaptiveHDR = adaptiveHDR
+    self.upscalingTarget = upscalingTarget
+  }
+  private enum CodingKeys: String, CodingKey { case adaptiveHDR, upscalingTarget }
+  init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    adaptiveHDR = try values.decodeIfPresent(Bool.self, forKey: .adaptiveHDR) ?? false
+    upscalingTarget = try values.decodeIfPresent(StreamUpscalingTarget.self, forKey: .upscalingTarget) ?? .screen
+  }
 }
 
 /// Optional HDR policy never changes the negotiated stream profile.

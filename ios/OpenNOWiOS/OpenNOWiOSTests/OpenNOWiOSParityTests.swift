@@ -99,10 +99,27 @@ final class OpenNOWiOSParityTests: XCTestCase {
         XCTAssertEqual(StreamSettingsResolver.profile(for: allocation, membershipTier:"ULTIMATE"),profile)
     }
 
+    func testUpscalingTargetsUseSourceDimensionsAndPreserveStreamProfile() throws {
+        let source = CGSize(width: 2560, height: 1080)
+        let screen = CGSize(width: 2868, height: 1320)
+        XCTAssertEqual(StreamUpscalingTarget.screen.size(source: source, screen: screen), screen)
+        XCTAssertEqual(StreamUpscalingTarget.oneAndHalf.size(source: source, screen: screen), CGSize(width: 3840, height: 1620))
+        XCTAssertEqual(StreamUpscalingTarget.double.size(source: source, screen: screen), CGSize(width: 5120, height: 2160))
+        for target in StreamUpscalingTarget.allCases {
+            var settings = AppSettings.default
+            let before = StreamSettingsResolver.profile(for: settings, membershipTier: "ULTIMATE")
+            settings.clientVideo.upscalingTarget = target
+            let restored = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings))
+            XCTAssertEqual(restored.clientVideo.upscalingTarget, target)
+            XCTAssertEqual(StreamSettingsResolver.profile(for: restored, membershipTier: "ULTIMATE"), before)
+        }
+    }
+
     func testRemovedClientVideoOptionsAreIgnoredOnUpgrade() throws {
         let saved = Data(#"{"pacing":"balanced","interpolation":true,"adaptiveHDR":true}"#.utf8)
         let options = try JSONDecoder().decode(StreamClientVideoOptions.self, from: saved)
         XCTAssertTrue(options.adaptiveHDR)
+        XCTAssertEqual(options.upscalingTarget, .screen)
         let encoded = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(options)) as? [String: Any])
         XCTAssertNil(encoded["pacing"])
         XCTAssertNil(encoded["interpolation"])

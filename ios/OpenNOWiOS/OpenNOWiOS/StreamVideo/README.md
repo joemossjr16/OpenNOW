@@ -11,6 +11,10 @@ Settings → Stream and HUD → Picture expose:
 - **Adaptive HDR:** Core Image's `CIToneMapHeadroom` with the active screen's
   `currentEDRHeadroom`. Unknown source headroom leaves the original HDR path
   intact and reports the metadata limitation. Off by default.
+- **Upscaling target:** Screen resolution (default), 1.5× or 2× both incoming
+  stream dimensions. Multipliers render an intermediate image and fit it to the
+  screen, preserving the incoming resolution. For 2560×1080, they produce
+  3840×1620 and 5120×2160.
 - **Upscaling method:** MetalFX, NIS or AMD FSR1. NIS/FSR1 accept near-native
   enlargement up to 2× per dimension, retain the requested stream resolution and
   use Stream Sharpening for integrated sharpening.

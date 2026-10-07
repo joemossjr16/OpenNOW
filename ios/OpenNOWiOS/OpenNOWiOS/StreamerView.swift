@@ -1847,7 +1847,12 @@ private struct NativeStreamControlsPanel: View {
                     isOn: Binding(get: { coordinator.liveSettings.metalFXUpscalingEnabled },
                         set: { value in coordinator.updateLiveSettings { $0.metalFXUpscalingEnabled = value } }))
                 if coordinator.liveSettings.metalFXUpscalingEnabled {
-                    Picker("Upscaling method", selection: Binding(
+                    Picker("Upscaling target", selection: Binding(
+                    get: { coordinator.liveSettings.clientVideo.upscalingTarget },
+                    set: { value in coordinator.updateLiveSettings { $0.clientVideo.upscalingTarget = value } })) {
+                    ForEach(StreamUpscalingTarget.allCases) { target in Text(target.label).tag(target) }
+                }
+                Picker("Upscaling method", selection: Binding(
                         get: { coordinator.liveSettings.upscalingMethod },
                         set: { value in coordinator.updateLiveSettings { $0.upscalingMethod = value } })) {
                         ForEach(StreamUpscalingMethod.allCases) { method in
@@ -6174,7 +6179,7 @@ private final class NativeStreamRenderView: UIView {
         upscalingEnabled = upscaling
         upscalingMethod = method
         clientVideo = client
-        if upscaling || client != .init() { ensureFilteredMetalView() }
+        if upscaling || client.adaptiveHDR { ensureFilteredMetalView() }
         filteredMetalView?.setVideoEffects(upscaling: upscaling, metal4: metal4, method: method, client: client)
         updateRendererVisibility()
     }
@@ -6305,7 +6310,7 @@ private final class NativeStreamRenderView: UIView {
     }
 
     private var shouldRequestFilteredRenderer: Bool {
-        upscalingEnabled || clientVideo != .init() || nativeStreamShouldUseFilteredRenderer(
+        upscalingEnabled || clientVideo.adaptiveHDR || nativeStreamShouldUseFilteredRenderer(
             osMajorVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,
             videoCodec: videoCodec,
             streamSharpeningEnabled: streamSharpeningEnabled,
@@ -6512,12 +6517,13 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
 
     func setVideoEffects(upscaling: Bool, metal4: Bool, method: StreamUpscalingMethod = .metalFX,
                          client: StreamClientVideoOptions = .init()) {
+        let targetChanged = clientVideo.upscalingTarget != client.upscalingTarget
         if clientVideo != client { effectsGeneration &+= 1 }
         clientVideo = client
         if upscaling && method == .fsr1 { clientProcessor.prepareIfNeeded() }
         metal4Enabled = metal4
         if metal4 { prepareMetal4IfNeeded() }
-        guard upscalingEnabled != upscaling || upscalingMethod != method else { return }
+        guard upscalingEnabled != upscaling || upscalingMethod != method || targetChanged else { return }
         spatialUpscaler.reset(); nisUpscaler.reset(); clientProcessor.resetScaling()
         upscalingMethod = method
         metal4UpscalingStatus = nil
@@ -6655,9 +6661,10 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
 
         let bounds = CGRect(origin: .zero, size: view.drawableSize)
         let destination = stretchToFill ? bounds : Self.aspectFitRect(source: frameSize, target: bounds.size)
+        let scalingDestination = clientVideo.upscalingTarget.size(source: frameSize, screen: destination.size)
         let shouldUpscale = upscalingEnabled && drawStarted >= suspendUpscalingUntil
         let upscaleSize = shouldUpscale
-            ? upscalingMethod.outputSize(source: frameSize, destination: destination.size)
+            ? upscalingMethod.outputSize(source: frameSize, destination: scalingDestination)
             : nil
         let useFSR = shouldUpscale && upscalingMethod == .fsr1 && upscaleSize != nil
         let mappedHDR: CIImage?
@@ -6763,7 +6770,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                let presentationFrame,
                !specialProcessing,
                effects.submit(buffer: pixelBuffer, destination: destination, upscale: shouldUpscale,
-                    target: presentationFrame.texture, sharpening:Float(sharpeningAmount), method: upscalingMethod, ticket: ticket,
+                    target: presentationFrame.texture, sharpening:Float(sharpeningAmount), method: upscalingMethod, scalingDestination: scalingDestination, ticket: ticket,
                     waitForPrevious: NativeStreamSubmissionQueue.metal4Effects.requiresWait(from: lastSubmissionQueue),
                     completion: completeMetal4) {
                 if let ticket { submissionTimeline?.accept(ticket) }
@@ -6783,7 +6790,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
             }
 
             var sourceImage = mappedHDR ?? CIImage(cvPixelBuffer: pixelBuffer)
-            if useFSR, let scaled = clientProcessor.upscaleFSR(image:sourceImage,destination:destination.size,
+            if useFSR, let scaled = clientProcessor.upscaleFSR(image:sourceImage,destination:scalingDestination,
                     hdr:hdrTransfer != .sdr,sharpness:Float(sharpeningAmount),context:ciContext,command:commandBuffer) {
                 sourceImage = scaled
             }
@@ -6814,7 +6821,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                     transfer: hdrTransfer == .pq ? 1 : hdrTransfer == .hlg ? 2 : 0,
                     upscale: shouldUpscale && !useFSR, context: ciContext, producer: commandBuffer,
                     target: presentationFrame.texture, method: upscalingMethod,
-                    sharpening: upscalingMethod == .nis ? Float(sharpeningAmount) : 0, ticket: ticket,
+                    sharpening: upscalingMethod == .nis ? Float(sharpeningAmount) : 0, scalingDestination: scalingDestination, ticket: ticket,
                     waitForPrevious: NativeStreamSubmissionQueue.metal4Effects.requiresWait(from: lastSubmissionQueue),
                     completion: completeMetal4) {
                     if let ticket { submissionTimeline?.accept(ticket) }
@@ -6833,11 +6840,11 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
             let scaled: CIImage?
             if shouldUpscale && upscalingMethod == .nis {
                 scaled = nisUpscaler.encode(image: filteredImage, sourceSize: sourceExtent.size,
-                    destinationSize: destination.size, hdr: hdrTransfer != .sdr,
+                    destinationSize: scalingDestination, hdr: hdrTransfer != .sdr,
                     sharpness: Float(sharpeningAmount), context: ciContext, commandBuffer: commandBuffer)
             } else if shouldUpscale && !useFSR && upscalingMethod == .metalFX {
                 scaled = spatialUpscaler.encode(image: filteredImage, sourceSize: sourceExtent.size,
-                    destinationSize: destination.size, hdr: hdrTransfer != .sdr,
+                    destinationSize: scalingDestination, hdr: hdrTransfer != .sdr,
                     context: ciContext, commandBuffer: commandBuffer)
             } else { scaled = nil }
             scaledImage = scaled ?? filteredImage

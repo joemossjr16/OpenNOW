@@ -635,6 +635,11 @@ struct SettingsView: View {
                 .font(.footnote).foregroundStyle(.secondary)
             Toggle("Upscaling", isOn: $store.settings.metalFXUpscalingEnabled)
             if store.settings.metalFXUpscalingEnabled {
+                Picker("Upscaling Target", selection: $store.settings.clientVideo.upscalingTarget) {
+                    ForEach(StreamUpscalingTarget.allCases) { target in Text(target.label).tag(target) }
+                }
+                Text("Multipliers scale both stream dimensions, then fit the result to the screen. They do not change the incoming stream resolution.")
+                    .font(.footnote).foregroundStyle(.secondary)
                 Picker("Upscaling Method", selection: $store.settings.upscalingMethod) {
                     ForEach(StreamUpscalingMethod.allCases) { method in
                         Text(method.label).tag(method)
@@ -642,10 +647,10 @@ struct SettingsView: View {
                 }
             }
             if store.settings.metalFXUpscalingEnabled && store.settings.upscalingMethod != .metalFX {
-                Text("NIS and FSR1 scale your current stream to the fitted screen area, up to 2× in each dimension. Stream Sharpening controls its integrated sharpening. Resolution, HDR, codec and FPS stay unchanged.")
+                Text("NIS and FSR1 scale your current stream to the selected target, up to 2× in each dimension. Stream Sharpening controls its integrated sharpening. Resolution, HDR, codec and FPS stay unchanged.")
                     .font(.footnote).foregroundStyle(.secondary)
             }
-            if store.settings.metalFXUpscalingEnabled && store.settings.upscalingMethod == .metalFX {
+            if store.settings.metalFXUpscalingEnabled && store.settings.upscalingMethod == .metalFX && store.settings.clientVideo.upscalingTarget == .screen {
                 Picker("MetalFX Quality", selection: metalFXQualityBinding) {
                     ForEach(MetalFXQualityPreset.allCases) { preset in
                         Text(metalFXPresetLabel(preset)).tag(preset)
@@ -655,7 +660,7 @@ struct SettingsView: View {
                 Text(metalFXResolutionSummary)
                     .font(.footnote).foregroundStyle(.secondary)
             }
-            if store.settings.upscalingMethod == .metalFX {
+            if store.settings.upscalingMethod == .metalFX && store.settings.clientVideo.upscalingTarget == .screen {
                 Text("Quality preserves more detail; Balanced and Performance request smaller streams to reduce decode work. Presets select the nearest eligible resolution available on your plan. Resolution changes apply to a fresh session. Manual keeps your selected resolution. HDR, codec and FPS stay unchanged.")
                     .font(.footnote).foregroundStyle(.secondary)
             }
@@ -1731,7 +1736,7 @@ struct SettingsView: View {
     }
 
     private func applyMetalFXQualityPreset() {
-        guard store.settings.upscalingMethod == .metalFX else { return }
+        guard store.settings.upscalingMethod == .metalFX, store.settings.clientVideo.upscalingTarget == .screen else { return }
         guard store.settings.metalFXUpscalingEnabled,
               store.settings.metalFXQualityPreset != .manual else { return }
         guard let choice = metalFXChoice(store.settings.metalFXQualityPreset) else {
