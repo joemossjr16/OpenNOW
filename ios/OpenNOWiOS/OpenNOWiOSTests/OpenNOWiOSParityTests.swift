@@ -101,7 +101,8 @@ final class OpenNOWiOSParityTests: XCTestCase {
 
     func testInterpolationGatesAndBalancedCadence() {
         XCTAssertNil(NativeStreamClientVideoPolicy.interpolationReason(size:CGSize(width:1920,height:1080),sourceFPS:60,displayFPS:120))
-        XCTAssertNotNil(NativeStreamClientVideoPolicy.interpolationReason(size:CGSize(width:2560,height:1080),sourceFPS:60,displayFPS:120))
+        XCTAssertNil(NativeStreamClientVideoPolicy.interpolationReason(size:CGSize(width:2560,height:1080),sourceFPS:60,displayFPS:120))
+        XCTAssertNil(NativeStreamClientVideoPolicy.interpolationReason(size:CGSize(width:3840,height:2160),sourceFPS:60,displayFPS:120))
         XCTAssertNotNil(NativeStreamClientVideoPolicy.interpolationReason(size:CGSize(width:1920,height:1080),sourceFPS:100,displayFPS:120))
         XCTAssertNotNil(NativeStreamClientVideoPolicy.interpolationReason(size:.zero,sourceFPS:60,displayFPS:120))
         XCTAssertNotNil(NativeStreamClientVideoPolicy.interpolationReason(size:CGSize(width:1920,height:1080),sourceFPS:60,displayFPS:60))

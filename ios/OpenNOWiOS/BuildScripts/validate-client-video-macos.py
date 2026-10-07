@@ -132,6 +132,17 @@ enum NativeStreamHDRTransfer {
   for _ in 0..<3 { processor.observeGPU(duration:0.02,failed:false,budget:1/120) }
   precondition(processor.interpolationSuspended && !processor.interpolationReady)
   processor.resetHistory(retry:true);precondition(!processor.interpolationSuspended && !processor.interpolationReady)
+  // Above-1080p history allocation and interpolation must remain eligible.
+  for index in 0..<2 {
+   let image=CIImage(color:CIColor(red:0.2,green:0.3,blue:0.6)).cropped(to:CGRect(x:0,y:0,width:2560,height:1080))
+   let command=queue.makeCommandBuffer()!
+   let result=processor.interpolate(image:image,newReal:true,phase:0.5,hdr:false,context:context,command:command)
+   precondition(result != nil && result!.extent.size == CGSize(width:2560,height:1080))
+   command.commit();await command.completed();precondition(command.status == .completed)
+  }
+  precondition(processor.interpolationReady)
+  processor.resetHistory(retry:true)
+  print("PASS above-1080p interpolation history and GPU dispatch")
   if #available(macOS 26.0,*) {
    let image=CIImage(color:CIColor(red:4,green:2,blue:1,alpha:1,colorSpace:CGColorSpace(name:CGColorSpace.extendedLinearSRGB)!)!).cropped(to:CGRect(x:0,y:0,width:16,height:16)).settingContentHeadroom(4)
    let mapped=NativeStreamClientVideoProcessor.toneMap(image:image,headroom:2)!

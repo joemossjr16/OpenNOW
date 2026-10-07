@@ -636,7 +636,7 @@ struct SettingsView: View {
             Text("Balanced buffers up to two frames to smooth arrival jitter. Lowest latency always selects the newest frame.")
                 .font(.footnote).foregroundStyle(.secondary)
             Toggle("Client Frame Interpolation", isOn: $store.settings.clientVideo.interpolation)
-            Text("Experimental. Generates one intermediate frame for streams up to 60 FPS and 1080p. Requires a display running at least 1.5× the stream FPS. Can add artifacts and delay; pauses if GPU time exceeds the display budget.")
+            Text("Experimental. Generates one intermediate frame for streams up to 60 FPS. Requires a display running at least 1.5× the stream FPS. Can add artifacts and delay; pauses if GPU time exceeds the display budget.")
                 .font(.footnote).foregroundStyle(.secondary)
             Toggle("Adaptive HDR", isOn: $store.settings.clientVideo.adaptiveHDR)
             Text("Tone maps HDR to the screen's current brightness headroom when the source supplies headroom metadata.")

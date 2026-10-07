@@ -12,9 +12,9 @@ Settings → Stream and HUD → Picture expose:
 - **Frame pacing:** Lowest latency (latest frame) or Balanced (two pending frames,
   nominal-frame cadence). Interpolation uses lowest-latency selection.
 - **Client interpolation:** Experimental, at most one intermediate frame per real
-  frame. Streams must be at most 60 FPS and 2,073,600 pixels; display callbacks must
+  frame. Streams must be at most 60 FPS; display callbacks must
   run at least 1.5× the configured stream FPS. A 60 FPS stream on a 120 Hz display
-  is the intended first device test. 2560×1080 and 100 FPS deliberately remain
+  is the intended first device test. There is no resolution cap; streams above 60 FPS remain
   real-frame playback. This feature does not change the negotiated stream profile
   or claim VRR. It adds temporal delay and can introduce motion artifacts.
 - **Adaptive HDR:** Core Image's `CIToneMapHeadroom` with the active screen's

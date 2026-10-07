@@ -19,8 +19,8 @@ enum NativeStreamClientVideoPolicy {
   static func interpolationReason(size: CGSize, sourceFPS: Int, displayFPS: Double) -> String? {
     guard sourceFPS > 0, sourceFPS <= 60 else { return "Requires a stream at 60 FPS or below" }
     guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0,
-      size.width * size.height <= 1920 * 1080
-    else { return "Requires 1080p or fewer pixels" }
+      size.width < CGFloat(Int.max - 7), size.height < CGFloat(Int.max - 7)
+    else { return "Waiting for valid frame dimensions" }
     guard displayFPS.isFinite, displayFPS >= Double(sourceFPS) * 1.5 else {
       return "Display needs at least 1.5× stream FPS"
     }
@@ -155,7 +155,7 @@ final class NativeStreamClientVideoProcessor {
     guard let pipelines, !interpolationSuspended else { return nil }
     let size = image.extent.size
     guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0,
-      size.width * size.height <= 1920 * 1080
+      size.width < CGFloat(Int.max - 7), size.height < CGFloat(Int.max - 7)
     else { return nil }
     let width = Int(size.width)
     let height = Int(size.height)
