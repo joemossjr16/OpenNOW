@@ -943,6 +943,7 @@ struct AppSettings: Codable, Equatable {
     var enableL4S: Bool
     var metal4Enabled: Bool = false
     var metalFXUpscalingEnabled: Bool = false
+    var upscalingMethod: StreamUpscalingMethod = .metalFX
     var metalFXQualityPreset: MetalFXQualityPreset = .manual
     var streamSharpeningEnabled: Bool = false
     var streamSharpeningAmount: Double = 0.25
@@ -1056,6 +1057,7 @@ struct AppSettings: Codable, Equatable {
         case enableL4S
         case metal4Enabled
         case metalFXUpscalingEnabled
+        case upscalingMethod
         case metalFXQualityPreset
         case streamSharpeningEnabled
         case streamSharpeningAmount
@@ -1179,6 +1181,7 @@ struct AppSettings: Codable, Equatable {
         enableL4S = try container.decodeIfPresent(Bool.self, forKey: .enableL4S) ?? false
         metal4Enabled = try container.decodeIfPresent(Bool.self, forKey: .metal4Enabled) ?? false
         metalFXUpscalingEnabled = try container.decodeIfPresent(Bool.self, forKey: .metalFXUpscalingEnabled) ?? false
+        upscalingMethod = try container.decodeIfPresent(StreamUpscalingMethod.self, forKey: .upscalingMethod) ?? .metalFX
         metalFXQualityPreset = try container.decodeIfPresent(MetalFXQualityPreset.self, forKey: .metalFXQualityPreset) ?? .manual
         streamSharpeningEnabled = try container.decodeIfPresent(Bool.self, forKey: .streamSharpeningEnabled) ?? false
         streamSharpeningAmount = try container.decodeIfPresent(Double.self, forKey: .streamSharpeningAmount) ?? 0.25
@@ -1288,6 +1291,7 @@ struct AppSettings: Codable, Equatable {
         controllerShortcuts = updated.controllerShortcuts
         metal4Enabled = updated.metal4Enabled
         metalFXUpscalingEnabled = updated.metalFXUpscalingEnabled
+        upscalingMethod = updated.upscalingMethod
         hideStreamButtons = updated.hideStreamButtons
         touch = updated.touch
         mouseSensitivity = updated.mouseSensitivity

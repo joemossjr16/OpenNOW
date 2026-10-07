@@ -36,6 +36,7 @@ final class PresentationCount: @unchecked Sendable {
   setbuf(stdout,nil)
   let app = NSApplication.shared
   app.setActivationPolicy(.accessory)
+  app.finishLaunching()
   let device = MTLCreateSystemDefaultDevice()!, queue = device.makeCommandQueue()!
   let renderer = NativeStreamMetal4HDRRenderer(device:device)!
   let compatible = NativeStreamHDRMetalRenderer(device:device)!
@@ -46,7 +47,7 @@ final class PresentationCount: @unchecked Sendable {
   view.isPaused = true; view.enableSetNeedsDisplay = false; view.framebufferOnly = false
   view.colorPixelFormat = .bgr10a2Unorm
   let delegate = DrawDelegate(); view.delegate = delegate
-  window.contentView = view; window.orderFront(nil)
+  window.contentView = view; window.orderFrontRegardless()
   let layer = view.layer as! CAMetalLayer
   layer.maximumDrawableCount = 3
   layer.colorspace = CGColorSpace(name:CGColorSpace.itur_2100_PQ)

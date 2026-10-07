@@ -3,7 +3,7 @@
 from pathlib import Path
 import os,subprocess,tempfile
 root=Path(__file__).resolve().parents[3]
-source="\n".join((root/"ios/OpenNOWiOS/OpenNOWiOS"/name).read_text() for name in ["NativeStreamVideoEffects.swift","NativeStreamHDRMetal.swift","NativeStreamMetal4Effects.swift","NativeStreamMetal4Presentation.swift"])
+source="\n".join((root/"ios/OpenNOWiOS/OpenNOWiOS"/name).read_text() for name in ["NativeStreamVideoEffects.swift","NativeStreamNIS.swift","NativeStreamHDRMetal.swift","NativeStreamMetal4Effects.swift","NativeStreamMetal4Presentation.swift"])
 CHECK = r"""
 import QuartzCore
 @main struct EffectsCheck {

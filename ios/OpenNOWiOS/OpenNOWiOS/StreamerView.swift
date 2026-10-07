@@ -1839,10 +1839,19 @@ private struct NativeStreamControlsPanel: View {
                     value: coordinator.liveSettings.metal4Enabled ? "On" : "Off",
                     isOn: Binding(get: { coordinator.liveSettings.metal4Enabled },
                         set: { value in coordinator.updateLiveSettings { $0.metal4Enabled = value } }))
-                NativeStreamToggleRow(title: "MetalFX upscaling",
+                NativeStreamToggleRow(title: "Upscaling",
                     value: coordinator.liveSettings.metalFXUpscalingEnabled ? "On" : "Off",
                     isOn: Binding(get: { coordinator.liveSettings.metalFXUpscalingEnabled },
                         set: { value in coordinator.updateLiveSettings { $0.metalFXUpscalingEnabled = value } }))
+                if coordinator.liveSettings.metalFXUpscalingEnabled {
+                    Picker("Upscaling method", selection: Binding(
+                        get: { coordinator.liveSettings.upscalingMethod },
+                        set: { value in coordinator.updateLiveSettings { $0.upscalingMethod = value } })) {
+                        ForEach(StreamUpscalingMethod.allCases) { method in
+                            Text(method.label).tag(method)
+                        }
+                    }
+                }
                 if let rates = coordinator.statsSnapshot.presentationRates {
                     Text(rates.label).font(.footnote.monospacedDigit()).foregroundStyle(.secondary)
                 }
@@ -3454,7 +3463,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         guard next != liveSettings else { return }
         liveSettings = next
         statsMetrics = next.streamStatsMetrics
-        renderer?.setVideoEffects(upscaling: next.metalFXUpscalingEnabled, metal4: next.metal4Enabled)
+        renderer?.setVideoEffects(upscaling: next.metalFXUpscalingEnabled, metal4: next.metal4Enabled, method: next.upscalingMethod)
         inputBridge.configureUserPreferences(
             mouseSensitivity: next.mouseSensitivity,
             mouseAcceleration: next.mouseAcceleration,
@@ -3855,7 +3864,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         renderer.setStretchStreamToFill(streamerPreferences.stretchStreamToFill)
         renderer.setStreamSharpening(enabled: streamSharpeningEnabled, amount: streamSharpeningAmount)
         renderer.setViewportTransform(scale: streamZoomScale, offset: streamZoomOffset)
-        renderer.setVideoEffects(upscaling: liveSettings.metalFXUpscalingEnabled, metal4: liveSettings.metal4Enabled)
+        renderer.setVideoEffects(upscaling: liveSettings.metalFXUpscalingEnabled, metal4: liveSettings.metal4Enabled, method: liveSettings.upscalingMethod)
         attachCurrentVideoSinkIfNeeded()
     }
 
@@ -6141,6 +6150,7 @@ private final class NativeStreamRenderView: UIView {
     private var streamSharpeningAmount = 0.25
     private var metal4Enabled = false
     private var upscalingEnabled = false
+    private var upscalingMethod: StreamUpscalingMethod = .metalFX
     var videoEffectsStatus: String { filteredMetalView?.videoEffectsStatus ?? "" }
     var presentationRates: NativeStreamPresentationRates? {
         filteredRendererActive ? filteredMetalView?.presentationRates : nil
@@ -6154,11 +6164,12 @@ private final class NativeStreamRenderView: UIView {
         updateRendererVisibility()
     }
 
-    func setVideoEffects(upscaling: Bool, metal4: Bool) {
+    func setVideoEffects(upscaling: Bool, metal4: Bool, method: StreamUpscalingMethod = .metalFX) {
         metal4Enabled = metal4
         upscalingEnabled = upscaling
+        upscalingMethod = method
         if upscaling { ensureFilteredMetalView() }
-        filteredMetalView?.setVideoEffects(upscaling: upscaling, metal4: metal4)
+        filteredMetalView?.setVideoEffects(upscaling: upscaling, metal4: metal4, method: method)
         updateRendererVisibility()
     }
     private var viewportTransformScale: CGFloat = 1
@@ -6310,7 +6321,7 @@ private final class NativeStreamRenderView: UIView {
         filtered.frame = videoContainerView.bounds
         filtered.stretchToFill = stretchStreamToFill
         filtered.sharpeningAmount = streamSharpeningEnabled ? streamSharpeningAmount : 0
-        filtered.setVideoEffects(upscaling: upscalingEnabled, metal4: metal4Enabled)
+        filtered.setVideoEffects(upscaling: upscalingEnabled, metal4: metal4Enabled, method: upscalingMethod)
         filtered.isHidden = true
         videoContainerView.addSubview(filtered)
         rendererStateLock.lock()
@@ -6469,8 +6480,10 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     private var rendererBackend = "Metal / Core Image"
     private var metal4UpscalingStatus: String?
     private let spatialUpscaler: NativeStreamSpatialUpscaler
+    private let nisUpscaler: NativeStreamNISUpscaler
     private var metal4Enabled = false
     private var upscalingEnabled = false
+    private var upscalingMethod: StreamUpscalingMethod = .metalFX
     private var suspendUpscalingUntil: CFTimeInterval = 0
     private var effectsGeneration: UInt64 = 0
     private var lastSubmissionQueue: NativeStreamSubmissionQueue?
@@ -6481,17 +6494,20 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     var videoEffectsStatus: String {
         var parts: [String] = ["Renderer: " + rendererBackend]
         if upscalingEnabled {
-            parts.append("MetalFX: " + (CACurrentMediaTime() < suspendUpscalingUntil
-                ? "Paused: processing error" : (metal4UpscalingStatus ?? spatialUpscaler.status)))
+            parts.append(upscalingMethod.shortLabel + ": " + (CACurrentMediaTime() < suspendUpscalingUntil
+                ? "Paused: processing error" : (metal4UpscalingStatus ?? (upscalingMethod == .nis ? nisUpscaler.status : spatialUpscaler.status))))
         }
         return parts.joined(separator: " · ")
     }
 
-    func setVideoEffects(upscaling: Bool, metal4: Bool) {
+    func setVideoEffects(upscaling: Bool, metal4: Bool, method: StreamUpscalingMethod = .metalFX) {
         metal4Enabled = metal4
         if metal4 { prepareMetal4IfNeeded() }
-        guard upscalingEnabled != upscaling else { return }
-        if !upscaling { spatialUpscaler.reset() }
+        guard upscalingEnabled != upscaling || upscalingMethod != method else { return }
+        spatialUpscaler.reset(); nisUpscaler.reset()
+        upscalingMethod = method
+        metal4UpscalingStatus = nil
+        suspendUpscalingUntil = 0
         upscalingEnabled = upscaling
         effectsGeneration &+= 1
     }
@@ -6530,6 +6546,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
             submissionTimeline = NativeStreamMetalFrameTimeline(device:device)
         } else { submissionTimeline = nil }
         spatialUpscaler = NativeStreamSpatialUpscaler(device: device)
+        nisUpscaler = NativeStreamNISUpscaler(device: device)
         ciContext = CIContext(mtlDevice: device, options: [.cacheIntermediates: false])
         mtkView = MTKView(frame: .zero, device: device)
         if let layer = mtkView.layer as? CAMetalLayer {
@@ -6625,7 +6642,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         let destination = stretchToFill ? bounds : Self.aspectFitRect(source: frameSize, target: bounds.size)
         let shouldUpscale = upscalingEnabled && drawStarted >= suspendUpscalingUntil
         let upscaleSize = shouldUpscale
-            ? NativeStreamVideoEffectsPolicy.upscaleSize(source: frameSize, destination: destination.size)
+            ? upscalingMethod.outputSize(source: frameSize, destination: destination.size)
             : nil
         let ticket = submissionTimeline?.next()
         let presentationTracker = presentations
@@ -6718,7 +6735,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                let effects = metal4EffectsStorage as? NativeStreamMetal4EffectsRenderer,
                let presentationFrame,
                effects.submit(buffer: pixelBuffer, destination: destination, upscale: shouldUpscale,
-                    target: presentationFrame.texture, sharpening:Float(sharpeningAmount), ticket: ticket,
+                    target: presentationFrame.texture, sharpening:Float(sharpeningAmount), method: upscalingMethod, ticket: ticket,
                     waitForPrevious: NativeStreamSubmissionQueue.metal4Effects.requiresWait(from: lastSubmissionQueue),
                     completion: completeMetal4) {
                 if let ticket { submissionTimeline?.accept(ticket) }
@@ -6741,7 +6758,8 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
             let sourceExtent = sourceImage.extent
             let filteredImage: CIImage = {
                 let normalizedAmount = min(max(sharpeningAmount, 0), 1)
-                guard normalizedAmount > 0.001,
+                guard !(shouldUpscale && upscalingMethod == .nis && upscaleSize != nil),
+                      normalizedAmount > 0.001,
                       let filter = sharpeningFilter else {
                     return sourceImage
                 }
@@ -6763,7 +6781,8 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                 if effects.submit(image: filteredImage, destination: destination,
                     transfer: hdrTransfer == .pq ? 1 : hdrTransfer == .hlg ? 2 : 0,
                     upscale: shouldUpscale, context: ciContext, producer: commandBuffer,
-                    target: presentationFrame.texture, ticket: ticket,
+                    target: presentationFrame.texture, method: upscalingMethod,
+                    sharpening: upscalingMethod == .nis ? Float(sharpeningAmount) : 0, ticket: ticket,
                     waitForPrevious: NativeStreamSubmissionQueue.metal4Effects.requiresWait(from: lastSubmissionQueue),
                     completion: completeMetal4) {
                     if let ticket { submissionTimeline?.accept(ticket) }
@@ -6779,11 +6798,17 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
             #endif
             metal4UpscalingStatus = nil
             let scaledImage: CIImage
-            if shouldUpscale, let scaled = spatialUpscaler.encode(image: filteredImage,
-                sourceSize: sourceExtent.size, destinationSize: destination.size, hdr: hdrTransfer != .sdr,
-                context: ciContext, commandBuffer: commandBuffer) {
-                scaledImage = scaled
-            } else { scaledImage = filteredImage }
+            let scaled: CIImage?
+            if shouldUpscale && upscalingMethod == .nis {
+                scaled = nisUpscaler.encode(image: filteredImage, sourceSize: sourceExtent.size,
+                    destinationSize: destination.size, hdr: hdrTransfer != .sdr,
+                    sharpness: Float(sharpeningAmount), context: ciContext, commandBuffer: commandBuffer)
+            } else if shouldUpscale {
+                scaled = spatialUpscaler.encode(image: filteredImage, sourceSize: sourceExtent.size,
+                    destinationSize: destination.size, hdr: hdrTransfer != .sdr,
+                    context: ciContext, commandBuffer: commandBuffer)
+            } else { scaled = nil }
+            scaledImage = scaled ?? filteredImage
             let scaleX = destination.width / max(scaledImage.extent.width, 1)
             let scaleY = destination.height / max(scaledImage.extent.height, 1)
             let transform = CGAffineTransform(translationX: destination.minX, y: destination.minY)

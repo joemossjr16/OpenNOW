@@ -82,6 +82,34 @@ private actor LiveResolutionTestTransport: NativeStreamNVSTTransport {
 }
 
 final class OpenNOWiOSParityTests: XCTestCase {
+    func testNISSelectionPreservesExistingSettingsAndLiveControls() throws {
+        var settings = AppSettings.default
+        settings.upscalingMethod = .nis
+        settings.preferredAspectRatio = "21:9"
+        settings.preferredResolution = "2560x1080"
+        let restored = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings))
+        XCTAssertEqual(restored.upscalingMethod, .nis)
+        XCTAssertEqual(restored.preferredResolution, settings.preferredResolution)
+        var previous = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(settings)) as? [String: Any])
+        previous.removeValue(forKey: "upscalingMethod")
+        XCTAssertEqual(try JSONDecoder().decode(AppSettings.self, from: JSONSerialization.data(withJSONObject: previous)).upscalingMethod, .metalFX)
+        var allocation = AppSettings.default
+        let resolution = allocation.preferredResolution
+        allocation.applyStreamerControls(from: settings)
+        XCTAssertEqual(allocation.upscalingMethod, .nis)
+        XCTAssertEqual(allocation.preferredResolution, resolution)
+    }
+
+    func testNISEligibilityIncludesNearNativeAndRejectsUnsupportedGeometry() {
+        let source = CGSize(width: 2560, height: 1080)
+        XCTAssertEqual(StreamUpscalingMethod.nis.outputSize(source: source, destination: CGSize(width: 2868, height: 1210)), CGSize(width: 2868, height: 1210))
+        XCTAssertNil(StreamUpscalingMethod.nis.outputSize(source: source, destination: source))
+        XCTAssertNil(StreamUpscalingMethod.nis.outputSize(source: source, destination: CGSize(width: 1920, height: 1080)))
+        XCTAssertNil(StreamUpscalingMethod.nis.outputSize(source: source, destination: CGSize(width: 6000, height: 2400)))
+        XCTAssertNil(StreamUpscalingMethod.nis.outputSize(source: source, destination: CGSize(width: CGFloat.infinity, height: 1320)))
+        XCTAssertNil(StreamUpscalingMethod.nis.outputSize(source: .zero, destination: source))
+    }
+
     func testLiveResolutionPickerUsesDeliveredAspectAndPlan() {
         let choices = StreamSettingsResolver.liveResolutionChoices(deliveredResolution: "1600x1200", membershipTier: "ULTIMATE")
         XCTAssertEqual(choices.map(\.value), ["1024x768", "1112x834", "1600x1200"])

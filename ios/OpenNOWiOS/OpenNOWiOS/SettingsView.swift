@@ -630,8 +630,19 @@ struct SettingsView: View {
             Text("Opt in to Metal 4 on supported devices running iOS 26 or later. Off uses compatible Metal rendering; HDR and MetalFX remain available.")
                 .font(.footnote).foregroundStyle(.secondary)
 
-            Toggle("MetalFX Upscaling", isOn: $store.settings.metalFXUpscalingEnabled)
+            Toggle("Upscaling", isOn: $store.settings.metalFXUpscalingEnabled)
             if store.settings.metalFXUpscalingEnabled {
+                Picker("Upscaling Method", selection: $store.settings.upscalingMethod) {
+                    ForEach(StreamUpscalingMethod.allCases) { method in
+                        Text(method.label).tag(method)
+                    }
+                }
+            }
+            if store.settings.metalFXUpscalingEnabled && store.settings.upscalingMethod == .nis {
+                Text("NIS scales your current stream to the fitted screen area, up to 2× in each dimension. Stream Sharpening controls its integrated sharpening. Resolution, HDR, codec and FPS stay unchanged.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            if store.settings.metalFXUpscalingEnabled && store.settings.upscalingMethod == .metalFX {
                 Picker("MetalFX Quality", selection: metalFXQualityBinding) {
                     ForEach(MetalFXQualityPreset.allCases) { preset in
                         Text(metalFXPresetLabel(preset)).tag(preset)
@@ -641,8 +652,10 @@ struct SettingsView: View {
                 Text(metalFXResolutionSummary)
                     .font(.footnote).foregroundStyle(.secondary)
             }
-            Text("Quality preserves more detail; Balanced and Performance request smaller streams to reduce decode work. Presets select the nearest eligible resolution available on your plan. Resolution changes apply to a fresh session. Manual keeps your selected resolution. HDR, codec and FPS stay unchanged.")
-                .font(.footnote).foregroundStyle(.secondary)
+            if store.settings.upscalingMethod == .metalFX {
+                Text("Quality preserves more detail; Balanced and Performance request smaller streams to reduce decode work. Presets select the nearest eligible resolution available on your plan. Resolution changes apply to a fresh session. Manual keeps your selected resolution. HDR, codec and FPS stay unchanged.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
             Toggle("Stream Sharpening", isOn: $store.settings.streamSharpeningEnabled)
 
             if store.settings.streamSharpeningEnabled {
@@ -1715,6 +1728,7 @@ struct SettingsView: View {
     }
 
     private func applyMetalFXQualityPreset() {
+        guard store.settings.upscalingMethod == .metalFX else { return }
         guard store.settings.metalFXUpscalingEnabled,
               store.settings.metalFXQualityPreset != .manual else { return }
         guard let choice = metalFXChoice(store.settings.metalFXQualityPreset) else {

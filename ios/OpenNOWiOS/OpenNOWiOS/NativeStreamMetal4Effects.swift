@@ -16,6 +16,7 @@ final class NativeStreamMetal4EffectsRenderer {
         let width, height, outputWidth, outputHeight: Int
         let transfer: Int
         let upscale, sharpen: Bool
+        let method: StreamUpscalingMethod
     }
     private struct Slot {
         let allocator: any MTL4CommandAllocator
@@ -27,19 +28,21 @@ final class NativeStreamMetal4EffectsRenderer {
         let input, output: any MTLTexture
         let sharpened: (any MTLTexture)?
         let scaler: (any MTL4FXSpatialScaler)?
+        let nisConfig: (any MTLBuffer)?
     }
     private final class Resources {
         let slots: [Slot]
+        let nis: NativeStreamNISKernel?
         private let lock = NSLock()
         private var available = NativeStreamMetal4FrameSlotPolicy.indices
-        init(slots: [Slot]) { self.slots = slots }
+        init(slots: [Slot], nis: NativeStreamNISKernel?) { self.slots = slots; self.nis = nis }
         func take() -> Int? { lock.lock(); defer { lock.unlock() }; return available.popLast() }
         func release(_ index: Int) { lock.lock(); available.append(index); lock.unlock() }
     }
     private let device: any MTLDevice
     private let queue: any MTL4CommandQueue
     private let compiler: any MTL4Compiler
-    private let sdrPipeline, hdrPipeline, conversionPipeline: any MTLRenderPipelineState
+    private let sdrPipeline, hdrPipeline, conversionPipeline, nisConversionPipeline: any MTLRenderPipelineState
     private let sharpeningPipeline: any MTLComputePipelineState
     // A static ColorSync transform preserves Apple's HLG display interpretation.
     // Build once off the display thread; no per-frame Core Image producer is needed.
@@ -49,6 +52,8 @@ final class NativeStreamMetal4EffectsRenderer {
     private let producerEvent: any MTLSharedEvent
     private var producerValue: UInt64 = 0
     private let setupQueue = DispatchQueue(label: "OpenNOW.Metal4FX.setup", qos: .userInitiated)
+    // Only setupQueue accesses the geometry-independent NIS pipelines.
+    private var nisKernel: NativeStreamNISKernel?
     private var resources: [Key: Resources] = [:]
     private var preparing: Set<Key> = []
     private var rejected: Set<Key> = []
@@ -77,6 +82,7 @@ final class NativeStreamMetal4EffectsRenderer {
             }
             sdrPipeline = try pipeline(.bgra8Unorm); hdrPipeline = try pipeline(.bgr10a2Unorm)
             conversionPipeline = try pipeline(.rgba16Float, fragmentName: "nativeLinearFragment")
+            nisConversionPipeline = try pipeline(.rgba16Float, fragmentName: "nativeNISFragment")
             let compute = MTL4ComputePipelineDescriptor()
             let function = MTL4LibraryFunctionDescriptor(); function.library = library; function.name = "sharpenLinear"
             compute.computeFunctionDescriptor = function
@@ -88,28 +94,29 @@ final class NativeStreamMetal4EffectsRenderer {
     /// Called on the display thread. False leaves the producer uncommitted for legacy fallback.
     func submit(image: CIImage, destination: CGRect, transfer: Int, upscale: Bool,
                 context: CIContext, producer: any MTLCommandBuffer, target: any MTLTexture,
+                method: StreamUpscalingMethod = .metalFX, sharpening: Float = 0,
                 ticket: NativeStreamMetalFrameTimeline.Ticket? = nil,
                 waitForPrevious: Bool = true, completion: @escaping @Sendable (Double, NSError?) -> Void) -> Bool {
         submit(image: image, native: nil, destination: destination, transfer: transfer, upscale: upscale,
-               context: context, producer: producer, sharpening: 0, target: target, ticket: ticket,
+               context: context, producer: producer, sharpening: sharpening, method: method, target: target, ticket: ticket,
                waitForPrevious: waitForPrevious, completion: completion)
     }
     /// Zero-copy native SDR/PQ/HLG or a tagged linear RGB surface.
     /// Unknown color metadata/warm-up retains the compatible CI fallback.
     func submit(buffer: CVPixelBuffer, destination: CGRect, upscale: Bool, target: any MTLTexture,
-                sharpening: Float = 0, producer: (any MTLCommandBuffer)? = nil,
+                sharpening: Float = 0, method: StreamUpscalingMethod = .metalFX, producer: (any MTLCommandBuffer)? = nil,
                 ticket: NativeStreamMetalFrameTimeline.Ticket? = nil,
                 waitForPrevious: Bool = true, completion: @escaping @Sendable (Double, NSError?) -> Void) -> Bool {
         guard let input = NativeStreamMetalVideoInput.Input(buffer: buffer, cache: textureCache, target: target) else { return false }
         return submit(image: nil, native: input, destination: destination,
                       transfer: input.color.presentationTransfer, upscale: upscale,
-                      context: nil, producer: producer, sharpening: sharpening,
+                      context: nil, producer: producer, sharpening: sharpening, method: method,
                       target: target, ticket: ticket,
                       waitForPrevious: waitForPrevious, completion: completion)
     }
     private func submit(image: CIImage?, native: NativeStreamMetalVideoInput.Input?,
                 destination: CGRect, transfer: Int, upscale: Bool,
-                context: CIContext?, producer: (any MTLCommandBuffer)?, sharpening: Float, target: any MTLTexture,
+                context: CIContext?, producer: (any MTLCommandBuffer)?, sharpening: Float, method: StreamUpscalingMethod, target: any MTLTexture,
                 ticket: NativeStreamMetalFrameTimeline.Ticket?,
                 waitForPrevious: Bool, completion: @escaping @Sendable (Double, NSError?) -> Void) -> Bool {
         let size = native.map { CGSize(width: $0.y.width, height: $0.y.height) } ?? image?.extent.size ?? .zero
@@ -118,10 +125,12 @@ final class NativeStreamMetal4EffectsRenderer {
               destination.width.isFinite, destination.height.isFinite, destination.width > 0, destination.height > 0,
               transfer >= 0, transfer <= 2,
               target.pixelFormat == (transfer == 0 ? .bgra8Unorm : .bgr10a2Unorm) else { return false }
-        let outputSize = upscale ? NativeStreamVideoEffectsPolicy.upscaleSize(source: size, destination: destination.size) : nil
+        let outputSize = upscale ? method.outputSize(source: size, destination: destination.size) : nil
+        let useNIS = outputSize != nil && method == .nis
         let key = Key(width: Int(size.width.rounded()), height: Int(size.height.rounded()),
             outputWidth: Int((outputSize?.width ?? size.width).rounded()),
-            outputHeight: Int((outputSize?.height ?? size.height).rounded()), transfer: transfer, upscale: outputSize != nil, sharpen: sharpening.isFinite && sharpening > 0.001)
+            outputHeight: Int((outputSize?.height ?? size.height).rounded()), transfer: transfer, upscale: outputSize != nil, sharpen: !useNIS && sharpening.isFinite && sharpening > 0.001,
+            method: useNIS ? .nis : .metalFX)
         guard let resource = resources[key] else {
             prepare(key); status = rejected.contains(key) ? "Metal 4 unavailable for this resolution" : "Preparing Metal 4"
             return false
@@ -129,8 +138,9 @@ final class NativeStreamMetal4EffectsRenderer {
         guard let index = resource.take() else { return false }
         let slot = resource.slots[index]
         if let image, let context, let producer {
-            let space = NativeStreamVideoEffectsPolicy.workingColorSpace(hdr: transfer != 0)
-            let source = key.upscale ? NativeStreamVideoEffectsPolicy.spatialInput(image: image, hdr: transfer != 0) : image
+            let space = useNIS ? NativeStreamNISKernel.colorSpace(hdr: transfer != 0)
+                : NativeStreamVideoEffectsPolicy.workingColorSpace(hdr: transfer != 0)
+            let source = key.upscale && !useNIS ? NativeStreamVideoEffectsPolicy.spatialInput(image: image, hdr: transfer != 0) : image
             context.render(source.transformed(by: CGAffineTransform(translationX: -image.extent.minX, y: -image.extent.minY)),
                 to: slot.input, commandBuffer: producer,
                 bounds: CGRect(x: 0, y: 0, width: key.width, height: key.height), colorSpace: space)
@@ -140,8 +150,10 @@ final class NativeStreamMetal4EffectsRenderer {
         for texture in [slot.input, slot.output, target, hlgConversion, videoTransfer] { slot.residency.addAllocation(texture) }
         if let sharp = slot.sharpened { slot.residency.addAllocation(sharp) }
         if let native { slot.residency.addAllocation(native.y); slot.residency.addAllocation(native.uv) }
-        slot.residency.addAllocation(slot.uniforms); slot.residency.commit()
-        var uniforms = SIMD4<Float>(Float(transfer), sharpening.isFinite ? min(max(sharpening,0),1) : 0, 0, 0)
+        slot.residency.addAllocation(slot.uniforms)
+        if let config = slot.nisConfig { slot.residency.addAllocation(config) }
+        slot.residency.commit()
+        var uniforms = SIMD4<Float>(Float(transfer), sharpening.isFinite ? min(max(sharpening,0),1) : 0, useNIS ? 1 : 0, 0)
         withUnsafeBytes(of: &uniforms) { slot.uniforms.contents().copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
         slot.arguments.setAddress(slot.uniforms.gpuAddress, index: 0)
         slot.arguments.setTexture(slot.output.gpuResourceID, index: 0)
@@ -163,7 +175,7 @@ final class NativeStreamMetal4EffectsRenderer {
                 slot.command.endCommandBuffer(); resource.release(index); return false
             }
             NativeStreamMetalDecoderCoherency.prepareReads(on: encoder)
-            encoder.setRenderPipelineState(conversionPipeline)
+            encoder.setRenderPipelineState(useNIS ? nisConversionPipeline : conversionPipeline)
             encoder.setViewport(MTLViewport(originX: 0, originY: 0, width: Double(key.width), height: Double(key.height), znear: 0, zfar: 1))
             encoder.setArgumentTable(slot.conversionArguments, stages: .fragment)
             encoder.drawPrimitives(primitiveType: .triangleStrip, vertexStart: 0, vertexCount: 4)
@@ -194,6 +206,23 @@ final class NativeStreamMetal4EffectsRenderer {
             scaler.colorTexture = processingInput; scaler.outputTexture = slot.output
             scaler.inputContentWidth = key.width; scaler.inputContentHeight = key.height
             scaler.encode(commandBuffer: slot.command)
+        }
+        if let nis = resource.nis, let config = slot.nisConfig {
+            guard let encoder = slot.command.makeComputeCommandEncoder() else {
+                slot.command.endCommandBuffer(); resource.release(index); return false
+            }
+            NativeStreamNISConfig.write(to: config, width: key.width, height: key.height,
+                outputWidth: key.outputWidth, outputHeight: key.outputHeight, hdr: transfer != 0, sharpness: sharpening)
+            encoder.barrier(afterQueueStages: [.fragment, .tile], beforeStages: .dispatch, visibilityOptions: .device)
+            slot.sharpeningArguments.setAddress(config.gpuAddress, index: 0)
+            slot.sharpeningArguments.setTexture(slot.input.gpuResourceID, index: 0)
+            slot.sharpeningArguments.setTexture(slot.output.gpuResourceID, index: 1)
+            encoder.setComputePipelineState(transfer == 0 ? nis.sdr : nis.pq)
+            encoder.setArgumentTable(slot.sharpeningArguments)
+            encoder.dispatchThreadgroups(threadgroupsPerGrid: NativeStreamNISKernel.groups(width: key.outputWidth, height: key.outputHeight),
+                threadsPerThreadgroup: NativeStreamNISKernel.threads)
+            encoder.barrier(afterStages: .dispatch, beforeQueueStages: [.fragment, .tile], visibilityOptions: .device)
+            encoder.endEncoding()
         }
         let pass = MTL4RenderPassDescriptor()
         pass.colorAttachments[0].texture = target; pass.colorAttachments[0].loadAction = .clear
@@ -255,10 +284,15 @@ final class NativeStreamMetal4EffectsRenderer {
         let device = device, compiler = compiler
         setupQueue.async { [weak self] in
             var slots: [Slot] = []
+            var nis: NativeStreamNISKernel?
             do {
+                if key.method == .nis {
+                    nis = try self?.nisKernel ?? NativeStreamNISKernel(device: device, compiler: compiler)
+                    self?.nisKernel = nis
+                }
                 for _ in 0..<NativeStreamMetal4FrameSlotPolicy.inFlightCount {
                     var scaler: (any MTL4FXSpatialScaler)?
-                    if key.upscale {
+                    if key.upscale && key.method == .metalFX {
                         let descriptor = MTLFXSpatialScalerDescriptor()
                         descriptor.inputWidth = key.width; descriptor.inputHeight = key.height
                         descriptor.outputWidth = key.outputWidth; descriptor.outputHeight = key.outputHeight
@@ -281,14 +315,16 @@ final class NativeStreamMetal4EffectsRenderer {
                     let conversionTable = MTL4ArgumentTableDescriptor(); conversionTable.maxTextureBindCount = 4; conversionTable.maxBufferBindCount = 1
                     let sharp = key.sharpen ? (key.upscale ? texture(key.width,key.height,[]) : output) : nil
                     if key.sharpen && sharp == nil { throw NSError(domain: "OpenNOW.Metal4FX", code: 3) }
-                    let residency = MTLResidencySetDescriptor(); residency.initialCapacity = 8
+                    let nisConfig = key.method == .nis ? device.makeBuffer(length: 256, options: .storageModeShared) : nil
+                    if key.method == .nis && nisConfig == nil { throw NSError(domain: "OpenNOW.NIS", code: 2) }
+                    let residency = MTLResidencySetDescriptor(); residency.initialCapacity = 9
                     slots.append(Slot(allocator: allocator, command: command, arguments: try device.makeArgumentTable(descriptor: table),
                         conversionArguments: try device.makeArgumentTable(descriptor: conversionTable),
                         sharpeningArguments: try device.makeArgumentTable(descriptor: conversionTable),
-                        residency: try device.makeResidencySet(descriptor: residency), uniforms: uniforms, input: input, output: output, sharpened: sharp, scaler: scaler))
+                        residency: try device.makeResidencySet(descriptor: residency), uniforms: uniforms, input: input, output: output, sharpened: sharp, scaler: scaler, nisConfig: nisConfig))
                 }
             } catch { slots.removeAll() }
-            let result = NativeStreamMetal4FrameSlotPolicy.isComplete(slots.count) ? Resources(slots: slots) : nil
+            let result = NativeStreamMetal4FrameSlotPolicy.isComplete(slots.count) ? Resources(slots: slots, nis: nis) : nil
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.preparing.remove(key)
@@ -378,12 +414,12 @@ final class NativeStreamMetal4EffectsRenderer {
         return pow(max(p-3424.0f/4096.0f,0.0f) /
             max(2413.0f/128.0f-(2392.0f/128.0f)*p,1e-6f),float3(16384.0f/2610.0f))/0.0203f;
     }
-    fragment float4 nativeLinearFragment(V v [[stage_in]], texture2d<float> y [[texture(0)]],
-        texture2d<float> uv [[texture(1)]], texture3d<float> hlg [[texture(2)]], texture2d<float> video [[texture(3)]], constant Uniforms &u [[buffer(0)]]) {
+    float3 nativeLinearRGB(float2 coordinate, texture2d<float> y, texture2d<float> uv,
+        texture3d<float> hlg, texture2d<float> video, constant Uniforms &u) {
         constexpr sampler sample(filter::linear,address::clamp_to_edge);
-        uint2 pixel = uint2(clamp(v.uv*float2(y.get_width(),y.get_height()),float2(0),
+        uint2 pixel = uint2(clamp(coordinate*float2(y.get_width(),y.get_height()),float2(0),
                                  float2(y.get_width()-1,y.get_height()-1)));
-        float3 rgb = u.coefficients.w > 0 ? y.read(pixel).rgb : hdrEncodedRGB(y,uv,v.uv,u);
+        float3 rgb = u.coefficients.w > 0 ? y.read(pixel).rgb : hdrEncodedRGB(y,uv,coordinate,u);
         int transfer = int(u.green.z);
         if (transfer == 1) { rgb = pqToLinear(rgb); }
         else if (transfer == 2) {
@@ -407,7 +443,29 @@ final class NativeStreamMetal4EffectsRenderer {
                          dot(rgb,float3(-0.124550f,1.132900f,-0.008349f)),
                          dot(rgb,float3(-0.018151f,-0.100579f,1.118730f)));
         }
-        return float4(clamp(rgb,0.0f,transfer == 1 || transfer == 2 || (transfer == 4 && u.green.w > 0) ? 65504.0f : 1.0f),1);
+        return clamp(rgb,0.0f,transfer == 1 || transfer == 2 || (transfer == 4 && u.green.w > 0) ? 65504.0f : 1.0f);
+    }
+    float3 presentationEncodedRGB(float3 rgb, bool hdr) {
+        rgb = max(rgb, 0.0f);
+        if (hdr) {
+            // Core Image extended linear BT.2020 uses 203 nit reference white.
+            float3 y = pow(rgb * 0.0203f, float3(2610.0f/16384.0f));
+            return pow((3424.0f/4096.0f + (2413.0f/128.0f)*y)/(1.0f+(2392.0f/128.0f)*y),float3(2523.0f/32.0f));
+        }
+        return select(1.055f*pow(rgb,float3(1.0f/2.4f))-0.055f,12.92f*rgb,rgb<=0.0031308f);
+    }
+    fragment float4 nativeLinearFragment(V v [[stage_in]], texture2d<float> y [[texture(0)]],
+        texture2d<float> uv [[texture(1)]], texture3d<float> hlg [[texture(2)]], texture2d<float> video [[texture(3)]], constant Uniforms &u [[buffer(0)]]) {
+        return float4(nativeLinearRGB(v.uv, y, uv, hlg, video, u), 1);
+    }
+    fragment float4 nativeNISFragment(V v [[stage_in]], texture2d<float> y [[texture(0)]],
+        texture2d<float> uv [[texture(1)]], texture3d<float> hlg [[texture(2)]], texture2d<float> video [[texture(3)]], constant Uniforms &u [[buffer(0)]]) {
+        // PQ YCbCr is already display-referred: avoid a full-frame EOTF/OETF round trip.
+        if (u.green.z == 1 && u.coefficients.w == 0) {
+            return float4(clamp(hdrEncodedRGB(y, uv, v.uv, u), 0.0f, 1.0f), 1);
+        }
+        bool hdr = u.green.z == 1 || u.green.z == 2 || (u.green.z == 4 && u.green.w > 0);
+        return float4(clamp(presentationEncodedRGB(nativeLinearRGB(v.uv, y, uv, hlg, video, u), hdr), 0.0f, 1.0f), 1);
     }
     kernel void sharpenLinear(texture2d<float,access::read> input [[texture(0)]],
         texture2d<float,access::write> output [[texture(1)]],constant float4 &u [[buffer(0)]],
@@ -428,15 +486,8 @@ final class NativeStreamMetal4EffectsRenderer {
     fragment float4 effectsFragment(V v [[stage_in]], texture2d<float> image [[texture(0)]], constant float4 &u [[buffer(0)]]) {
         constexpr sampler s(filter::linear,address::clamp_to_edge);
         float3 rgb = max(image.sample(s,v.uv).rgb,0.0f);
-        if (u.x > 0) {
-            // Native conversion and CI fallback use linear BT.2020.
-            // Normalize both HDR transfers to PQ presentation.
-            // CI extended linear BT.2020 uses 203 nit reference white.
-            float3 y = pow(rgb * 0.0203f, float3(2610.0f/16384.0f));
-            rgb = pow((3424.0f/4096.0f + (2413.0f/128.0f)*y)/(1.0f+(2392.0f/128.0f)*y),float3(2523.0f/32.0f));
-        } else {
-            rgb = select(1.055f*pow(rgb,float3(1.0f/2.4f))-0.055f,12.92f*rgb,rgb<=0.0031308f);
-        }
+        // NIS already outputs display-referred sRGB/PQ; never apply OETF twice.
+        if (u.z == 0) { rgb = presentationEncodedRGB(rgb, u.x > 0); }
         return float4(rgb,1);
     }
     """

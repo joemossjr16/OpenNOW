@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		AB2060000000000000000001 /* NativeStreamNIS.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB2060000000000000000003; };
+		AB2060000000000000000002 /* NIS in Resources */ = {isa = PBXBuildFile; fileRef = AB2060000000000000000004; };
 		95DDF31E58CDEF17D4EA1762 /* RemoteSessionDiscovery.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5576A443FAC8D9F58E3931E6 /* RemoteSessionDiscovery.swift */; };
 		4A9F701B95F642B4B396FF48 /* StreamSessionsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 12734E3A4AF1481E9CA7E9E4; };
 		DC2C1BC3FB56423B96FF2C69 /* StreamSessionHistory.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6BEF4FE1193044C9B24243CB; };
@@ -207,6 +209,8 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		AB2060000000000000000003 /* NativeStreamNIS.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeStreamNIS.swift; sourceTree = "<group>"; };
+		AB2060000000000000000004 /* NIS */ = {isa = PBXFileReference; lastKnownFileType = folder; path = NIS; sourceTree = "<group>"; };
 		5576A443FAC8D9F58E3931E6 /* RemoteSessionDiscovery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteSessionDiscovery.swift; sourceTree = "<group>"; };
 		12734E3A4AF1481E9CA7E9E4 /* StreamSessionsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamSessionsView.swift; sourceTree = "<group>"; };
 		6BEF4FE1193044C9B24243CB /* StreamSessionHistory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamSessionHistory.swift; sourceTree = "<group>"; };
@@ -523,6 +527,8 @@
 				BB000000000000000000001E /* NativeStreamCodec.swift */,
 				BB0000000000000000000030 /* NativeStreamAV1.swift */,
 				BB0000000000000000000051 /* NativeStreamVideoEffects.swift */,
+				AB2060000000000000000003 /* NativeStreamNIS.swift */,
+				AB2060000000000000000004 /* NIS */,
 				BB0000000000000000000071 /* NativeStreamMetal4Effects.swift */,
 				BB0000000000000000000031 /* NativeStreamHDRMetal.swift */,
 				BB0000000000000000000091 /* NativeStreamMetal4Presentation.swift */,
@@ -698,6 +704,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				187B20A5ED969D396F5DE288 /* NVST/Licenses in Resources */,
+				AB2060000000000000000002 /* NIS in Resources */,
 				0A1B2C3D4E5F6A7B8C9D1004 /* Assets.xcassets in Resources */,
 				EE0000000000000000000001 /* PrivacyInfo.xcprivacy in Resources */,
 				DE000000000000000000000A /* Localizable.xcstrings in Resources */,
@@ -840,6 +847,7 @@
 				BB000000000000000000000E /* NativeStreamCodec.swift in Sources */,
 				BB0000000000000000000020 /* NativeStreamAV1.swift in Sources */,
 				BB0000000000000000000041 /* NativeStreamVideoEffects.swift in Sources */,
+				AB2060000000000000000001 /* NativeStreamNIS.swift in Sources */,
 				BB0000000000000000000061 /* NativeStreamMetal4Effects.swift in Sources */,
 				BB0000000000000000000021 /* NativeStreamHDRMetal.swift in Sources */,
 				BB0000000000000000000081 /* NativeStreamMetal4Presentation.swift in Sources */,
