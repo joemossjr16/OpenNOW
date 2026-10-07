@@ -82,6 +82,51 @@ private actor LiveResolutionTestTransport: NativeStreamNVSTTransport {
 }
 
 final class OpenNOWiOSParityTests: XCTestCase {
+    func testClientVideoOptionsPreserveAllocationAndDefaultToExistingRendering() throws {
+        var settings = AppSettings.default
+        XCTAssertEqual(settings.clientVideo, .init())
+        settings.clientVideo = .init(pacing: .balanced, interpolation: true, adaptiveHDR: true)
+        settings.upscalingMethod = .fsr1
+        let data = try JSONEncoder().encode(settings)
+        XCTAssertEqual(try JSONDecoder().decode(AppSettings.self, from:data).clientVideo, settings.clientVideo)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with:data) as? [String:Any])
+        object.removeValue(forKey:"clientVideo")
+        XCTAssertEqual(try JSONDecoder().decode(AppSettings.self, from:JSONSerialization.data(withJSONObject:object)).clientVideo, .init())
+        var allocation = AppSettings.default
+        let profile = StreamSettingsResolver.profile(for: allocation, membershipTier:"ULTIMATE")
+        allocation.applyStreamerControls(from:settings)
+        XCTAssertEqual(allocation.clientVideo,settings.clientVideo)
+        XCTAssertEqual(StreamSettingsResolver.profile(for: allocation, membershipTier:"ULTIMATE"),profile)
+    }
+
+    func testInterpolationGatesAndBalancedCadence() {
+        XCTAssertNil(NativeStreamClientVideoPolicy.interpolationReason(size:CGSize(width:1920,height:1080),sourceFPS:60,displayFPS:120))
+        XCTAssertNotNil(NativeStreamClientVideoPolicy.interpolationReason(size:CGSize(width:2560,height:1080),sourceFPS:60,displayFPS:120))
+        XCTAssertNotNil(NativeStreamClientVideoPolicy.interpolationReason(size:CGSize(width:1920,height:1080),sourceFPS:100,displayFPS:120))
+        XCTAssertNotNil(NativeStreamClientVideoPolicy.interpolationReason(size:.zero,sourceFPS:60,displayFPS:120))
+        XCTAssertNotNil(NativeStreamClientVideoPolicy.interpolationReason(size:CGSize(width:1920,height:1080),sourceFPS:60,displayFPS:60))
+        XCTAssertFalse(NativeStreamClientVideoPolicy.shouldPresentBalanced(now:1+1.0/120,last:1,fps:60))
+        XCTAssertTrue(NativeStreamClientVideoPolicy.shouldPresentBalanced(now:1+1.0/60,last:1,fps:60))
+        XCTAssertTrue(NativeStreamClientVideoPolicy.shouldPresentBalanced(now:0,last:1,fps:60))
+        XCTAssertFalse(NativeStreamClientVideoPolicy.validPair(gap:0.2,fps:60))
+        XCTAssertEqual(NativeStreamClientVideoPolicy.headroom(.nan),1)
+        XCTAssertEqual(NativeStreamClientVideoPolicy.headroom(4),4)
+    }
+
+    func testBalancedMailboxIsBoundedAndSwitchesBackToLatest() {
+        let mailbox=NativeStreamLatestFrameMailbox<Int>(maximumInFlight:1)
+        mailbox.setBalanced(true)
+        for value in 1...10 { mailbox.offer(value) }
+        XCTAssertEqual(mailbox.take()?.frame,9)
+        XCTAssertNil(mailbox.take())
+        mailbox.complete()
+        XCTAssertEqual(mailbox.take()?.frame,10)
+        mailbox.complete()
+        mailbox.offer(11);mailbox.offer(12);mailbox.setBalanced(false)
+        XCTAssertEqual(mailbox.take()?.frame,12)
+        mailbox.complete();XCTAssertNil(mailbox.take())
+    }
+
     func testNISSelectionPreservesExistingSettingsAndLiveControls() throws {
         var settings = AppSettings.default
         settings.upscalingMethod = .nis

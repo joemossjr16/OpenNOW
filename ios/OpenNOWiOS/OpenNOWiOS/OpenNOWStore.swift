@@ -944,6 +944,7 @@ struct AppSettings: Codable, Equatable {
     var metal4Enabled: Bool = false
     var metalFXUpscalingEnabled: Bool = false
     var upscalingMethod: StreamUpscalingMethod = .metalFX
+    var clientVideo: StreamClientVideoOptions = .init()
     var metalFXQualityPreset: MetalFXQualityPreset = .manual
     var streamSharpeningEnabled: Bool = false
     var streamSharpeningAmount: Double = 0.25
@@ -1058,6 +1059,7 @@ struct AppSettings: Codable, Equatable {
         case metal4Enabled
         case metalFXUpscalingEnabled
         case upscalingMethod
+        case clientVideo
         case metalFXQualityPreset
         case streamSharpeningEnabled
         case streamSharpeningAmount
@@ -1182,6 +1184,7 @@ struct AppSettings: Codable, Equatable {
         metal4Enabled = try container.decodeIfPresent(Bool.self, forKey: .metal4Enabled) ?? false
         metalFXUpscalingEnabled = try container.decodeIfPresent(Bool.self, forKey: .metalFXUpscalingEnabled) ?? false
         upscalingMethod = try container.decodeIfPresent(StreamUpscalingMethod.self, forKey: .upscalingMethod) ?? .metalFX
+        clientVideo = try container.decodeIfPresent(StreamClientVideoOptions.self, forKey: .clientVideo) ?? .init()
         metalFXQualityPreset = try container.decodeIfPresent(MetalFXQualityPreset.self, forKey: .metalFXQualityPreset) ?? .manual
         streamSharpeningEnabled = try container.decodeIfPresent(Bool.self, forKey: .streamSharpeningEnabled) ?? false
         streamSharpeningAmount = try container.decodeIfPresent(Double.self, forKey: .streamSharpeningAmount) ?? 0.25
@@ -1292,6 +1295,7 @@ struct AppSettings: Codable, Equatable {
         metal4Enabled = updated.metal4Enabled
         metalFXUpscalingEnabled = updated.metalFXUpscalingEnabled
         upscalingMethod = updated.upscalingMethod
+        clientVideo = updated.clientVideo
         hideStreamButtons = updated.hideStreamButtons
         touch = updated.touch
         mouseSensitivity = updated.mouseSensitivity

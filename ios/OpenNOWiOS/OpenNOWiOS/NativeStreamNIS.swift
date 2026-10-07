@@ -3,12 +3,12 @@ import CoreImage
 import Metal
 
 enum StreamUpscalingMethod: String, Codable, CaseIterable, Identifiable {
-    case metalFX, nis
+    case metalFX, nis, fsr1
     var id: String { rawValue }
-    var label: String { self == .nis ? "NVIDIA Image Scaling" : "MetalFX" }
-    var shortLabel: String { self == .nis ? "NIS" : "MetalFX" }
+    var label: String { self == .nis ? "NVIDIA Image Scaling" : self == .fsr1 ? "AMD FSR1" : "MetalFX" }
+    var shortLabel: String { self == .nis ? "NIS" : self == .fsr1 ? "FSR1" : "MetalFX" }
     func outputSize(source: CGSize, destination: CGSize) -> CGSize? {
-        guard self == .nis else {
+        guard self != .metalFX else {
             return NativeStreamVideoEffectsPolicy.upscaleSize(source: source, destination: destination)
         }
         guard source.width.isFinite, source.height.isFinite,

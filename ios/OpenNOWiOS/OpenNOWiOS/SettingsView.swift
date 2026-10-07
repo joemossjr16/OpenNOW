@@ -630,6 +630,17 @@ struct SettingsView: View {
             Text("Opt in to Metal 4 on supported devices running iOS 26 or later. Off uses compatible Metal rendering; HDR and MetalFX remain available.")
                 .font(.footnote).foregroundStyle(.secondary)
 
+            Picker("Frame Pacing", selection: $store.settings.clientVideo.pacing) {
+                ForEach(StreamFramePacing.allCases) { mode in Text(mode.label).tag(mode) }
+            }
+            Text("Balanced buffers up to two frames to smooth arrival jitter. Lowest latency always selects the newest frame.")
+                .font(.footnote).foregroundStyle(.secondary)
+            Toggle("Client Frame Interpolation", isOn: $store.settings.clientVideo.interpolation)
+            Text("Experimental. Generates one intermediate frame for streams up to 60 FPS and 1080p. Requires a display running at least 1.5× the stream FPS. Can add artifacts and delay; pauses if GPU time exceeds the display budget.")
+                .font(.footnote).foregroundStyle(.secondary)
+            Toggle("Adaptive HDR", isOn: $store.settings.clientVideo.adaptiveHDR)
+            Text("Tone maps HDR to the screen's current brightness headroom when the source supplies headroom metadata.")
+                .font(.footnote).foregroundStyle(.secondary)
             Toggle("Upscaling", isOn: $store.settings.metalFXUpscalingEnabled)
             if store.settings.metalFXUpscalingEnabled {
                 Picker("Upscaling Method", selection: $store.settings.upscalingMethod) {
@@ -638,8 +649,8 @@ struct SettingsView: View {
                     }
                 }
             }
-            if store.settings.metalFXUpscalingEnabled && store.settings.upscalingMethod == .nis {
-                Text("NIS scales your current stream to the fitted screen area, up to 2× in each dimension. Stream Sharpening controls its integrated sharpening. Resolution, HDR, codec and FPS stay unchanged.")
+            if store.settings.metalFXUpscalingEnabled && store.settings.upscalingMethod != .metalFX {
+                Text("NIS and FSR1 scale your current stream to the fitted screen area, up to 2× in each dimension. Stream Sharpening controls its integrated sharpening. Resolution, HDR, codec and FPS stay unchanged.")
                     .font(.footnote).foregroundStyle(.secondary)
             }
             if store.settings.metalFXUpscalingEnabled && store.settings.upscalingMethod == .metalFX {
