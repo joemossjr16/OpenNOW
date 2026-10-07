@@ -2,71 +2,35 @@ import CoreImage
 import Foundation
 import Metal
 
-enum StreamFramePacing: String, Codable, CaseIterable, Identifiable {
-  case lowLatency, balanced
-  var id: String { rawValue }
-  var label: String { self == .balanced ? "Balanced" : "Lowest latency" }
-}
-
 struct StreamClientVideoOptions: Codable, Equatable {
-  var pacing: StreamFramePacing = .lowLatency
-  var interpolation = false
   var adaptiveHDR = false
 }
 
-/// Timing/eligibility has one owner; optional features never change the stream profile.
+/// Optional HDR policy never changes the negotiated stream profile.
 enum NativeStreamClientVideoPolicy {
-  static func interpolationReason(size: CGSize, sourceFPS: Int, displayFPS: Double) -> String? {
-    guard sourceFPS > 0, sourceFPS <= 60 else { return "Requires a stream at 60 FPS or below" }
-    guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0,
-      size.width < CGFloat(Int.max - 7), size.height < CGFloat(Int.max - 7)
-    else { return "Waiting for valid frame dimensions" }
-    guard displayFPS.isFinite, displayFPS >= Double(sourceFPS) * 1.5 else {
-      return "Display needs at least 1.5× stream FPS"
-    }
-    return nil
-  }
-  static func shouldPresentBalanced(now: Double, last: Double?, fps: Int) -> Bool {
-    guard now.isFinite, let last, last.isFinite, now > last else { return true }
-    return now - last >= 0.8 / Double(max(fps, 1))
-  }
-  static func validPair(gap: Double, fps: Int) -> Bool {
-    gap.isFinite && gap > 0 && gap <= 1.5 / Double(max(fps, 1))
-  }
   static func headroom(_ value: Double) -> Float {
     Float(value.isFinite ? min(max(value, 1), 32) : 1)
   }
 }
 
 /// Compatible producer queue computes optional effects before the existing Metal 4
-/// input-copy/event handoff. History and outputs are never read by the display queue
+/// input-copy/event handoff. Producer outputs are never read by the display queue
 /// directly. Serial queue ordering and three-frame admission bound slot reuse.
 final class NativeStreamClientVideoProcessor {
   private struct Pipelines {
-    let easu, rcas, flow, warp: any MTLComputePipelineState
+    let easu, rcas: any MTLComputePipelineState
   }
   private struct Scaling {
     let width, height, outputWidth, outputHeight: Int
     let sharpen: Bool
     let slots: [(input: any MTLTexture, scaled: any MTLTexture, sharp: (any MTLTexture)?)]
   }
-  private struct History {
-    let width, height: Int
-    let hdr: Bool
-    let images: [any MTLTexture]
-    let outputs: [any MTLTexture]
-    let flow: any MTLTexture
-  }
   private let device: any MTLDevice
   private let setup = DispatchQueue(label: "OpenNOW.ClientVideo.setup", qos: .userInitiated)
   private var pipelines: Pipelines?
   private var scaling: Scaling?
-  private var history: History?
-  private var historyIndex = 0, historyCount = 0, outputIndex = 0, scaleIndex = 0
-  private(set) var interpolationSuspended = false
-  private(set) var interpolationStatus = "Preparing"
+  private var scaleIndex = 0
   private(set) var fsrStatus = "Preparing"
-  var interpolationReady: Bool { historyCount >= 2 && !interpolationSuspended }
 
   private var preparationStarted = false
   init(device: any MTLDevice) { self.device = device }
@@ -89,7 +53,6 @@ final class NativeStreamClientVideoProcessor {
             source: String(contentsOf: url, encoding: .utf8), options: options)
         }
         let fsr = try library("FSR1")
-        let interpolation = try library("Interpolation")
         func pipeline(_ library: any MTLLibrary, _ name: String) throws
           -> any MTLComputePipelineState
         {
@@ -99,35 +62,18 @@ final class NativeStreamClientVideoProcessor {
           return try device.makeComputePipelineState(function: function)
         }
         let result = try Pipelines(
-          easu: pipeline(fsr, "fsrEasu"), rcas: pipeline(fsr, "fsrRcas"),
-          flow: pipeline(interpolation, "videoFlow"), warp: pipeline(interpolation, "videoWarp"))
+          easu: pipeline(fsr, "fsrEasu"), rcas: pipeline(fsr, "fsrRcas"))
         DispatchQueue.main.async { [weak self] in self?.pipelines = result }
       } catch {
         DispatchQueue.main.async { [weak self] in
-          self?.interpolationStatus = "Unavailable on this device"
           self?.fsrStatus = "Unavailable on this device"
         }
       }
     }
   }
-  func resetHistory(retry: Bool = false) {
-    historyCount = 0
-    if retry {
-      interpolationSuspended = false
-      interpolationStatus = "Warming up"
-    }
-  }
   func resetScaling() {
     scaling = nil
     fsrStatus = "Preparing"
-  }
-  func observeGPU(failed: Bool) {
-    guard historyCount > 0, !interpolationSuspended else { return }
-    if failed {
-      interpolationSuspended = true
-      resetHistory()
-      interpolationStatus = "Paused: GPU error"
-    }
   }
   private func texture(_ width: Int, _ height: Int) -> (any MTLTexture)? {
     let d = MTLTextureDescriptor.texture2DDescriptor(
@@ -144,69 +90,6 @@ final class NativeStreamClientVideoProcessor {
     encoder.dispatchThreads(
       MTLSize(width: width, height: height, depth: 1),
       threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
-  }
-  func interpolate(
-    image: CIImage, newReal: Bool, phase: Float, hdr: Bool,
-    context: CIContext, command: any MTLCommandBuffer
-  ) -> CIImage? {
-    guard let pipelines, !interpolationSuspended else { return nil }
-    let size = image.extent.size
-    guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0,
-      size.width < CGFloat(Int.max - 7), size.height < CGFloat(Int.max - 7)
-    else { return nil }
-    let width = Int(size.width)
-    let height = Int(size.height)
-    if history?.width != width || history?.height != height || history?.hdr != hdr {
-      guard let a = texture(width, height), let b = texture(width, height),
-        let flow = texture((width + 7) / 8, (height + 7) / 8)
-      else { return nil }
-      let outputs = (0..<3).compactMap { _ in texture(width, height) }
-      guard outputs.count == 3 else { return nil }
-      history = History(
-        width: width, height: height, hdr: hdr, images: [a, b], outputs: outputs, flow: flow)
-      resetHistory()
-    }
-    guard let history else { return nil }
-    let space = NativeStreamNISKernel.colorSpace(hdr: hdr)
-    if newReal {
-      historyIndex = 1 - historyIndex
-      context.render(
-        image.transformed(
-          by: CGAffineTransform(translationX: -image.extent.minX, y: -image.extent.minY)),
-        to: history.images[historyIndex], commandBuffer: command,
-        bounds: CGRect(x: 0, y: 0, width: width, height: height), colorSpace: space)
-      historyCount = min(historyCount + 1, 2)
-    }
-    guard historyCount > 0 else { return nil }
-    let current = history.images[historyIndex]
-    command.addCompletedHandler { [history] _ in _ = history }
-    guard historyCount >= 2 else {
-      interpolationStatus = "Warming up"
-      return CIImage(mtlTexture: current, options: [.colorSpace: space])
-    }
-    let previous = history.images[1 - historyIndex]
-    if newReal {
-      guard let encoder = command.makeComputeCommandEncoder() else { return nil }
-      encoder.setTexture(previous, index: 0)
-      encoder.setTexture(current, index: 1)
-      encoder.setTexture(history.flow, index: 2)
-      dispatch(
-        pipelines.flow, encoder: encoder, width: history.flow.width, height: history.flow.height)
-      encoder.endEncoding()
-    }
-    let output = history.outputs[outputIndex]
-    outputIndex = (outputIndex + 1) % 3
-    guard let encoder = command.makeComputeCommandEncoder() else { return nil }
-    encoder.setTexture(previous, index: 0)
-    encoder.setTexture(current, index: 1)
-    encoder.setTexture(history.flow, index: 2)
-    encoder.setTexture(output, index: 3)
-    var phase = phase.isFinite ? min(max(phase, 0), 1) : 1
-    encoder.setBytes(&phase, length: MemoryLayout<Float>.size, index: 0)
-    dispatch(pipelines.warp, encoder: encoder, width: width, height: height)
-    encoder.endEncoding()
-    interpolationStatus = "Active · one intermediate frame"
-    return CIImage(mtlTexture: output, options: [.colorSpace: space])
   }
   func upscaleFSR(
     image: CIImage, destination: CGSize, hdr: Bool, sharpness: Float,

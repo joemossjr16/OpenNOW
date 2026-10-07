@@ -630,14 +630,6 @@ struct SettingsView: View {
             Text("Opt in to Metal 4 on supported devices running iOS 26 or later. Off uses compatible Metal rendering; HDR and MetalFX remain available.")
                 .font(.footnote).foregroundStyle(.secondary)
 
-            Picker("Frame Pacing", selection: $store.settings.clientVideo.pacing) {
-                ForEach(StreamFramePacing.allCases) { mode in Text(mode.label).tag(mode) }
-            }
-            Text("Balanced buffers up to two frames to smooth arrival jitter. Lowest latency always selects the newest frame.")
-                .font(.footnote).foregroundStyle(.secondary)
-            Toggle("Client Frame Interpolation", isOn: $store.settings.clientVideo.interpolation)
-            Text("Experimental. Generates one intermediate frame for streams up to 60 FPS. Requires a display running at least 1.5× the stream FPS. Can add artifacts and delay. GPU timing does not automatically pause interpolation.")
-                .font(.footnote).foregroundStyle(.secondary)
             Toggle("Adaptive HDR", isOn: $store.settings.clientVideo.adaptiveHDR)
             Text("Tone maps HDR to the screen's current brightness headroom when the source supplies headroom metadata.")
                 .font(.footnote).foregroundStyle(.secondary)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise optional spatial/temporal effects on Metal, including moving fixtures."""
+"""Exercise spatial scaling, HDR headroom and Metal 4 producer handoff."""
 from pathlib import Path
 import os
 import shutil
@@ -64,87 +64,6 @@ enum NativeStreamHDRTransfer {
    } }
   }
   print("PASS FSR: SDR/PQ black/white/color, sharpness, 2x/near-native, partial edge groups and repeated surfaces")
-  // Direct flow/warp oracle: a known +4-pixel translation must move the midpoint +2.
-  let url=Bundle.main.url(forResource:"Interpolation",withExtension:"metal",subdirectory:"StreamVideo")!
-  let library=try await device.makeLibrary(source:String(contentsOf:url),options:nil)
-  let flowPSO=try await device.makeComputePipelineState(function:library.makeFunction(name:"videoFlow")!)
-  let warpPSO=try await device.makeComputePipelineState(function:library.makeFunction(name:"videoWarp")!)
-  let w=128,h=64,previous=texture(w,h),current=texture(w,h),flow=texture((w+7)/8,(h+7)/8),output=texture(w,h)
-  func value(_ x:Int,_ y:Int) -> Float { Float((x*73+y*31+(x*y)%71)%251)/400+0.1 }
-  func moving(_ t:any MTLTexture,_ shift:Int) {
-   var b=[UInt16](repeating:0,count:w*h*4)
-   for y in 0..<h { for x in 0..<w {
-    let v=value(max(0,x-shift),y)
-    for c in 0..<3 { b[(y*w+x)*4+c]=Float16(v).bitPattern };b[(y*w+x)*4+3]=Float16(1).bitPattern
-   } }
-   b.withUnsafeBytes { t.replace(region:MTLRegionMake2D(0,0,w,h),mipmapLevel:0,withBytes:$0.baseAddress!,bytesPerRow:w*8) }
-  }
-  moving(previous,0);moving(current,4)
-  let command=queue.makeCommandBuffer()!
-  let e=command.makeComputeCommandEncoder()!
-  e.setComputePipelineState(flowPSO);e.setTexture(previous,index:0);e.setTexture(current,index:1);e.setTexture(flow,index:2)
-  e.dispatchThreads(MTLSize(width:flow.width,height:flow.height,depth:1),threadsPerThreadgroup:MTLSize(width:8,height:8,depth:1));e.endEncoding()
-  let warp=command.makeComputeCommandEncoder()!
-  warp.setComputePipelineState(warpPSO);warp.setTexture(previous,index:0);warp.setTexture(current,index:1);warp.setTexture(flow,index:2);warp.setTexture(output,index:3)
-  var phase:Float=0.5;warp.setBytes(&phase,length:4,index:0)
-  warp.dispatchThreads(MTLSize(width:w,height:h,depth:1),threadsPerThreadgroup:MTLSize(width:8,height:8,depth:1));warp.endEncoding()
-  command.commit();await command.completed();precondition(command.status == .completed)
-  let motion=pixels(flow),actual=pixels(output)
-  var correct=0,total=0,interpolatedError:Float=0,repeatError:Float=0
-  for y in 2..<flow.height-2 { for x in 2..<flow.width-2 {
-   let i=(y*flow.width+x)*4
-   if abs(motion[i]-4)<0.1 && abs(motion[i+1])<0.1 { correct+=1 };total+=1
-  } }
-  for y in 16..<h-16 { for x in 24..<w-24 {
-   let ref=value(x-2,y)
-   interpolatedError+=abs(actual[(y*w+x)*4]-ref);repeatError+=abs(value(x-4,y)-ref)
-  } }
-  print("Motion vectors correct",correct,"/",total,"error",interpolatedError,"vs repeated",repeatError)
-  precondition(correct*4 >= total*3,"Motion direction/reconstruction wrong")
-  precondition(interpolatedError<repeatError*0.5,"Interpolation doesn't improve translation")
-  precondition(actual.allSatisfy { $0.isFinite && $0 >= 0 && $0 <= 1 })
-  print("PASS interpolation: known translation, midpoint motion, bounded pixels")
-  // A scene cut must choose the current frame rather than create ghosts.
-  fill(previous,[0,0,0,1]);fill(current,[1,1,1,1])
-  let cut=queue.makeCommandBuffer()!, cutFlow=cut.makeComputeCommandEncoder()!
-  cutFlow.setComputePipelineState(flowPSO);cutFlow.setTexture(previous,index:0);cutFlow.setTexture(current,index:1);cutFlow.setTexture(flow,index:2)
-  cutFlow.dispatchThreads(MTLSize(width:flow.width,height:flow.height,depth:1),threadsPerThreadgroup:MTLSize(width:8,height:8,depth:1));cutFlow.endEncoding()
-  let cutWarp=cut.makeComputeCommandEncoder()!
-  cutWarp.setComputePipelineState(warpPSO);cutWarp.setTexture(previous,index:0);cutWarp.setTexture(current,index:1);cutWarp.setTexture(flow,index:2);cutWarp.setTexture(output,index:3)
-  cutWarp.setBytes(&phase,length:4,index:0)
-  cutWarp.dispatchThreads(MTLSize(width:w,height:h,depth:1),threadsPerThreadgroup:MTLSize(width:8,height:8,depth:1));cutWarp.endEncoding()
-  cut.commit();await cut.completed();precondition(cut.status == .completed)
-  precondition(pixels(output).allSatisfy { abs($0-1)<0.001 },"Scene cut ghosting")
-  print("PASS scene-cut rejection")
-  // Real processor lifecycle: warmup, alternating colors, reset and GPU-error fallback.
-  let space=NativeStreamNISKernel.colorSpace(hdr:false)
-  for index in 0..<12 {
-   fill(current,[Float(index)/20,0.3,0.6,1])
-   let image=CIImage(mtlTexture:current,options:[.colorSpace:space])!
-   let command=queue.makeCommandBuffer()!
-   let result=processor.interpolate(image:image,newReal:true,phase:0.5,hdr:false,context:context,command:command)
-   precondition(result != nil)
-   context.render(result!,to:output,commandBuffer:command,bounds:CGRect(x:0,y:0,width:w,height:h),colorSpace:space)
-   command.commit();await command.completed();precondition(command.status == .completed)
-   precondition(pixels(output).allSatisfy { $0.isFinite })
-  }
-  precondition(processor.interpolationReady)
-  for _ in 0..<10 { processor.observeGPU(failed:false) }
-  precondition(!processor.interpolationSuspended && processor.interpolationReady)
-  processor.observeGPU(failed:true)
-  precondition(processor.interpolationSuspended && !processor.interpolationReady)
-  processor.resetHistory(retry:true);precondition(!processor.interpolationSuspended && !processor.interpolationReady)
-  // Above-1080p history allocation and interpolation must remain eligible.
-  for index in 0..<2 {
-   let image=CIImage(color:CIColor(red:0.2,green:0.3,blue:0.6)).cropped(to:CGRect(x:0,y:0,width:2560,height:1080))
-   let command=queue.makeCommandBuffer()!
-   let result=processor.interpolate(image:image,newReal:true,phase:0.5,hdr:false,context:context,command:command)
-   precondition(result != nil && result!.extent.size == CGSize(width:2560,height:1080))
-   command.commit();await command.completed();precondition(command.status == .completed)
-  }
-  precondition(processor.interpolationReady)
-  processor.resetHistory(retry:true)
-  print("PASS above-1080p interpolation history and GPU dispatch")
   if #available(macOS 26.0,*) {
    let image=CIImage(color:CIColor(red:4,green:2,blue:1,alpha:1,colorSpace:CGColorSpace(name:CGColorSpace.extendedLinearSRGB)!)!).cropped(to:CGRect(x:0,y:0,width:16,height:16)).settingContentHeadroom(4)
    let mapped=NativeStreamClientVideoProcessor.toneMap(image:image,headroom:2)!
@@ -157,10 +76,9 @@ enum NativeStreamHDRTransfer {
    print("HDR mapped",Array(color.prefix(4)),"luma",luma)
    precondition(luma<2.05 && luma>1,"HDR compression did not fit headroom")
   }
-  print("PASS lifecycle: history, settings reset, GPU-error fallback, HDR filter")
+  print("PASS adaptive HDR headroom filter")
   // Optional producer effects must preserve the existing Metal 4 GPU-event handoff.
   let renderer=NativeStreamMetal4EffectsRenderer(device:device)!
-  processor.resetHistory(retry:true)
   for hdr in [false,true] { for method in [StreamUpscalingMethod.nis,.fsr1] {
    let space=NativeStreamNISKernel.colorSpace(hdr:hdr)
    let desc=MTLTextureDescriptor.texture2DDescriptor(pixelFormat:hdr ? .bgr10a2Unorm : .bgra8Unorm,width:96,height:48,mipmapped:false)
@@ -173,8 +91,7 @@ enum NativeStreamHDRTransfer {
     var success=false
     for _ in 0..<300 {
      let command=queue.makeCommandBuffer()!
-     let generated=processor.interpolate(image:image,newReal:true,phase:0.5,hdr:hdr,context:context,command:command)!
-     let processed=method == .fsr1 ? processor.upscaleFSR(image:generated,destination:CGSize(width:96,height:48),hdr:hdr,sharpness:0.25,context:context,command:command)! : generated
+     let processed=method == .fsr1 ? processor.upscaleFSR(image:image,destination:CGSize(width:96,height:48),hdr:hdr,sharpness:0.25,context:context,command:command)! : image
      let pair=AsyncStream<Bool>.makeStream()
      success=renderer.submit(image:processed,destination:CGRect(x:0,y:0,width:96,height:48),transfer:hdr ? 1 : 0,upscale:method == .nis,
       context:context,producer:command,target:target,method:method,sharpening:method == .nis ? 0.25 : 0,
@@ -193,7 +110,7 @@ enum NativeStreamHDRTransfer {
     }
    }
   } }
-  print("PASS interpolation + NIS/FSR1 + Metal4 SDR/PQ event handoff and repeated frame ownership")
+  print("PASS NIS/FSR1 + Metal4 SDR/PQ event handoff and repeated frame ownership")
  }
 }
 '''

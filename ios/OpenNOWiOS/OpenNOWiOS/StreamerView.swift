@@ -1839,14 +1839,6 @@ private struct NativeStreamControlsPanel: View {
                     value: coordinator.liveSettings.metal4Enabled ? "On" : "Off",
                     isOn: Binding(get: { coordinator.liveSettings.metal4Enabled },
                         set: { value in coordinator.updateLiveSettings { $0.metal4Enabled = value } }))
-                Picker("Frame pacing", selection: Binding(
-                    get: { coordinator.liveSettings.clientVideo.pacing },
-                    set: { value in coordinator.updateLiveSettings { $0.clientVideo.pacing = value } })) {
-                    ForEach(StreamFramePacing.allCases) { mode in Text(mode.label).tag(mode) }
-                }
-                NativeStreamToggleRow(title: "Client interpolation", value: "Experimental · up to 1080p/60",
-                    isOn: Binding(get: { coordinator.liveSettings.clientVideo.interpolation },
-                        set: { value in coordinator.updateLiveSettings { $0.clientVideo.interpolation = value } }))
                 NativeStreamToggleRow(title: "Adaptive HDR", value: "Display headroom",
                     isOn: Binding(get: { coordinator.liveSettings.clientVideo.adaptiveHDR },
                         set: { value in coordinator.updateLiveSettings { $0.clientVideo.adaptiveHDR = value } }))
@@ -3474,7 +3466,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         guard next != liveSettings else { return }
         liveSettings = next
         statsMetrics = next.streamStatsMetrics
-        renderer?.setVideoEffects(upscaling: next.metalFXUpscalingEnabled, metal4: next.metal4Enabled, method: next.upscalingMethod, client: next.clientVideo, sourceFPS: streamProfile.fps)
+        renderer?.setVideoEffects(upscaling: next.metalFXUpscalingEnabled, metal4: next.metal4Enabled, method: next.upscalingMethod, client: next.clientVideo)
         inputBridge.configureUserPreferences(
             mouseSensitivity: next.mouseSensitivity,
             mouseAcceleration: next.mouseAcceleration,
@@ -3875,7 +3867,7 @@ final class NativeStreamCoordinator: NSObject, ObservableObject {
         renderer.setStretchStreamToFill(streamerPreferences.stretchStreamToFill)
         renderer.setStreamSharpening(enabled: streamSharpeningEnabled, amount: streamSharpeningAmount)
         renderer.setViewportTransform(scale: streamZoomScale, offset: streamZoomOffset)
-        renderer.setVideoEffects(upscaling: liveSettings.metalFXUpscalingEnabled, metal4: liveSettings.metal4Enabled, method: liveSettings.upscalingMethod, client: liveSettings.clientVideo, sourceFPS: streamProfile.fps)
+        renderer.setVideoEffects(upscaling: liveSettings.metalFXUpscalingEnabled, metal4: liveSettings.metal4Enabled, method: liveSettings.upscalingMethod, client: liveSettings.clientVideo)
         attachCurrentVideoSinkIfNeeded()
     }
 
@@ -6163,7 +6155,6 @@ private final class NativeStreamRenderView: UIView {
     private var upscalingEnabled = false
     private var upscalingMethod: StreamUpscalingMethod = .metalFX
     private var clientVideo = StreamClientVideoOptions()
-    private var sourceFPS = 60
     var videoEffectsStatus: String { filteredMetalView?.videoEffectsStatus ?? "" }
     var presentationRates: NativeStreamPresentationRates? {
         filteredRendererActive ? filteredMetalView?.presentationRates : nil
@@ -6178,13 +6169,13 @@ private final class NativeStreamRenderView: UIView {
     }
 
     func setVideoEffects(upscaling: Bool, metal4: Bool, method: StreamUpscalingMethod = .metalFX,
-                         client: StreamClientVideoOptions = .init(), sourceFPS: Int = 60) {
+                         client: StreamClientVideoOptions = .init()) {
         metal4Enabled = metal4
         upscalingEnabled = upscaling
         upscalingMethod = method
-        clientVideo = client; self.sourceFPS = sourceFPS
+        clientVideo = client
         if upscaling || client != .init() { ensureFilteredMetalView() }
-        filteredMetalView?.setVideoEffects(upscaling: upscaling, metal4: metal4, method: method, client: client, sourceFPS: sourceFPS)
+        filteredMetalView?.setVideoEffects(upscaling: upscaling, metal4: metal4, method: method, client: client)
         updateRendererVisibility()
     }
     private var viewportTransformScale: CGFloat = 1
@@ -6336,7 +6327,7 @@ private final class NativeStreamRenderView: UIView {
         filtered.frame = videoContainerView.bounds
         filtered.stretchToFill = stretchStreamToFill
         filtered.sharpeningAmount = streamSharpeningEnabled ? streamSharpeningAmount : 0
-        filtered.setVideoEffects(upscaling: upscalingEnabled, metal4: metal4Enabled, method: upscalingMethod, client: clientVideo, sourceFPS: sourceFPS)
+        filtered.setVideoEffects(upscaling: upscalingEnabled, metal4: metal4Enabled, method: upscalingMethod, client: clientVideo)
         filtered.isHidden = true
         videoContainerView.addSubview(filtered)
         rendererStateLock.lock()
@@ -6427,8 +6418,7 @@ final class NativeStreamLatestFrameMailbox<Frame>: @unchecked Sendable {
 
     private let lock = NSLock()
     private let maximumInFlight: Int
-    private var pending: [Entry] = []
-    private var balanced = false
+    private var pending: Entry?
     private var inFlight = 0
 
     init(maximumInFlight: Int = 2) {
@@ -6438,25 +6428,17 @@ final class NativeStreamLatestFrameMailbox<Frame>: @unchecked Sendable {
 
     func offer(_ frame: Frame) {
         lock.lock()
-        if !balanced { pending.removeAll(keepingCapacity: true) }
-        pending.append(Entry(frame: frame))
-        if pending.count > 2 { pending.removeFirst() }
+        pending = Entry(frame: frame)
         lock.unlock()
     }
 
     func take() -> Entry? {
         lock.lock()
         defer { lock.unlock() }
-        guard inFlight < maximumInFlight, !pending.isEmpty else { return nil }
-        let entry = pending.removeFirst()
+        guard inFlight < maximumInFlight, let entry = pending else { return nil }
+        pending = nil
         inFlight += 1
         return entry
-    }
-
-    func setBalanced(_ enabled: Bool) {
-        lock.lock(); defer { lock.unlock() }
-        balanced = enabled
-        if !enabled, let latest = pending.last { pending = [latest] }
     }
 
     func complete() {
@@ -6507,14 +6489,6 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     private let nisUpscaler: NativeStreamNISUpscaler
     private let clientProcessor: NativeStreamClientVideoProcessor
     private var clientVideo = StreamClientVideoOptions()
-    private var clientEpoch: UInt64 = 0
-    private var sourceFPS = 60
-    private var displayFPS = 60.0
-    private var lastRealTime: Double?
-    private var lastDrawTime: Double?
-    private var retainedFrame: RTCVideoFrame?
-    private var syntheticPending = false
-    private var interpolationReason = "Warming up"
     private var hdrStatus = "Waiting for HDR"
     private var metal4Enabled = false
     private var upscalingEnabled = false
@@ -6532,23 +6506,15 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
             parts.append(upscalingMethod.shortLabel + ": " + (CACurrentMediaTime() < suspendUpscalingUntil
                 ? "Paused: processing error" : (metal4UpscalingStatus ?? (upscalingMethod == .nis ? nisUpscaler.status : upscalingMethod == .fsr1 ? clientProcessor.fsrStatus : spatialUpscaler.status))))
         }
-        if clientVideo.interpolation { parts.append("Interpolation: " + interpolationReason) }
-        if clientVideo.pacing == .balanced { parts.append(clientVideo.interpolation ? "Pacing: Lowest latency for interpolation" : "Pacing: Balanced") }
         if clientVideo.adaptiveHDR { parts.append("HDR: " + hdrStatus) }
         return parts.joined(separator: " · ")
     }
 
     func setVideoEffects(upscaling: Bool, metal4: Bool, method: StreamUpscalingMethod = .metalFX,
-                         client: StreamClientVideoOptions = .init(), sourceFPS: Int = 60) {
-        if clientVideo != client || self.sourceFPS != sourceFPS {
-            effectsGeneration &+= 1
-            clientEpoch &+= 1
-            clientProcessor.resetHistory(retry: true)
-            retainedFrame = nil; syntheticPending = false; lastRealTime = nil; lastDrawTime = nil
-        }
-        clientVideo = client; self.sourceFPS = sourceFPS
-        if client.interpolation || (upscaling && method == .fsr1) { clientProcessor.prepareIfNeeded() }
-        frames.setBalanced(client.pacing == .balanced && !client.interpolation)
+                         client: StreamClientVideoOptions = .init()) {
+        if clientVideo != client { effectsGeneration &+= 1 }
+        clientVideo = client
+        if upscaling && method == .fsr1 { clientProcessor.prepareIfNeeded() }
         metal4Enabled = metal4
         if metal4 { prepareMetal4IfNeeded() }
         guard upscalingEnabled != upscaling || upscalingMethod != method else { return }
@@ -6658,10 +6624,6 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     }
 
     private func displayTick(_ link: CADisplayLink) {
-        let interval = link.targetTimestamp - link.timestamp
-        if interval > 0 { displayFPS = 1 / interval }
-        if clientVideo.pacing == .balanced && !clientVideo.interpolation,
-           !NativeStreamClientVideoPolicy.shouldPresentBalanced(now: link.timestamp, last: lastDrawTime, fps: sourceFPS) { return }
         mtkView.draw()
     }
 
@@ -6678,40 +6640,19 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
         guard gpuAdmission.wait(timeout: .now()) == .success else { return }
         var submitted = false
         defer { if !submitted { gpuAdmission.signal() } }
-        let entry = frames.take()
-        let realFrame = entry != nil
-        guard let frame = entry?.frame ?? (syntheticPending ? retainedFrame : nil) else { return }
-        if !realFrame {
-            guard clientProcessor.interpolationReady, let lastRealTime,
-                  drawStarted - lastRealTime <= 1.5 / Double(max(sourceFPS,1)) else {
-                syntheticPending = false; return
-            }
-        }
-        syntheticPending = false
+        guard let entry = frames.take() else { return }
         defer {
             // Return the slot on conversion/drawable failures too.
-            if !submitted && realFrame { frames.complete() }
+            if !submitted { frames.complete() }
         }
-        guard let pixelBuffer = frameBridge.pixelBuffer(for: frame) else { return }
+        guard let pixelBuffer = frameBridge.pixelBuffer(for: entry.frame) else { return }
         configureColorOutput(for: pixelBuffer)
         guard let drawable = view.currentDrawable,
               let commandBuffer = commandQueue.makeCommandBuffer() else {
             return
         }
-        let frameSize = CGSize(width: CGFloat(frame.width), height: CGFloat(frame.height))
+        let frameSize = CGSize(width: CGFloat(entry.frame.width), height: CGFloat(entry.frame.height))
 
-        let reason = NativeStreamClientVideoPolicy.interpolationReason(size: frameSize, sourceFPS: sourceFPS, displayFPS: displayFPS)
-        let interpolate = clientVideo.interpolation && reason == nil && !clientProcessor.interpolationSuspended
-        if realFrame {
-            if let lastRealTime, !NativeStreamClientVideoPolicy.validPair(gap: drawStarted-lastRealTime, fps: sourceFPS) {
-                clientProcessor.resetHistory()
-            }
-            lastRealTime = drawStarted
-            retainedFrame = interpolate ? frame : nil
-        }
-        if clientVideo.interpolation {
-            interpolationReason = reason ?? clientProcessor.interpolationStatus
-        }
         let bounds = CGRect(origin: .zero, size: view.drawableSize)
         let destination = stretchToFill ? bounds : Self.aspectFitRect(source: frameSize, target: bounds.size)
         let shouldUpscale = upscalingEnabled && drawStarted >= suspendUpscalingUntil
@@ -6729,7 +6670,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
             if clientVideo.adaptiveHDR { hdrStatus = "SDR source" }
         }
         let useToneMap = mappedHDR != nil
-        let specialProcessing = interpolate || useFSR || useToneMap
+        let specialProcessing = useFSR || useToneMap
         let ticket = submissionTimeline?.next()
         let presentationTracker = presentations
         let mailbox = frames
@@ -6749,7 +6690,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                 presentationTracker.recordPresentation(at: time)
             }, completion: { [weak self] error in
                 admission.signal()
-                if realFrame { mailbox.complete() }
+                mailbox.complete()
                 if let error {
                     NSLog("[OpenNOW] Metal 4 presentation failed code=%ld", error.code)
                     DispatchQueue.main.async { [weak self] in
@@ -6787,7 +6728,6 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                         : nil
                 }
 
-                lastDrawTime = drawStarted
                 submitted = true
                 return
             }
@@ -6833,7 +6773,6 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                     : hdrTransfer == .hlg ? "Metal 4 · native HLG conversion" : "Metal 4 · native SDR conversion")
                 metal4UpscalingStatus = shouldUpscale ? effects.status : nil
 
-                lastDrawTime = drawStarted
                 submitted = true
                 return
             }
@@ -6844,20 +6783,6 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
             }
 
             var sourceImage = mappedHDR ?? CIImage(cvPixelBuffer: pixelBuffer)
-            if interpolate, let generated = clientProcessor.interpolate(image:sourceImage,newReal:realFrame,
-                    phase:realFrame ? 0.5 : 1, hdr:hdrTransfer != .sdr,context:ciContext,command:commandBuffer) {
-                sourceImage = generated
-                syntheticPending = realFrame && clientProcessor.interpolationReady
-                interpolationReason = clientProcessor.interpolationStatus
-                let epoch = clientEpoch
-                commandBuffer.addCompletedHandler { [weak self] command in
-                    let failed = command.status == .error
-                    DispatchQueue.main.async { [weak self] in
-                        guard let self, self.clientEpoch == epoch else { return }
-                        self.clientProcessor.observeGPU(failed:failed)
-                    }
-                }
-            }
             if useFSR, let scaled = clientProcessor.upscaleFSR(image:sourceImage,destination:destination.size,
                     hdr:hdrTransfer != .sdr,sharpness:Float(sharpeningAmount),context:ciContext,command:commandBuffer) {
                 sourceImage = scaled
@@ -6898,7 +6823,6 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                     rendererBackend = "Metal 4 · effects"
                     if shouldUpscale { metal4UpscalingStatus = useFSR ? clientProcessor.fsrStatus : effects.status } else { metal4UpscalingStatus = nil }
 
-                    lastDrawTime = drawStarted
                     submitted = true
                     return
                 }
@@ -6948,7 +6872,7 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                 ticket?.recoverAfterGPUFailure()
                 if let error = command.error as NSError? { NSLog("[OpenNOW] Metal rendering failed code=%ld", error.code) }
             }
-            if realFrame { mailbox.complete() }
+            mailbox.complete()
             guard checkEffectsFailure, command.status == .error else { return }
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.effectsGeneration == effectsToken else { return }
@@ -6958,7 +6882,6 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
 
         if let ticket { commandBuffer.encodeSignalEvent(ticket.event,value:ticket.value) }
         commandBuffer.present(drawable)
-        lastDrawTime = drawStarted
         submitted = true
         commandBuffer.commit()
         if let ticket { submissionTimeline?.accept(ticket) }
@@ -6975,7 +6898,6 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
     private func configureColorOutput(for buffer: CVPixelBuffer) {
         let transfer = NativeStreamHDRTransfer.detect(in: buffer)
         guard transfer != hdrTransfer else { return }
-        clientProcessor.resetHistory(); syntheticPending = false
         hdrTransfer = transfer
         let hdr = transfer != .sdr
         // Normalize PQ/HLG sources into PQ display encoding with BT.2020 primaries
