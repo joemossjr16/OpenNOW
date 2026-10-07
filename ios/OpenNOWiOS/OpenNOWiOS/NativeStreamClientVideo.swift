@@ -63,7 +63,6 @@ final class NativeStreamClientVideoProcessor {
   private var scaling: Scaling?
   private var history: History?
   private var historyIndex = 0, historyCount = 0, outputIndex = 0, scaleIndex = 0
-  private var slowFrames = 0
   private(set) var interpolationSuspended = false
   private(set) var interpolationStatus = "Preparing"
   private(set) var fsrStatus = "Preparing"
@@ -115,7 +114,6 @@ final class NativeStreamClientVideoProcessor {
     historyCount = 0
     if retry {
       interpolationSuspended = false
-      slowFrames = 0
       interpolationStatus = "Warming up"
     }
   }
@@ -123,13 +121,12 @@ final class NativeStreamClientVideoProcessor {
     scaling = nil
     fsrStatus = "Preparing"
   }
-  func observeGPU(duration: Double, failed: Bool, budget: Double) {
+  func observeGPU(failed: Bool) {
     guard historyCount > 0, !interpolationSuspended else { return }
-    slowFrames = duration.isFinite && duration > budget ? slowFrames + 1 : 0
-    if failed || slowFrames >= 3 {
+    if failed {
       interpolationSuspended = true
       resetHistory()
-      interpolationStatus = failed ? "Paused: GPU error" : "Paused: GPU budget exceeded"
+      interpolationStatus = "Paused: GPU error"
     }
   }
   private func texture(_ width: Int, _ height: Int) -> (any MTLTexture)? {

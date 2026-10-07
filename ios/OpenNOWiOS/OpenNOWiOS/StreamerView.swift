@@ -6849,14 +6849,12 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
                 sourceImage = generated
                 syntheticPending = realFrame && clientProcessor.interpolationReady
                 interpolationReason = clientProcessor.interpolationStatus
-                let budget = 1 / displayFPS
                 let epoch = clientEpoch
                 commandBuffer.addCompletedHandler { [weak self] command in
-                    let duration = command.gpuEndTime-command.gpuStartTime
                     let failed = command.status == .error
                     DispatchQueue.main.async { [weak self] in
                         guard let self, self.clientEpoch == epoch else { return }
-                        self.clientProcessor.observeGPU(duration:duration,failed:failed,budget:budget)
+                        self.clientProcessor.observeGPU(failed:failed)
                     }
                 }
             }

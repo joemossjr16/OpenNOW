@@ -116,7 +116,7 @@ enum NativeStreamHDRTransfer {
   cut.commit();await cut.completed();precondition(cut.status == .completed)
   precondition(pixels(output).allSatisfy { abs($0-1)<0.001 },"Scene cut ghosting")
   print("PASS scene-cut rejection")
-  // Real processor lifecycle: warmup, alternating colors, reset and GPU-budget fallback.
+  // Real processor lifecycle: warmup, alternating colors, reset and GPU-error fallback.
   let space=NativeStreamNISKernel.colorSpace(hdr:false)
   for index in 0..<12 {
    fill(current,[Float(index)/20,0.3,0.6,1])
@@ -129,7 +129,9 @@ enum NativeStreamHDRTransfer {
    precondition(pixels(output).allSatisfy { $0.isFinite })
   }
   precondition(processor.interpolationReady)
-  for _ in 0..<3 { processor.observeGPU(duration:0.02,failed:false,budget:1/120) }
+  for _ in 0..<10 { processor.observeGPU(failed:false) }
+  precondition(!processor.interpolationSuspended && processor.interpolationReady)
+  processor.observeGPU(failed:true)
   precondition(processor.interpolationSuspended && !processor.interpolationReady)
   processor.resetHistory(retry:true);precondition(!processor.interpolationSuspended && !processor.interpolationReady)
   // Above-1080p history allocation and interpolation must remain eligible.
@@ -155,7 +157,7 @@ enum NativeStreamHDRTransfer {
    print("HDR mapped",Array(color.prefix(4)),"luma",luma)
    precondition(luma<2.05 && luma>1,"HDR compression did not fit headroom")
   }
-  print("PASS lifecycle: history, settings reset, slow-GPU fallback, HDR filter")
+  print("PASS lifecycle: history, settings reset, GPU-error fallback, HDR filter")
   // Optional producer effects must preserve the existing Metal 4 GPU-event handoff.
   let renderer=NativeStreamMetal4EffectsRenderer(device:device)!
   processor.resetHistory(retry:true)

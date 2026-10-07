@@ -34,10 +34,9 @@ recovered PXPlay shader implementation, a neural model or server frame generatio
 
 Two adjacent real frames warm up history. Frame gaps, size/color changes and live
 option changes reset it. Only one extra presentation is admitted between real
-frames; missing frames never extrapolate indefinitely. GPU failures or three
-consecutive producer commands above the display interval suspend interpolation
-until a settings change retries it. This timing budget covers compatible producer
-work; Metal 4 consumer/presentation time and physical thermals also need testing.
+frames; missing frames never extrapolate indefinitely. GPU command failures suspend interpolation
+until a settings change retries it. There is no GPU-time cutoff.
+Producer/consumer GPU performance and physical thermals need device testing.
 
 All persistent textures are retained until queued work finishes. Optional producer
 outputs feed Core Image's copy into the existing Metal 4 slot; the Metal 4 queue
@@ -73,7 +72,7 @@ python3 ios/OpenNOWiOS/BuildScripts/validate-metal4-effects-macos.py
 
 The first script enables Metal API/shader validation and covers SDR/PQ constant
 colors, near-native/2× geometry, 2560×1080→2868×1320, edge coverage, sharpening,
-known translation/midpoint motion, cuts, history reset/GPU-budget fallback, HDR
+known translation/midpoint motion, cuts, history reset/GPU-error fallback, HDR
 tone-map output and NIS/FSR1/interpolation → Metal 4 event/lifetime handoff.
 Simulator parity tests cover persistence, profile retention, timing gates and the
 bounded balanced mailbox. These checks do not establish physical iPhone/iPad
