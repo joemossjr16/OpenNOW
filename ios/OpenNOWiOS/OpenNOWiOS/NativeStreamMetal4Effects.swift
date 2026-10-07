@@ -280,6 +280,10 @@ final class NativeStreamMetal4EffectsRenderer {
     }
     private func prepare(_ key: Key) {
         guard !preparing.contains(key), !rejected.contains(key), preparing.count < 2 else { return }
+        // Retire previous geometry before allocating a new full-resolution pool.
+        // Submitted commands retain their Resources until feedback completes.
+        resources.removeAll()
+        order.removeAll()
         preparing.insert(key)
         let device = device, compiler = compiler
         setupQueue.async { [weak self] in
@@ -330,9 +334,8 @@ final class NativeStreamMetal4EffectsRenderer {
                 self.preparing.remove(key)
                 if let result {
                     self.resources[key] = result; self.order.append(key)
-                    // Preserve cached resources when live video geometry changes.
-                    // Keep two configurations; in-flight completions retain evicted resources.
-                    while self.order.count > 2 { self.resources.removeValue(forKey: self.order.removeFirst()) }
+                    // Cache only the current geometry; completions retain evicted resources.
+                    while self.order.count > 1 { self.resources.removeValue(forKey: self.order.removeFirst()) }
                 } else { self.rejected.insert(key) }
             }
         }

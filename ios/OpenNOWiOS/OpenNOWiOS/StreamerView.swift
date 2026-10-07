@@ -6838,7 +6838,10 @@ private final class NativeStreamFilteredMetalView: UIView, MTKViewDelegate {
             metal4UpscalingStatus = nil
             let scaledImage: CIImage
             let scaled: CIImage?
-            if shouldUpscale && upscalingMethod == .nis {
+            // Metal 4 prepares its own NIS pool asynchronously. Render the real
+            // frame with CI while it warms up rather than allocating a second pool.
+            let waitingForNativeNIS = preferMetal4Effects && upscalingMethod == .nis
+            if shouldUpscale && upscalingMethod == .nis && !waitingForNativeNIS {
                 scaled = nisUpscaler.encode(image: filteredImage, sourceSize: sourceExtent.size,
                     destinationSize: scalingDestination, hdr: hdrTransfer != .sdr,
                     sharpness: Float(sharpeningAmount), context: ciContext, commandBuffer: commandBuffer)

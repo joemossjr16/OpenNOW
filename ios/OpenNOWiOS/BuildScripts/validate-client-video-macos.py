@@ -79,28 +79,28 @@ enum NativeStreamHDRTransfer {
   print("PASS adaptive HDR headroom filter")
   // Optional producer effects must preserve the existing Metal 4 GPU-event handoff.
   let renderer=NativeStreamMetal4EffectsRenderer(device:device)!
-  for hdr in [false,true] { for method in [StreamUpscalingMethod.metalFX,.nis,.fsr1] { for scale:CGFloat in [1.5,2] {
+  for hdr in [false,true] { for method in [StreamUpscalingMethod.metalFX,.nis,.fsr1] { for scale:CGFloat in [1.5,2] { for (sourceWidth,sourceHeight) in (method == .nis ? [(64,32),(2560,1080)] : [(64,32)]) {
    let space=NativeStreamNISKernel.colorSpace(hdr:hdr)
    let desc=MTLTextureDescriptor.texture2DDescriptor(pixelFormat:hdr ? .bgr10a2Unorm : .bgra8Unorm,width:96,height:48,mipmapped:false)
    desc.storageMode = .shared;desc.usage=[.renderTarget,.shaderRead]
    let target=device.makeTexture(descriptor:desc)!
-   let input=texture(64,32)
+   let input=texture(sourceWidth,sourceHeight)
    for level:Float in [0.2,0.4,0.1,0.6] {
     fill(input,[level,level,level,1])
     let image=CIImage(mtlTexture:input,options:[.colorSpace:space])!
     var success=false
     for _ in 0..<300 {
      let command=queue.makeCommandBuffer()!
-     let processed=method == .fsr1 ? processor.upscaleFSR(image:image,destination:CGSize(width:64*scale,height:32*scale),hdr:hdr,sharpness:0.25,context:context,command:command)! : image
+     let processed=method == .fsr1 ? processor.upscaleFSR(image:image,destination:CGSize(width:CGFloat(sourceWidth)*scale,height:CGFloat(sourceHeight)*scale),hdr:hdr,sharpness:0.25,context:context,command:command)! : image
      let pair=AsyncStream<Bool>.makeStream()
      success=renderer.submit(image:processed,destination:CGRect(x:0,y:0,width:96,height:48),transfer:hdr ? 1 : 0,upscale:method != .fsr1,
-      context:context,producer:command,target:target,method:method,sharpening:method == .nis ? 0.25 : 0, scalingDestination:CGSize(width:64*scale,height:32*scale),
+      context:context,producer:command,target:target,method:method,sharpening:method == .nis ? 0.25 : 0, scalingDestination:CGSize(width:CGFloat(sourceWidth)*scale,height:CGFloat(sourceHeight)*scale),
       completion:{ _,error in pair.continuation.yield(error == nil);pair.continuation.finish() })
      if success { for await ok in pair.stream { precondition(ok) };break }
      command.commit();await command.completed();try await Task.sleep(nanoseconds:10_000_000)
     }
     precondition(success,renderer.status)
-    if method != .fsr1 { precondition(renderer.status.contains("→ \(Int(64*scale))×\(Int(32*scale))"), "Scaler ignored explicit target: \(renderer.status)") }
+    if method != .fsr1 { precondition(renderer.status.contains("→ \(Int(CGFloat(sourceWidth)*scale))×\(Int(CGFloat(sourceHeight)*scale))"), "Scaler ignored explicit target: \(renderer.status)") }
     var data=[UInt32](repeating:0,count:96*48)
     data.withUnsafeMutableBytes { target.getBytes($0.baseAddress!,bytesPerRow:96*4,from:MTLRegionMake2D(0,0,96,48),mipmapLevel:0) }
     let values=data.map { Float($0 & (hdr ? 1023 : 255))/Float(hdr ? 1023 : 255) }
@@ -110,7 +110,7 @@ enum NativeStreamHDRTransfer {
      precondition(abs(actual-level)<0.015,"Client effect handoff changed color or read stale frame")
     }
    }
-  } } }
+  } } } }
   print("PASS MetalFX/NIS/FSR1 explicit 1.5x/2x targets on fixed drawable: + Metal4 SDR/PQ event handoff and repeated frame ownership")
  }
 }

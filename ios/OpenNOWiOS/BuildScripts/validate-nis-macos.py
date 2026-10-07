@@ -52,7 +52,7 @@ enum NativeStreamHDRTransfer {
   }
   for hdr in [false,true] { for sharpness:Float in [0,0.25,1] {
    let sizes = [(37,29,43,33),(64,32,128,64),(37,29,37,29)]
-     + (hdr && sharpness == 0.25 ? [(2560,1080,2868,1320)] : [])
+     + (hdr && sharpness == 0.25 ? [(2560,1080,2868,1320),(2560,1080,3840,1620),(2560,1080,5120,2160)] : [])
    for size in sizes {
     let (w,h,ow,oh) = size, input=texture(w,h), output=texture(ow,oh)
     let config=device.makeBuffer(length:256,options:.storageModeShared)!
